@@ -933,29 +933,17 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     /// Synchronous: no event loop runs inside this loop, so no stroke can land between a wipe and
     /// the repaint that follows it.
     ///
-    /// The strip's content lives in one layer per kind, spanning the whole strip: the managed
-    /// "Ink" and whatever else the pages hold. A page is the part of every one of those layers
-    /// inside that page's rectangle -- which is how the artifact is written, one cropped entry per
-    /// layer -- so reading it back is putting each entry into the layer of the same name at the
-    /// same rectangle. Nothing has to be activated for that, which is what made the
-    /// one-group-per-page design unworkable here.
-    QList<KisPaintLayer *> content;
+    /// The strip keeps ONE content layer, "Ink", and a page is the part of it inside that page's
+    /// rectangle. Reading every page's layers back into layers of their own was tried and taken
+    /// out again: the tablet crashed mid-roll with SIGSEGV inside this library, right after the
+    /// window's writes had landed. PdfInkLoader::loadInkLayers() is written and exercised, and is
+    /// what the next attempt starts from; until then the strip redraws the way it is known to
+    /// work.
+    KisPaintLayer *ink = nullptr;
     for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
         KisNodeSP child = m_document->image()->root()->at(i);
-        if (PdfPageSaver::isPageBackground(child)) {
-            continue;
-        }
-        if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
-            content.append(layer);
-        }
-    }
-
-    /// The one layer that always exists, and the fallback for anything that cannot be put where it
-    /// belongs.
-    KisPaintLayer *ink = nullptr;
-    for (KisPaintLayer *layer : content) {
-        if (layer->name() == QStringLiteral("Ink")) {
-            ink = layer;
+        if (child->name() == QStringLiteral("Ink")) {
+            ink = qobject_cast<KisPaintLayer *>(child.data());
             break;
         }
     }
@@ -964,12 +952,11 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         const int newPage = slots.at(i).page;
 
         /// The whole band, because the page arriving may be smaller than the one that was there.
-        /// Every page's content is on disk -- phase one wrote the whole window before this loop
-        /// was allowed to run -- so the wipe below cannot take anything with it. Every content
-        /// layer, not only "Ink": they all belong to the page, and the reload puts each back.
-        for (KisPaintLayer *layer : content) {
-            layer->paintDevice()->fill(slots.at(i).cell,
-                                       KoColor(Qt::transparent, m_document->image()->colorSpace()));
+        /// Every page's ink is on disk -- phase one wrote the whole window before this loop was
+        /// allowed to run -- so the wipe below cannot take anything with it.
+        if (ink) {
+            ink->paintDevice()->fill(slots.at(i).cell,
+                                     KoColor(Qt::transparent, m_document->image()->colorSpace()));
         }
 
         /// const_cast because KisSharedPtr::data() hands back a const node, and the paper layer is
@@ -988,8 +975,8 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         if (paper) {
             paper->setDirty(slots.at(i).cell);
         }
-        for (KisPaintLayer *layer : content) {
-            layer->setDirty(slots.at(i).cell);
+        if (ink) {
+            ink->setDirty(slots.at(i).cell);
         }
 
         if (newPage < 0) {
@@ -1003,40 +990,15 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             paper->setName(PdfStripBuilder::backgroundLayerName(newPage));
         }
 
-        /// Every layer the page has, back into the layer of the same name at this page's own
-        /// rectangle. A layer the artifact has and the strip does not yet joins the strip here and
-        /// stays for the pages after this one.
-        const QList<QPair<QString, QImage>> savedLayers = PdfInkLoader::loadInkLayers(
+        /// The page's content, flattened, back into Ink at this page's own rectangle. The
+        /// artifact still holds one entry per layer (see PdfPageSaver) -- it is the reading back
+        /// of them one by one that is not done here yet.
+        const QImage savedInk = PdfInkLoader::loadInk(
             QDir(m_projectDir).filePath(m_manifest.pages.at(newPage).kraFile), nullptr);
-        for (const QPair<QString, QImage> &saved : savedLayers) {
-            KisPaintLayer *target = nullptr;
-            for (KisPaintLayer *layer : content) {
-                if (layer->name() == saved.first) {
-                    target = layer;
-                    break;
-                }
-            }
-            if (!target) {
-                /// The page carries a layer this strip was not built with, and adding one here is
-                /// what crashed: measured on the tablet, a window move onto pages whose artifacts
-                /// hold a layer of their own took the application down. The pixels still have to
-                /// land somewhere, and "Ink" is the layer that is always there, so the content is
-                /// folded into it rather than into a layer built mid-roll.
-                target = ink;
-                if (target) {
-                    say(QStringLiteral("strip: the page carries layer \"%1\" and the strip has "
-                                       "none; its pixels go into Ink")
-                            .arg(saved.first));
-                }
-            }
-
-            if (!target) {
-                continue;
-            }
-
-            target->paintDevice()->convertFromQImage(saved.second, nullptr,
-                                                    slots.at(i).rect.x(), slots.at(i).rect.y());
-            target->setDirty(slots.at(i).cell);
+        if (ink && !savedInk.isNull()) {
+            ink->paintDevice()->convertFromQImage(savedInk, nullptr,
+                                                  slots.at(i).rect.x(), slots.at(i).rect.y());
+            ink->setDirty(slots.at(i).cell);
         }
         if (paper) {
             paper->setDirty(slots.at(i).cell);
