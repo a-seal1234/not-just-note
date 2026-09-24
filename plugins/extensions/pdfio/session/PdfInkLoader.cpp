@@ -6,6 +6,9 @@
 
 #include "PdfInkLoader.h"
 
+#include <QDir>
+#include <QTextStream>
+
 #include <QDebug>
 #include <QFileInfo>
 
@@ -180,6 +183,45 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
     copyRestoredLayers(page, layers, parent);
     KisPart::instance()->removeDocument(document, true);
     return true;
+}
+
+QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayersFromSidecar(const QString &kraPath,
+                                                                        QString *why)
+{
+    QList<QPair<QString, QImage>> layers;
+    const QString index = kraPath + QStringLiteral(".layers.txt");
+    QFile list(index);
+    if (!list.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        /// No sidecar: an artifact written before this was added, or one whose write was skipped.
+        return loadInkLayers(kraPath, why);
+    }
+
+    const QString dir = kraPath + QStringLiteral(".layers");
+    QTextStream in(&list);
+    while (!in.atEnd()) {
+        const QString line = in.readLine();
+        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
+            continue;
+        }
+
+        /// index, name, file, opacity, x, y
+        const QStringList parts = line.split(QLatin1Char('\t'));
+        if (parts.size() < 4) {
+            continue;
+        }
+
+        QImage pixels;
+        if (!pixels.load(QDir(dir).filePath(parts.at(2)), "PNG") || pixels.isNull()) {
+            continue;
+        }
+
+        layers.append(QPair<QString, QImage>(parts.at(1), pixels));
+    }
+
+    if (layers.isEmpty() && why) {
+        *why = QStringLiteral("%1 carries no readable layer images").arg(index);
+    }
+    return layers;
 }
 
 QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath, QString *why)

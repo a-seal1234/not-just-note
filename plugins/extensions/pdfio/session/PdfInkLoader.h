@@ -56,6 +56,18 @@ public:
     static QList<QPair<QString, QImage>> loadInkLayers(const QString &kraPath,
                                                        QString *why = nullptr);
 
+    /**
+     * The same list, read from the PNG sidecar an artifact is saved with -- one image per layer,
+     * with no document opened at all.
+     *
+     * This is what the strip reads with. Opening a document per page is what ends in a tombstone on
+     * the tablet during a window move (five of them per move); a PNG is a QImage and nothing else.
+     * Falls back to loadInkLayers() when there is no sidecar, so an artifact written before this
+     * existed still reads.
+     */
+    static QList<QPair<QString, QImage>> loadInkLayersFromSidecar(const QString &kraPath,
+                                                                  QString *why = nullptr);
+
 private:
     PdfInkLoader() = delete;
 };
