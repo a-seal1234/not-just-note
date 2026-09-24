@@ -182,6 +182,55 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
     return true;
 }
 
+QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath, QString *why)
+{
+    QList<QPair<QString, QImage>> layers;
+    if (!QFileInfo::exists(kraPath)) {
+        /// Not an error: a page that was never drawn on has no artifact.
+        return layers;
+    }
+
+    KisDocument *document = KisPart::instance()->createDocument();
+    if (!document) {
+        fail(why, QStringLiteral("no document could be made for %1").arg(kraPath));
+        return layers;
+    }
+
+    KraConverter converter(document);
+    QFile file(kraPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        fail(why, QStringLiteral("cannot read %1").arg(kraPath));
+        KisPart::instance()->removeDocument(document, true);
+        return layers;
+    }
+
+    const KisImportExportErrorCode code = converter.buildImage(&file);
+    file.close();
+    if (!code.isOk()) {
+        fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
+        KisPart::instance()->removeDocument(document, true);
+        return layers;
+    }
+
+    const KisImageSP loaded = converter.image();
+    if (loaded && loaded->root()) {
+        const QRect area = loaded->bounds();
+        for (quint32 i = 0; i < loaded->root()->childCount(); ++i) {
+            KisPaintLayer *paint = qobject_cast<KisPaintLayer *>(loaded->root()->at(i).data());
+            if (!paint) {
+                continue;
+            }
+            const QImage pixels = paint->paintDevice()->convertToQImage(nullptr, area);
+            if (!pixels.isNull()) {
+                layers.append(QPair<QString, QImage>(paint->name(), pixels));
+            }
+        }
+    }
+
+    KisPart::instance()->removeDocument(document, true);
+    return layers;
+}
+
 QImage PdfInkLoader::loadInk(const QString &kraPath, QString *why)
 {
     if (!QFileInfo::exists(kraPath)) {

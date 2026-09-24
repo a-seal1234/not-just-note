@@ -8,6 +8,8 @@
 #define PDFINKLOADER_H
 
 #include <QImage>
+#include <QList>
+#include <QPair>
 #include <QString>
 
 #include <kis_types.h>
@@ -41,6 +43,18 @@ public:
      */
     static bool loadInkLayersInto(const QString &kraPath, const KisImageSP &target,
                                   KisNodeSP parent, QString *why = nullptr);
+
+    /**
+     * One entry per layer of the artifact: the layer's own name and its pixels over the page's
+     * area, in the order they are stacked. Empty when the page has no artifact or it cannot be
+     * read as a document.
+     *
+     * This is what the strip reads back with: its content lives in one layer per kind, spanning
+     * the whole strip, so a page is the part of each of those layers inside that page's rectangle
+     * and the reload puts every entry back into the layer of the same name.
+     */
+    static QList<QPair<QString, QImage>> loadInkLayers(const QString &kraPath,
+                                                       QString *why = nullptr);
 
 private:
     PdfInkLoader() = delete;
