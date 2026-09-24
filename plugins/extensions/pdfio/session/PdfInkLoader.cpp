@@ -18,6 +18,16 @@
 #include <KArchiveFile>
 #include <KZip>
 
+#include <KisDocument.h>
+#include <KisImportExportErrorCode.h>
+#include <KisPart.h>
+#include <kra_converter.h>
+
+#include <kis_group_layer.h>
+#include <kis_image.h>
+#include <kis_paint_device.h>
+#include <kis_paint_layer.h>
+
 namespace {
 
 void fail(QString *why, const QString &message)
@@ -65,6 +75,112 @@ void collectMergedImage(const KArchiveDirectory *directory, const QString &prefi
 }
 
 } // namespace
+
+namespace {
+
+/// Copies \a layers into \a parent, keeping names, order and opacity, and keeping groups as
+/// groups. Nodes cannot be moved between images: each one is rebuilt in the target image and its
+/// pixels cloned, which is what PdfPageSaver does in the other direction.
+/// \a target by value: KisSharedPtr hands back a const KisImage through a const smart pointer,
+/// and addNode() is not a const method.
+void copyRestoredLayers(KisImageSP target, const QList<KisNodeSP> &layers, KisNodeSP parent)
+{
+    for (KisNodeSP child : layers) {
+        if (KisGroupLayer *group = qobject_cast<KisGroupLayer *>(child.data())) {
+            KisGroupLayerSP copy = new KisGroupLayer(target, group->name(), group->opacity(),
+                                                     target->colorSpace());
+            target->addNode(copy, parent);
+
+            QList<KisNodeSP> children;
+            for (quint32 i = 0; i < group->childCount(); ++i) {
+                children.append(group->at(i));
+            }
+            copyRestoredLayers(target, children, copy);
+            continue;
+        }
+
+        KisPaintLayer *paint = qobject_cast<KisPaintLayer *>(child.data());
+        if (!paint) {
+            continue;
+        }
+
+        KisPaintLayerSP copy = new KisPaintLayer(target, paint->name(), paint->opacity());
+        copy->paintDevice()->makeCloneFrom(paint->paintDevice(), paint->paintDevice()->extent());
+        copy->setX(paint->x());
+        copy->setY(paint->y());
+        target->addNode(copy, parent);
+    }
+}
+
+} // namespace
+
+bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &target,
+                                     KisNodeSP parent, QString *why)
+{
+    if (!QFileInfo::exists(kraPath)) {
+        /// Not an error: a page that was never drawn on has no artifact.
+        return false;
+    }
+
+    if (!target || !parent) {
+        fail(why, QStringLiteral("there is no page to put %1 into").arg(kraPath));
+        return false;
+    }
+
+    /// A copy of the shared pointer, because removeNode() and copyRestoredLayers() are not const.
+    KisImageSP page = target;
+
+    KisDocument *document = KisPart::instance()->createDocument();
+    if (!document) {
+        fail(why, QStringLiteral("no document could be made for %1").arg(kraPath));
+        return false;
+    }
+
+    KraConverter converter(document);
+    QFile file(kraPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        fail(why, QStringLiteral("cannot read %1").arg(kraPath));
+        KisPart::instance()->removeDocument(document, true);
+        return false;
+    }
+
+    const KisImportExportErrorCode code = converter.buildImage(&file);
+    file.close();
+    if (!code.isOk()) {
+        fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
+        KisPart::instance()->removeDocument(document, true);
+        return false;
+    }
+
+    const KisImageSP loaded = converter.image();
+    QList<KisNodeSP> layers;
+    if (loaded && loaded->root()) {
+        for (quint32 i = 0; i < loaded->root()->childCount(); ++i) {
+            layers.append(loaded->root()->at(i));
+        }
+    }
+
+    if (layers.isEmpty()) {
+        fail(why, QStringLiteral("%1 holds no layers").arg(kraPath));
+        KisPart::instance()->removeDocument(document, true);
+        return false;
+    }
+
+    /// The Ink group ships with an empty paint layer for the user to draw on
+    /// (PdfProjectBuilder::inkStrokeLayerName). The layers coming back take its place, or the page
+    /// would show both an empty stroke layer and the layers that hold the strokes.
+    QList<KisNodeSP> placeholders;
+    for (quint32 i = 0; i < parent->childCount(); ++i) {
+        placeholders.append(parent->at(i));
+    }
+    for (KisNodeSP placeholder : placeholders) {
+        page->removeNode(placeholder);
+    }
+
+    copyRestoredLayers(page, layers, parent);
+    KisPart::instance()->removeDocument(document, true);
+    return true;
+}
 
 QImage PdfInkLoader::loadInk(const QString &kraPath, QString *why)
 {

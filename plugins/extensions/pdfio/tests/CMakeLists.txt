@@ -181,7 +181,9 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripLayout.cpp
         )
 
-    target_include_directories(PdfStripBuilderTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_include_directories(PdfStripBuilderTest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_SOURCE_DIR}/plugins/impex/libkra)
 
     target_link_libraries(PdfStripBuilderTest PRIVATE
         Qt${QT_MAJOR_VERSION}::Core
@@ -189,6 +191,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         Qt${QT_MAJOR_VERSION}::Test
         Poppler::Qt${QT_MAJOR_VERSION}
         kritaimage
+        kritalibkra
         KF${KF_MAJOR}::Archive)
 
     target_compile_definitions(PdfStripBuilderTest PRIVATE
@@ -247,7 +250,8 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         kritalcmsengine)
 
     target_include_directories(PdfNavigatorIntegrationTest PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_SOURCE_DIR}/plugins/impex/libkra)
 
     target_link_libraries(PdfNavigatorIntegrationTest PRIVATE
         Qt${QT_MAJOR_VERSION}::Core
@@ -257,6 +261,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         Poppler::Qt${QT_MAJOR_VERSION}
         kritaui
         kritaimage
+        kritalibkra
         kritawidgetutils
         KF${KF_MAJOR}::Archive)
 

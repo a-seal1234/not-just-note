@@ -1403,16 +1403,50 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
     }
 
     const QString kraPath = QDir(m_projectDir).filePath(m_manifest.pages.at(index).kraFile);
-    const QImage savedInk = PdfInkLoader::loadInk(kraPath, nullptr);
-    if (!savedInk.isNull()) {
-        if (KisPaintLayer *stroke = qobject_cast<KisPaintLayer *>(PdfProjectBuilder::inkStrokeLayer(image).data())) {
-            stroke->paintDevice()->convertFromQImage(savedInk, 0, 0, 0);
-            say(QStringLiteral("restored %1x%2 of ink from %3")
-                    .arg(savedInk.width()).arg(savedInk.height()).arg(kraPath));
+
+    /// Whatever was drawn on this page comes back as the layers it was made of, not as one picture.
+    ///
+    /// The artifact is a .kra and holds the page's own layers (see PdfPageSaver), so a layer the
+    /// user made is a layer again -- its own name, inside the page's Ink group, and separate from
+    /// the rest. The merged image is what this used to load, and stays the fallback: an artifact
+    /// that cannot be read as a document still shows its picture.
+    KisNodeSP inkGroup;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        KisNodeSP child = image->root()->at(i);
+        if (child->name() == PdfProjectBuilder::inkLayerName()) {
+            inkGroup = child;
+            break;
         }
     }
 
-    return showImage(image, PdfProjectBuilder::inkStrokeLayer(image), index, PdfStripLayout(), why);
+    QString restoreWhy;
+    if (inkGroup && PdfInkLoader::loadInkLayersInto(kraPath, image, inkGroup, &restoreWhy)) {
+        say(QStringLiteral("restored the page's own layers from %1").arg(kraPath));
+    } else {
+        if (!restoreWhy.isEmpty()) {
+            say(QStringLiteral("page %1: %2; falling back to the flattened artifact")
+                    .arg(index + 1)
+                    .arg(restoreWhy));
+        }
+
+        const QImage savedInk = PdfInkLoader::loadInk(kraPath, nullptr);
+        if (!savedInk.isNull()) {
+            if (KisPaintLayer *stroke = qobject_cast<KisPaintLayer *>(PdfProjectBuilder::inkStrokeLayer(image).data())) {
+                stroke->paintDevice()->convertFromQImage(savedInk, 0, 0, 0);
+                say(QStringLiteral("restored %1x%2 of ink from %3")
+                        .arg(savedInk.width()).arg(savedInk.height()).arg(kraPath));
+            }
+        }
+    }
+
+    /// The node to draw on: the group's own stroke layer when the restored layers left one, and
+    /// the first layer of the group when they took its place.
+    KisNodeSP activeNode = PdfProjectBuilder::inkStrokeLayer(image);
+    if (!activeNode && inkGroup && inkGroup->childCount() > 0) {
+        activeNode = inkGroup->at(0);
+    }
+
+    return showImage(image, activeNode, index, PdfStripLayout(), why);
 }
 
 bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int index,
