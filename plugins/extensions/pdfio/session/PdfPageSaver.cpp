@@ -6,6 +6,10 @@
 
 #include "PdfPageSaver.h"
 
+#include <QDir>
+#include <QFileInfo>
+#include <QTextStream>
+
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfStripBuilder.h"
 
@@ -183,6 +187,45 @@ bool PdfPageSaver::saveDocument(KisDocument *document, const QString &path, QStr
     if (!document->saveAs(path, QByteArrayLiteral("application/x-krita"), false)) {
         fail(why, QStringLiteral("could not start saving %1").arg(path));
         return false;
+    }
+
+    /// The same layers, also written as plain PNGs beside the artifact, with a one-line-per-layer
+    /// index.
+    ///
+    /// Reading a page's layers back out of the artifact means opening a document, and on the tablet
+    /// five of those per window move end in SIGSEGV -- logcat ends at "strip: reading the layers of
+    /// page 4" and a tombstone follows two seconds later. A PNG per layer costs one QImage to read
+    /// and nothing else, which is what the layer path is meant to read from now on. The artifact
+    /// keeps its layers either way; this is the cheap copy, not a replacement.
+    const KisImageSP image = document->image();
+    if (image && image->root() && !image->root()->childCount() == 0) {
+        const QString index = path + QStringLiteral(".layers.txt");
+        QFile list(index);
+        if (list.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream out(&list);
+            out << "# index\tname\tfile\topacity\tx\ty\n";
+            const QRect bounds = image->bounds();
+            int count = 0;
+            for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+                KisPaintLayer *layer =
+                    qobject_cast<KisPaintLayer *>(image->root()->at(i).data());
+                if (!layer || !layer->visible()) {
+                    continue;
+                }
+
+                const QImage pixels = layer->paintDevice()->convertToQImage(nullptr, bounds);
+                const QString file = QStringLiteral("%1.layers/%2.png").arg(path).arg(count);
+                QDir().mkpath(QFileInfo(file).absolutePath());
+                if (pixels.isNull() || !pixels.save(file, "PNG")) {
+                    continue;
+                }
+
+                out << count << '\t' << layer->name() << '\t'
+                    << QFileInfo(file).fileName() << '\t'
+                    << layer->opacity() << '\t' << layer->x() << '\t' << layer->y() << '\n';
+                ++count;
+            }
+        }
     }
 
     return true;
