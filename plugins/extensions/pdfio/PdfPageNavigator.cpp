@@ -141,14 +141,24 @@ constexpr qreal StripCentreHysteresis = 48.0;
 constexpr int SaveLandingTimeoutMs = 15000;
 
 /// The idle half of the saving pipeline: how long the ink has to be quiet before it is written
-/// down, how often that is asked, and the smallest gap between two such writes.
+/// down, how often that is asked, the smallest gap between two such writes, and the longest the
+/// ink may sit unsaved.
 ///
-/// Long enough that a paragraph is not copied to disk between every two strokes, short enough
-/// that putting the pen down and the app dying within the same breath still loses nothing but
-/// the last stroke -- and a page turn never has to be what makes an unsaved page safe.
-constexpr qint64 InkSettleMs = 600;
+/// Six hundred milliseconds was the first answer and the running notebook showed why it was
+/// wrong: a stroke marks every page of the strip -- which page it fell on is only decided at save
+/// time -- so every pause in writing, the moment between two sentences, rewrote all five pages,
+/// about ten megabytes, over and over. Measured in pdfio.log: seven full five-page cycles inside
+/// thirty seconds of taking notes.
+///
+/// Ten seconds of quiet is a pause someone actually took. The five minute backstop is what keeps
+/// ink safe from someone who never pauses. Neither is what protects a page turn: the turn, the
+/// roll and the close each write their pages and wait for the landing themselves, which is where
+/// the ink would otherwise be lost. The idle write only decides how much is at risk if the
+/// application dies -- at most the last ten seconds, or five minutes of continuous writing.
+constexpr qint64 InkSettleMs = 10000;
 constexpr qint64 AutoSaveTickMs = 250;
-constexpr qint64 AutoSaveMinGapMs = 800;
+constexpr qint64 AutoSaveMinGapMs = 1000;
+constexpr qint64 AutoSaveMaxIntervalMs = 5 * 60 * 1000;
 
 /// The gap the strip decoration leaves between pages, in widget pixels.
 constexpr qreal GapWidgetPixels = 16;
@@ -313,27 +323,31 @@ void PdfPageNavigator::checkScrollFollow()
     /// converter it comes from is re-laid out while the strip repaints.
     const qreal zoom = converter->effectiveZoom();
 
-    /// The vertical scrollbar instead, which says the same thing as integers and never moves on its
-    /// own. KisCanvasController::resetScrollBars() sets its value to the top-left corner of the
-    /// painted region, in image pixels, and its range to leave the visible height out of the image
-    /// height -- so the middle of the viewport is value + visible / 2, with no converter, no zoom
-    /// and no layout state involved. Only the vertical axis matters: a strip is vertical.
+    /// The vertical scrollbar, for the log. Its integers are the record of what the canvas
+    /// controller thought the view was doing, and telling a wrong reading from a stale one needs
+    /// both numbers.
+    ///
+    /// It is NOT what the centre is computed from any more. resetScrollBars() sets its range from
+    /// KisCoordinatesConverter::minimumOffset()/maximumOffset() and its value from
+    /// documentOffset(), and all of those are in WIDGET pixels -- the bounds are built as
+    /// dPointMax - canvasWidgetSize + vast scrolling, against the canvas widget. The arithmetic
+    /// that used to be here read them as image pixels and mixed the two, which made the centre
+    /// drift with the zoom by everything the scrollbar was ahead of the image: measured on the
+    /// tablet, the same place in the strip read 6670 at zoom 0.641 and 7888 at zoom 1.027, the
+    /// follow turned pages nobody had scrolled to, and at zoom 0.939 the "visible" term went
+    /// negative so the reading came out as centre (0,-244) of a 1653x12240 image -- outside the
+    /// image, dropped as impossible, with the follow blind while the user was pinch-zooming.
     auto *scrollArea = dynamic_cast<QAbstractScrollArea *>(m_view->canvasController());
     QScrollBar *bar = scrollArea ? scrollArea->verticalScrollBar() : nullptr;
-    if (!bar) {
-        return;
-    }
-    const int visible = qMax(1, int(imageSize.height()) - (bar->maximum() - bar->minimum()));
 
-    /// Where the document origin sits inside the canvas widget, in widget pixels. Turning the
-    /// widget's middle back into a document point this way does not go through the rectangle
-    /// mapping that reported nonsense.
-    /// The canvas controller already answers "which document point is in the middle of the
-    /// viewport" -- it is the value the controller pans by, computed from
-    /// imageRectInWidgetPixels() rather than from the converter's document offset, which is in a
-    /// different unit and put the centre of the viewport outside the image (centre (2744,-3700) of
-    /// a 1102x5058 image).
-    const QPointF centre(0.0, bar->value() + visible / 2.0);
+    /// The middle of the viewport, asked of the one thing that knows where the image sits: the
+    /// converter's own widget-to-image transform, at the same widget centre that transform was
+    /// computed against. There are no units to get wrong and no zoom term of its own -- zooming
+    /// about the middle of the viewport leaves the middle of the viewport where it was, which is
+    /// what stops a pinch from looking like a scroll, and it is right at the end of the notebook
+    /// as well: at the bottom the reading is the bottom of the image minus half a viewport, which
+    /// is inside the last page's own cell rather than two pages above it.
+    const QPointF centre = converter->widgetToImage(converter->widgetCenterPoint());
 
     /// Which page the middle of the view is over, in document coordinates.
     ///
@@ -350,9 +364,13 @@ void PdfPageNavigator::checkScrollFollow()
     if (!imageBounds.adjusted(-4, -4, 4, 4).contains(centre)) {
         if (now - m_lastRejectLog > 2000) {
             m_lastRejectLog = now;
-            say(QStringLiteral("scroll: dropped a reading: zoom %1, centre (%2,%3) of a %4x%5 image")
+            say(QStringLiteral("scroll: dropped a reading: zoom %1, centre (%2,%3) of a %4x%5 image, "
+                               "bar %6 of %7..%8")
                     .arg(zoom, 0, 'f', 3).arg(qRound(centre.x())).arg(qRound(centre.y()))
-                    .arg(qRound(imageSize.width())).arg(qRound(imageSize.height())));
+                    .arg(qRound(imageSize.width())).arg(qRound(imageSize.height()))
+                    .arg(bar ? bar->value() : -1)
+                    .arg(bar ? bar->minimum() : 0)
+                    .arg(bar ? bar->maximum() : 0));
         }
         return;
     }
@@ -670,8 +688,12 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
 
     /// And with no ink-change history: the clock the idle write waits on starts at the first
     /// stroke actually made in this notebook, not wherever the last one left it.
+    ///
+    /// The overdue clock starts NOW, for the same reason in the other direction: left at zero it
+    /// would mean "overdue since the epoch", and the five minute backstop would fire on the very
+    /// first tick after the first stroke.
     m_lastInkChange = 0;
-    m_lastAutoSave = 0;
+    m_lastAutoSave = QDateTime::currentMSecsSinceEpoch();
 
     m_projectDir = projectDir;
     m_manifest = manifest;
@@ -1692,9 +1714,12 @@ void PdfPageNavigator::pumpAutoSave()
     }
 
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now - m_lastInkChange < InkSettleMs) {
-        /// The pen may still be down. A write takes a copy of the whole ink of its page, and
-        /// copying a paragraph one stroke at a time is work the settle gap exists to avoid.
+    const bool quiet = now - m_lastInkChange >= InkSettleMs;
+    const bool overdue = now - m_lastAutoSave >= AutoSaveMaxIntervalMs;
+    if (!quiet && !overdue) {
+        /// The pen may still be down and nothing is overdue: writing now would copy a paragraph
+        /// one stroke at a time, which is the work the settle gap exists to avoid -- and in a
+        /// strip it copies every page's ink, not only the one being written on.
         return;
     }
     if (now - m_lastAutoSave < AutoSaveMinGapMs) {

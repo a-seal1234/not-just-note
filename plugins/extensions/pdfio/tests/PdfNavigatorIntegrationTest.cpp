@@ -69,6 +69,7 @@ private Q_SLOTS:
     void testCleanTurnEvictsWithoutSaving();
     void testDirtyPageIsSavedBeforeEvictionAndTheInkComesBack();
     void testRefusedSaveKeepsThePageOpenAndTheInkIntact();
+    void testInkIsNotWrittenWhileThePenIsStillBusy();
     void testQuittingWritesTheInkToo();
     void testClosingTheTabWritesTheInkAndAsksNothing();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
@@ -513,6 +514,41 @@ void PdfNavigatorIntegrationTest::testRefusedSaveKeepsThePageOpenAndTheInkIntact
     QCOMPARE(navigator()->pageWindow().evictionCount(), 1);
     QCOMPARE(navigator()->pageWindow().savedBeforeEvictionCount(), 1);
     QCOMPARE(navigator()->pageWindow().blockedEvictionCount(), 2);
+}
+
+/**
+ * The idle write waits for a pause, and a page turn is what writes promptly.
+ *
+ * The pipeline used to write the ink down after 600 ms of quiet, and in a strip that means every
+ * page of the window -- which page a stroke belongs to is only decided at save time -- so taking
+ * notes rewrote all five artifacts, some ten megabytes, every three seconds of the session
+ * (pdfio.log, 2026-09-24: seven full five-page cycles inside thirty seconds). Ten seconds of
+ * quiet is now the earliest an idle write runs and five minutes is the longest ink may sit
+ * unsaved, so a second and a half after a stroke nothing may be on disk -- and the page turn
+ * must still write it and wait for the landing, because that is what stands between a turn and a
+ * lost stroke.
+ */
+void PdfNavigatorIntegrationTest::testInkIsNotWrittenWhileThePenIsStillBusy()
+{
+    QVERIFY(useNotebook(QStringLiteral("busy")));
+
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    /// Six ticks of the idle timer, and nothing to show for them.
+    QTest::qWait(1500);
+    const QString artifact = artifactFor(0);
+    QVERIFY2(!QFileInfo::exists(artifact),
+             "the idle write fired while the ink had barely stopped moving");
+
+    /// The turn writes it, waits for it to land, and the mark is in what it wrote.
+    QString why;
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 1);
+    QVERIFY2(waitForInk(artifact), qPrintable(artifact));
+    QVERIFY2(inkMarkInImage(PdfInkLoader::loadInk(artifact)),
+             "the turn wrote the page without the ink that was on it");
 }
 
 /**

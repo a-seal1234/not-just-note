@@ -21,8 +21,15 @@
  * PdfPageNavigator::checkScrollFollow() has all the parts for it. m_scrollWatch ticks every 150 ms
  * while idle, and it only turns when the page under the centre of the viewport has been the same
  * for SettleMs (450) and the last turn is older than TurnCooldownMs (700)
- * (PdfPageNavigator.cpp:159-215). The page under the centre comes from pageAtDocumentPoint(),
- * whose strip branch is an exact rectangle test over m_stripRects (:307-317).
+ * (PdfPageNavigator.cpp:281-450). The page under the centre comes from pageAtDocumentPoint(),
+ * whose strip branch is an exact rectangle test over m_stripRects (:530).
+ *
+ * What this replica takes as given is the centre itself, and that is where the reported "the
+ * coordinates of each page are wrong, and at the end it stays on the second to last page" came
+ * from: the navigator read the centre out of the vertical scrollbar in the wrong unit, so the
+ * answer drifted with the zoom and could not reach the last pages. It is now the converter's own
+ * widgetToImage(widgetCenterPoint()). The mapping from a sane centre to a page -- everything
+ * below -- did not change, and is what these numbers are about.
  *
  * That leaves two candidate causes and this test distinguishes them with numbers, because the fix
  * is different for each:
@@ -39,11 +46,11 @@
  */
 namespace {
 
-/// PdfPageNavigator.cpp:89-93.
+/// PdfPageNavigator.cpp:117-121.
 constexpr qint64 TurnCooldownMs = 700;
 constexpr qint64 SettleMs = 450;
 
-/// PdfPageNavigator.cpp:465: m_scrollWatch->start(150).
+/// PdfPageNavigator.cpp:710: m_scrollWatch->start(150).
 constexpr qint64 TickMs = 150;
 
 /// How the centre of the viewport is mapped to a page: exactly as the navigator does today, or
