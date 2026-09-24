@@ -896,7 +896,9 @@ void PdfIoPlugin::runPanProbe()
 void PdfIoPlugin::runStripProbe()
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
-    navigator->setScope(3);
+    /// The scope the application ships with, not a number of the probe's own: the strip probe had
+    /// its own three, so it tested a window the user never sees.
+    navigator->setScope(5);
 
     QString why;
     if (!navigator->openNotebook(qEnvironmentVariable("PDFIO_PROBE"), &why)) {
@@ -936,8 +938,12 @@ void PdfIoPlugin::runStripProbe()
     const QString groupName = PdfStripBuilder::inkGroupName(first);
     for (quint32 i = 0; i < image->root()->childCount(); ++i) {
         KisNodeSP child = image->root()->at(i);
-        if (child->name() == groupName && child->childCount() > 0) {
-            stroke = qobject_cast<KisPaintLayer *>(child->at(0).data());
+        /// The strip holds ONE content layer, "Ink" (PdfStripBuilder::build), and a page is the
+        /// part of it inside that page's rectangle. This used to look for a group per page, a
+        /// design the strip no longer has: the probe answered "no Ink layer for page 1" and never
+        /// reached the turn it exists to exercise.
+        if (child->name() == QStringLiteral("Ink")) {
+            stroke = qobject_cast<KisPaintLayer *>(child.data());
             break;
         }
     }
@@ -948,6 +954,13 @@ void PdfIoPlugin::runStripProbe()
 
     stroke->paintDevice()->fill(QRect(area.x() + 100, area.y() + 100, 200, 40),
                                 KoColor(Qt::black, image->colorSpace()));
+    /// The window only writes a page it believes is dirty, and a direct write into a paint device
+    /// does not set that: without this the turn writes no artifact, and the roll this probe exists
+    /// to exercise has nothing to read back.
+    if (KisDocument *page = navigator->currentDocument()) {
+        page->setModified(true);
+    }
+
     say(QStringLiteral("strip: drew at %1,%2 in the strip, which is the page's 100,100")
             .arg(area.x() + 100).arg(area.y() + 100));
 
@@ -1016,6 +1029,21 @@ void PdfIoPlugin::runStripProbe()
                         }
                     }
                 }
+
+                /// Turn far enough to MOVE the window. One turn forward and back never reaches
+                /// the roll -- the active page has to hit the edge of the strip first -- and the
+                /// roll is the path this probe exists to reach: a window move saves every page,
+                /// reads them back and repaints.
+                for (int i = 0; i < 6; ++i) {
+                    QString rollWhy;
+                    if (!navigator->next(&rollWhy)) {
+                        say(QStringLiteral("strip: cannot turn forward any further: %1")
+                                .arg(rollWhy));
+                        break;
+                    }
+                }
+                say(QStringLiteral("strip: after six turns the active page is %1")
+                        .arg(navigator->currentIndex() + 1));
 
                 say(QStringLiteral("strip: artifact %1x%2, page is %3x%4, ink at %5,%6 %7x%8 "
                                    "(expected 100,100 200x40)")

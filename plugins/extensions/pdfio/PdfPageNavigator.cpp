@@ -847,14 +847,6 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     }
 
     const KoColorSpace *colorSpace = m_document->image()->colorSpace();
-    KisPaintLayer *ink = nullptr;
-    for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
-        KisNodeSP child = m_document->image()->root()->at(i);
-        if (child->name() == QStringLiteral("Ink")) {
-            ink = qobject_cast<KisPaintLayer *>(child.data());
-            break;
-        }
-    }
 
     const QList<PdfStripLayout::Slot> slots = target.slots();
 
@@ -940,15 +932,80 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     ///
     /// Synchronous: no event loop runs inside this loop, so no stroke can land between a wipe and
     /// the repaint that follows it.
+    ///
+    /// The strip's content layers, by name: the managed "Ink" and whatever else the pages carry,
+    /// one layer per kind spanning the whole strip. A page is the part of every one of those
+    /// layers inside that page's rectangle, which is how the artifact is written.
+    QList<KisPaintLayer *> content;
+    KisPaintLayer *ink = nullptr;
+    for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
+        KisNodeSP child = m_document->image()->root()->at(i);
+        if (PdfPageSaver::isPageBackground(child)) {
+            continue;
+        }
+        if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
+            content.append(layer);
+            if (!ink && layer->name() == QStringLiteral("Ink")) {
+                ink = layer;
+            }
+        }
+    }
+
+    /// Read every page's layers BEFORE the repainting starts.
+    ///
+    /// Opening an artifact means opening a document, and doing that inside the loop that is
+    /// repainting the live strip is where this crashed on the tablet: SIGSEGV on the main loop
+    /// thread, faulting frames inside this library, about three hundred milliseconds after a
+    /// window's writes had landed. Read first, repaint second -- and the log says which page was
+    /// being read, which is the line the next crash would be read from.
+    QHash<int, QList<QPair<QString, QImage>>> pageLayers;
+    for (const PdfStripLayout::Slot &slot : slots) {
+        if (slot.page < 0 || pageLayers.contains(slot.page)) {
+            continue;
+        }
+
+        const QString kraPath =
+            QDir(m_projectDir).filePath(m_manifest.pages.at(slot.page).kraFile);
+        say(QStringLiteral("strip: reading the layers of page %1").arg(slot.page + 1));
+        pageLayers.insert(slot.page, PdfInkLoader::loadInkLayers(kraPath, nullptr));
+        say(QStringLiteral("strip: page %1 came back with %2 layer(s)")
+                .arg(slot.page + 1)
+                .arg(pageLayers.value(slot.page).size()));
+
+        /// A layer the page has and the strip does not yet gets its place here, before anything
+        /// is repainted, rather than in the middle of the repaint.
+        for (const QPair<QString, QImage> &saved : pageLayers.value(slot.page)) {
+            bool known = false;
+            for (KisPaintLayer *layer : content) {
+                if (layer->name() == saved.first) {
+                    known = true;
+                    break;
+                }
+            }
+            if (known) {
+                continue;
+            }
+
+            KisPaintLayerSP added = new KisPaintLayer(m_document->image(), saved.first,
+                                                      OPACITY_OPAQUE_U8);
+            m_document->image()->addNode(added, m_document->image()->root());
+            content.append(added.data());
+            say(QStringLiteral("strip: layer \"%1\" joins the strip for page %2")
+                    .arg(saved.first)
+                    .arg(slot.page + 1));
+        }
+    }
+
     for (int i = 0; i < slots.size(); ++i) {
         const int newPage = slots.at(i).page;
 
         /// The whole band, because the page arriving may be smaller than the one that was there.
-        /// Every page's ink is on disk -- phase one wrote the whole window before this loop was
-        /// allowed to run -- so the wipe below cannot take anything with it.
-        if (ink) {
-            ink->paintDevice()->fill(slots.at(i).cell,
-                                     KoColor(Qt::transparent, m_document->image()->colorSpace()));
+        /// Every page's content is on disk -- phase one wrote the whole window before this loop
+        /// was allowed to run -- so the wipe below cannot take anything with it. Every content
+        /// layer, because every one of them belongs to the page that is arriving.
+        for (KisPaintLayer *layer : content) {
+            layer->paintDevice()->fill(slots.at(i).cell,
+                                       KoColor(Qt::transparent, m_document->image()->colorSpace()));
         }
 
         /// const_cast because KisSharedPtr::data() hands back a const node, and the paper layer is
@@ -967,8 +1024,8 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         if (paper) {
             paper->setDirty(slots.at(i).cell);
         }
-        if (ink) {
-            ink->setDirty(slots.at(i).cell);
+        for (KisPaintLayer *layer : content) {
+            layer->setDirty(slots.at(i).cell);
         }
 
         if (newPage < 0) {
@@ -982,12 +1039,35 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             paper->setName(PdfStripBuilder::backgroundLayerName(newPage));
         }
 
-        const QImage savedInk = PdfInkLoader::loadInk(
-            QDir(m_projectDir).filePath(m_manifest.pages.at(newPage).kraFile), nullptr);
-        if (ink && !savedInk.isNull()) {
-            ink->paintDevice()->convertFromQImage(savedInk, nullptr,
-                                                  slots.at(i).rect.x(), slots.at(i).rect.y());
-            ink->setDirty(slots.at(i).cell);
+        /// Every layer the page has, into the layer of the same name at this page's own
+        /// rectangle. Nothing is read here: the reads happened above, before the repaint started.
+        /// A layer the strip does not have falls back to Ink -- the content still lands, and it
+        /// never builds a layer in the middle of a repaint.
+        const QList<QPair<QString, QImage>> saved = pageLayers.value(newPage);
+        for (const QPair<QString, QImage> &entry : saved) {
+            KisPaintLayer *target = nullptr;
+            for (KisPaintLayer *layer : content) {
+                if (layer->name() == entry.first) {
+                    target = layer;
+                    break;
+                }
+            }
+            if (!target) {
+                target = ink;
+                if (target) {
+                    say(QStringLiteral("strip: page %1 carries layer \"%2\" and the strip has "
+                                       "none; its pixels go into Ink")
+                            .arg(newPage + 1)
+                            .arg(entry.first));
+                }
+            }
+            if (!target) {
+                continue;
+            }
+
+            target->paintDevice()->convertFromQImage(entry.second, nullptr,
+                                                    slots.at(i).rect.x(), slots.at(i).rect.y());
+            target->setDirty(slots.at(i).cell);
         }
         if (paper) {
             paper->setDirty(slots.at(i).cell);
@@ -1021,30 +1101,6 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             && anchorSlot < m_stripRects.size()) {
             anchorPage = m_stripPages.at(anchorSlot);
             anchorInPage = centre - QPointF(m_stripRects.at(anchorSlot).topLeft());
-        }
-    }
-
-    /// And anything else the user put on the strip is folded away.
-    ///
-    /// Every layer of a page is saved now (see PdfPageSaver) and comes back inside the one managed
-    /// layer, "Ink", so a layer of the user's own left standing beside it would carry the same
-    /// strokes a second time -- and the layer panel would show a page's content floating outside
-    /// the notebook's own layer, which is what "the other layers are still floating" was. Nothing
-    /// is lost by dropping it here: phase one wrote its pixels into the page's artifact, and the
-    /// loop above has just read that artifact back into Ink.
-    if (m_document && m_document->image()) {
-        QList<KisNodeSP> strangers;
-        for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
-            KisNodeSP child = m_document->image()->root()->at(i);
-            if (child->name() == QStringLiteral("Ink") || PdfPageSaver::isPageBackground(child)) {
-                continue;
-            }
-            strangers.append(child);
-        }
-        for (KisNodeSP stranger : strangers) {
-            say(QStringLiteral("strip: folding layer \"%1\" into the notebook's own layer")
-                    .arg(stranger->name()));
-            m_document->image()->removeNode(stranger);
         }
     }
 

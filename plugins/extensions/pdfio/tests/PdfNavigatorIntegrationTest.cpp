@@ -83,7 +83,11 @@ private:
     /// Opens a notebook from its own copy of the fixture. The project directory is named after
     /// the source file, so a differently named copy is a different notebook: each test starts
     /// with an empty page store rather than whatever the test before it wrote.
-    bool useNotebook(const QString &name);
+    /// Opens a notebook and pins the scope it is read at. The application ships with the strip on
+    /// (five pages) and most of these cases are about the single page document -- design A -- so
+    /// the scope is asked for here instead of inherited from a default that is something else now.
+    /// The strip case asks for five.
+    bool useNotebook(const QString &name, int scope = 1);
 
     /// Paints a black square on the open page's ink layer and marks the document modified.
     void drawInk(KisDocument *document);
@@ -331,8 +335,10 @@ void PdfNavigatorIntegrationTest::cleanupTestCase()
     QDir(projectsRoot()).removeRecursively();
 }
 
-bool PdfNavigatorIntegrationTest::useNotebook(const QString &name)
+bool PdfNavigatorIntegrationTest::useNotebook(const QString &name, int scope)
 {
+    navigator()->setScope(scope);
+
     const QString source = m_dir.filePath(name + QStringLiteral(".pdf"));
     if (!QFileInfo::exists(source) && !QFile::copy(m_fixture, source)) {
         qWarning("[nav-integration] cannot copy the fixture to %s", qPrintable(source));
@@ -662,7 +668,7 @@ void PdfNavigatorIntegrationTest::testRollWritesEveryWindowPageAndRedrawsFromDis
     QVERIFY2(QFileInfo::exists(m_fixture), qPrintable(m_fixture));
     navigator()->setScope(5);
 
-    QVERIFY(useNotebook(QStringLiteral("roll")));
+    QVERIFY(useNotebook(QStringLiteral("roll"), 5));
 
     /// The copy is made; the swap has done its job. Restored here instead of at the end so a
     /// failure inside this test cannot leave the next one opening a fifty-page notebook nobody

@@ -306,7 +306,10 @@ private:
     /// above and below in one document, the window rolling rather than rebuilding, the active page
     /// following the middle of the viewport. Raising it to three turns that on. It is left at one
     /// deliberately, so the notebook is usable while the strip is finished.
-    int m_scope = 1;
+    /// Five pages at a time, which is what the notebook ships with: the active page with two on
+    /// each side. One page at a time is still reachable from the menu, and the default used to be
+    /// that -- a page with no neighbours on screen, which is not what the notebook is for.
+    int m_scope = 5;
     qreal m_dpi = 200.0;
 
     /**
