@@ -796,57 +796,95 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
     }
 
     const QList<PdfStripLayout::Slot> slots = target.slots();
-    int changed = 0;
 
-    /// Phase one: write every page whose band is about to disappear, and touch not a single pixel
-    /// until every one of those writes has landed.
+    /// Phase one: write EVERY page the window holds -- all of them, not only the ones whose band
+    /// is about to leave -- and touch not a single pixel until every one of those writes has
+    /// landed.
     ///
-    /// The write used to be started from inside the repaint below, and its result was dropped on
-    /// the floor -- the band was wiped straight afterwards whatever the write did. A write that
-    /// failed to start, or that never reported back (which is what Krita does to a second
-    /// background save started while the first is running), therefore took the only copy of that
-    /// page's ink with the wipe, and a scroll was enough to reach it: ink gone, sometimes, and
-    /// only when the timing lined up. Failing before any wipe leaves the strip exactly as it was:
-    /// a roll that cannot be completed safely is a roll that does not happen -- the rule the
-    /// bounded page window already follows for evicting a page.
+    /// Saving only the leaving pages was the incremental design: keep whatever is already
+    /// correct and patch the difference. It holds only while "already correct" is true, and
+    /// nothing proved that -- a write that failed to start, or that never reported (Krita wedges
+    /// a second background save started while the first is running), left the screen showing ink
+    /// that was on disk nowhere, and a scroll was enough to reach it. Writing everything first
+    /// gives the redraw below one thing to be built from: the artifacts. After a window move the
+    /// strip and the disk are checked against each other on every roll instead of assumed to
+    /// agree, which is the flow: save the window, then redraw it from what was saved.
+    ///
+    /// A clean pass, because each write waits inside an event loop and the pen can land a stroke
+    /// while it does: the mark set is re-read after every pass, and a page still marked means the
+    /// ink moved after its own write took its copy, so the pass runs again to catch it. Three
+    /// passes that never come out clean mean the user is drawing THROUGH the roll, and the roll
+    /// then refuses -- the stroke stays on screen and in memory, and the idle write takes it when
+    /// the pen lifts. Redrawing from a disk that does not have the stroke would be losing it the
+    /// slow way.
     ///
     /// m_savingPages is held for the whole roll: the follow timer and the queued re-centre both
     /// watch it, and neither may turn a page on top of the writes this is waiting for.
     const bool wasSaving = m_savingPages;
     m_savingPages = true;
-    for (int i = 0; i < slots.size(); ++i) {
-        const int oldPage = i < m_stripPages.size() ? m_stripPages.at(i) : -1;
-        const int newPage = slots.at(i).page;
-        if (oldPage == newPage || oldPage < 0) {
-            continue;
+
+    const auto stripIsClean = [this]() {
+        for (int page : m_window.dirtyPages()) {
+            if (m_stripPages.contains(page)) {
+                return false;
+            }
         }
-        QString saveWhy;
-        if (!saveThroughQueue(oldPage, &saveWhy)) {
+        return true;
+    };
+
+    int saved = 0;
+    constexpr int MaxSavePasses = 3;
+    for (int pass = 1;; ++pass) {
+        for (int page : m_stripPages) {
+            if (page < 0) {
+                continue;
+            }
+            QString saveWhy;
+            if (!saveThroughQueue(page, &saveWhy)) {
+                m_savingPages = wasSaving;
+                fail(why, QStringLiteral("the window cannot move past page %1: %2. The strip is unchanged.")
+                              .arg(page + 1)
+                              .arg(saveWhy));
+                say(QStringLiteral("strip: roll refused before touching anything: %1").arg(*why));
+                return false;
+            }
+            ++saved;
+        }
+
+        if (stripIsClean()) {
+            break;
+        }
+        if (pass >= MaxSavePasses) {
             m_savingPages = wasSaving;
-            fail(why, QStringLiteral("the window cannot move past page %1: %2. The strip is unchanged.")
-                          .arg(oldPage + 1)
-                          .arg(saveWhy));
-            say(QStringLiteral("strip: roll refused before touching anything: %1").arg(*why));
+            fail(why, QStringLiteral("the ink kept arriving while the window was being written; "
+                                     "the strip is unchanged"));
+            say(QStringLiteral("strip: roll refused after %1 write passes: %2").arg(pass).arg(*why));
             return false;
         }
+        say(QStringLiteral("strip: the ink moved during write pass %1; writing the window again")
+                .arg(pass));
     }
 
-    /// And nothing is still landing when the incoming pages are read back out of their artifacts
-    /// below: an idle write queued behind the ones just made would have those reads waiting on a
-    /// file it has not finished yet.
+    /// And nothing is still landing when the redraw reads the artifacts back below: an idle write
+    /// queued behind the ones just made would have those reads waiting on a file it has not
+    /// finished yet.
     drainWrites(nullptr);
 
+    /// Phase two: redraw the WHOLE window from what was just written -- every slot, paper and
+    /// ink alike, whether its page changed bands or not. Nothing on screen comes from before the
+    /// roll: the paper is rendered again from the source PDF and the ink is read back out of the
+    /// artifact it was just written to, so after a move what you see IS the disk, and a slot
+    /// holding stale pixels -- the class of bug this flow replaces -- cannot survive a window
+    /// move.
+    ///
+    /// Synchronous: no event loop runs inside this loop, so no stroke can land between a wipe and
+    /// the repaint that follows it.
     for (int i = 0; i < slots.size(); ++i) {
-        const int oldPage = i < m_stripPages.size() ? m_stripPages.at(i) : -1;
         const int newPage = slots.at(i).page;
-        if (oldPage == newPage) {
-            continue;
-        }
-        ++changed;
 
         /// The whole band, because the page arriving may be smaller than the one that was there.
-        /// The leaving page's ink is already on disk -- phase one wrote every leaving page before
-        /// this loop was allowed to run -- so the wipe below cannot take anything with it.
+        /// Every page's ink is on disk -- phase one wrote the whole window before this loop was
+        /// allowed to run -- so the wipe below cannot take anything with it.
         if (ink) {
             ink->paintDevice()->fill(slots.at(i).cell,
                                      KoColor(Qt::transparent, m_document->image()->colorSpace()));
@@ -907,7 +945,10 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
     }
 
     m_savingPages = wasSaving;
-    say(QStringLiteral("strip: rolled the window, repainting %1 slot(s)").arg(changed));
+    say(QStringLiteral("strip: window moved to page %1: %2 write(s) landed, %3 slot(s) redrawn from disk")
+            .arg(index + 1)
+            .arg(saved)
+            .arg(slots.size()));
     return activateWithinStrip(index, why);
 }
 

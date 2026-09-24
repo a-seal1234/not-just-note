@@ -70,9 +70,10 @@ private Q_SLOTS:
     void testDirtyPageIsSavedBeforeEvictionAndTheInkComesBack();
     void testRefusedSaveKeepsThePageOpenAndTheInkIntact();
     void testQuittingWritesTheInkToo();
-    /// Last on purpose: it is the case that leaves nothing open, which is the state the teardown
-    /// below is happiest in.
     void testClosingTheTabWritesTheInkAndAsksNothing();
+    /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
+    /// test that would care -- so a failure inside it cascades to nothing that runs after it.
+    void testRollWritesEveryWindowPageAndRedrawsFromDisk();
 
 private:
     PdfPageNavigator *navigator() const;
@@ -116,6 +117,26 @@ QString projectsRoot()
 KisPaintLayer *inkLayer(const KisImageSP &image)
 {
     return qobject_cast<KisPaintLayer *>(PdfProjectBuilder::inkStrokeLayer(image).data());
+}
+
+/// The STRIP's ink layer, found the way the plugin itself finds it: by name.
+///
+/// PdfProjectBuilder::inkStrokeLayer() answers for a page document -- a root whose second layer
+/// is the Ink group -- and a strip image is built differently: a Desk, one paper layer per slot,
+/// then a single layer called "Ink" above all of them. Asking the page-shaped helper about a
+/// strip image hands back nothing, which is what this test hit on its first run.
+KisPaintLayer *stripInkLayer(const KisImageSP &image)
+{
+    if (!image) {
+        return nullptr;
+    }
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        KisNodeSP child = image->root()->at(i);
+        if (child->name() == QStringLiteral("Ink")) {
+            return qobject_cast<KisPaintLayer *>(child.data());
+        }
+    }
+    return nullptr;
 }
 
 /**
@@ -542,6 +563,126 @@ void PdfNavigatorIntegrationTest::testClosingTheTabWritesTheInkAndAsksNothing()
     const QStringList rootKra = project.entryList(QStringList() << QStringLiteral("*.kra"), QDir::Files);
     QVERIFY2(rootKra.isEmpty(), qPrintable(rootKra.join(QLatin1Char(','))));
     QCOMPARE(homeKraFiles(), homeKraBefore);
+}
+
+/**
+ * A window move as a whole, as a flow: write every page the window holds, then redraw the whole
+ * window from what was written.
+ *
+ * The strip opens at scope five over a fifty-page source -- the ordinary fixture is three pages,
+ * and a window of five over three never has anywhere to go -- and a mark is placed inside a page
+ * that will STAY in the window when it moves. Turning to a page outside the window is what rolls
+ * it. Afterwards:
+ *
+ *  - every page the old window held has its artifact on disk: the roll writes all five, not only
+ *    the two whose band was about to leave,
+ *  - the mark is in the artifact of the page it was drawn on, and
+ *  - the mark is ON SCREEN in the new window, in a slot whose page did not change.
+ *
+ * The third is what fails without the redraw-from-saved flow. The roll wipes every slot it
+ * repaints, so a mark visible in a slot whose page did not change can only have come back out of
+ * the artifact -- the incremental roll kept such slots' pixels in memory instead, and this
+ * asserts the pixels came from the disk.
+ */
+void PdfNavigatorIntegrationTest::testRollWritesEveryWindowPageAndRedrawsFromDisk()
+{
+    /// A source long enough that a five-page window has somewhere to roll to.
+    const QString usualFixture = m_fixture;
+    m_fixture = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(m_fixture), qPrintable(m_fixture));
+    navigator()->setScope(5);
+
+    QVERIFY(useNotebook(QStringLiteral("roll")));
+
+    /// The copy is made; the swap has done its job. Restored here instead of at the end so a
+    /// failure inside this test cannot leave the next one opening a fifty-page notebook nobody
+    /// asked for: the swap is this test's business and nothing else's.
+    m_fixture = usualFixture;
+
+    QVERIFY(navigator()->pageCount() >= 8);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    /// Page 1 is inside the window the open built, so asking for it activates its slot rather
+    /// than rolling: the window under test is the one page 0 opened -- pages 0..4.
+    QString why;
+    QVERIFY2(navigator()->showPage(1, &why), qPrintable(why));
+
+    const PdfStripLayout before = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
+    QVERIFY(before.isValid());
+    const int staying = 3;
+    const int slot = before.slotForPage(staying);
+    QVERIFY(slot >= 0);
+
+    /// A mark inside the page that will stay, together with the change signal a stroke would
+    /// bring: the roll's clean pass reads the marks that signal raises, so the test drives them
+    /// the same way the canvas does -- pixels placed directly, the signal invoked directly.
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisPaintLayer *layer = stripInkLayer(document->image());
+    QVERIFY2(layer, "the strip has no layer called Ink to draw on");
+    const QRect mark(before.slots().at(slot).rect.topLeft() + QPoint(8, 8), QSize(24, 24));
+    layer->paintDevice()->fill(mark, KoColor(QColor(0, 0, 0), document->image()->colorSpace()));
+    document->setModified(true);
+    Q_EMIT document->image()->sigImageModified();
+
+    /// The marks cover every page the window holds -- the roll has all of them to clear.
+    QVERIFY(!navigator()->pageWindow().dirtyPages().isEmpty());
+
+    /// And the roll: page 5 is outside the window [0..4], so this is a window move and not a
+    /// turn to a page already in the strip.
+    QVERIFY2(navigator()->showPage(5, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 5);
+
+    /// Every page the old window reached the disk -- all five, the three whose band was not
+    /// going anywhere included. The write has LANDED by the time the roll returns; that wait is
+    /// the pipeline the flow rests on.
+    for (int page = 0; page < 5; ++page) {
+        QVERIFY2(QFileInfo::exists(artifactFor(page)),
+                 qPrintable(QStringLiteral("page %1 was not written by the roll").arg(page + 1)));
+    }
+
+    /// The mark is in the artifact of the page it was drawn on...
+    const QImage saved = PdfInkLoader::loadInk(artifactFor(staying));
+    QVERIFY2(inkMarkInImage(saved), "the mark did not reach the artifact of the page that stayed");
+
+    /// ...and on screen, in a slot the roll wiped and repainted. The new window is five pages
+    /// centred on 5, so it starts at page 3: this page did not change bands, and what shows in
+    /// its slot can only be what was read back out of the artifact above.
+    const PdfStripLayout after = PdfStripLayout::forWindow(navigator()->manifest(), 5, 5, 200.0);
+    const int afterSlot = after.slotForPage(staying);
+    QVERIFY(afterSlot >= 0);
+    KisPaintLayer *redrawn = stripInkLayer(navigator()->currentDocument()->image());
+    QVERIFY(redrawn);
+    const QImage onScreen = redrawn->paintDevice()->convertToQImage(
+        0, QRect(after.slots().at(afterSlot).rect.topLeft(),
+                 after.slots().at(afterSlot).rect.size()));
+    QVERIFY2(inkMarkInImage(onScreen),
+             "the mark did not come back from the artifact into the redrawn slot");
+
+    /// And the window is clean again: every mark the signal raised was cleared by the write that
+    /// put it on disk -- the clean pass the redraw is allowed to run behind.
+    QVERIFY2(navigator()->pageWindow().dirtyPages().isEmpty(),
+             "the roll finished with pages still marked unsaved");
+
+    /// Back to the shipped default -- and the tab closed, the way the closing test closes it.
+    ///
+    /// This test runs last, and teardown destroys the main window with whatever the tests left
+    /// in it: a view nobody closed took that window down on its way out (a null canvas resource
+    /// provider inside KoToolManager, reached from KisView's destructor), which is why the
+    /// closing test leaves nothing open and this one now does the same. The document is marked
+    /// clean first on purpose: its ink IS on disk -- the roll wrote it, and nothing was drawn
+    /// since -- so there is nothing to ask about and nothing to write on the way out.
+    navigator()->setScope(1);
+    KisDocument *finalDocument = navigator()->currentDocument();
+    QVERIFY(finalDocument);
+    finalDocument->setModified(false);
+
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
 }
 
 /**

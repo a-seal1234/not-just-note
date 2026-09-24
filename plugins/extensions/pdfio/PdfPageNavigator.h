@@ -355,11 +355,18 @@ private:
     bool buildForStrip(int index, QString *why);
 
     /**
-     * Moves the window one page without building anything.
+     * Moves the window one page without building a new document.
      *
-     * The image is the same size for any window, because every slot is the same cell, so reaching
-     * a page that is not in the strip only means repainting the slots whose page changed. That is
-     * what makes a run of page turns continuous instead of a rebuild every other turn.
+     * Two phases, in that order: every page the window currently holds is written and has
+     * LANDED, then every slot -- all of them, changed or not -- is redrawn from what was just
+     * written: paper rendered again from the source, ink read back out of its artifact. After a
+     * window move the strip and the disk are the same thing, checked against each other on every
+     * roll instead of assumed to agree. It still costs no new document or view, which is what a
+     * rebuild per turn would pay and what the roll exists to avoid; what it costs is the writes
+     * and the renders for the whole window, once per window move rather than once per slot.
+     *
+     * A write that cannot be made, or ink that keeps arriving through the writes, refuses the
+     * roll with the strip untouched -- never a wipe of pixels the disk does not have.
      */
     /// a centreOn says which page the new window is centred on; the page that becomes active is
     /// a index either way. Rolling down leaves the active page one slot in from the top rather
