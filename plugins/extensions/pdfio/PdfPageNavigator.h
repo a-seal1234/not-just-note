@@ -216,6 +216,19 @@ private:
     /// 47 while the canvas was at 0.14, and a centre at the document origin.
     qint64 m_viewSettleUntil = 0;
 
+    /// Where a window move has already put the middle of the viewport, and whether the two places
+    /// that would otherwise re-centre on the active page should leave the canvas alone because of
+    /// it.
+    ///
+    /// A roll moves the window under a canvas that does not move with it, so the same pixels end
+    /// up holding a different page -- measured on the tablet, a roll taken while page 5 filled
+    /// the view left page 8 under the same middle, and the follow then turned to 8. The page
+    /// being read is not the roll's to change: rollToPage() records the point that was in the
+    /// middle and puts the canvas back on it, and while this is set neither activateWithinStrip()
+    /// nor the 350 ms follow-up moves the view.
+    QPointF m_rollAnchor;
+    bool m_rollAnchored = false;
+
     /// When the last dropped reading was written out, so a canvas that never settles cannot flood.
     qint64 m_lastRejectLog = 0;
 
@@ -372,7 +385,12 @@ private:
     /// a index either way. Rolling down leaves the active page one slot in from the top rather
     /// than in the middle, so the page just left stays visible above it and the follow does not
     /// turn straight back to it. -1 centres on a index.
-    bool rollToPage(int index, QString *why, int centreOn = -1);
+    ///
+    /// \a keepTheReadingPage is for a window move the VIEW decided (a scroll): the page in the
+    /// middle of the viewport is where the reader is, and the move must leave it there -- the
+    /// window shifting underneath does not mean the book turned. An explicit turn passes false,
+    /// because there the user asked for a page and the canvas is meant to move to it.
+    bool rollToPage(int index, QString *why, int centreOn = -1, bool keepTheReadingPage = false);
     bool activateWithinStrip(int index, QString *why);
 
     /// Creates the document, its view and the strip decoration, and gives the page that was open

@@ -774,8 +774,12 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     return showImage(strip.image, strip.activeInkLayer, index, strip.layout, why);
 }
 
-bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
+bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool keepTheReadingPage)
 {
+    /// A roll that does not get far must not leave the canvas anchored to a point from a window
+    /// it never moved to.
+    m_rollAnchored = false;
+
     if (!m_document || !m_document->image()) {
         fail(why, QStringLiteral("no strip is open"));
         return false;
@@ -955,6 +959,36 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
         }
     }
 
+    /// What the roll is not allowed to change: the page being read.
+    ///
+    /// The window moves under a canvas that does not move with it, so the same pixels end up
+    /// holding a different page. Measured on the tablet: a roll taken while page 5 filled the
+    /// view left page 8 under the same middle, and the follow then turned to 8 -- the reader's
+    /// position had been moved by bookkeeping. The page under the middle of the viewport is
+    /// recorded here, together with the point of it that is in the middle, and the canvas is put
+    /// back on that point of that page once the new mapping is in place. A roll then looks like
+    /// nothing happened, except that there are more pages to scroll to -- which is all it is.
+    ///
+    /// Read after the repaint and before the mapping changes: the pixels are the new window's
+    /// already, but what the reader is looking at is still the old window's page. Anything
+    /// scrolled while the writes were landing is included, because it has moved the canvas by
+    /// now -- and the anchor is what keeps a two second write from teleporting the reader.
+    int anchorPage = -1;
+    QPointF anchorInPage;
+    if (keepTheReadingPage && m_view && m_view->canvasBase()
+        && m_view->canvasBase()->canvasWidget()
+        && !m_view->canvasBase()->canvasWidget()->size().isEmpty()
+        && m_view->canvasBase()->coordinatesConverter()) {
+        const KisCoordinatesConverter *converter = m_view->canvasBase()->coordinatesConverter();
+        const QPointF centre = converter->widgetToImage(converter->widgetCenterPoint());
+        const int anchorSlot = windowSlotFor(centre);
+        if (anchorSlot >= 0 && anchorSlot < m_stripPages.size()
+            && anchorSlot < m_stripRects.size()) {
+            anchorPage = m_stripPages.at(anchorSlot);
+            anchorInPage = centre - QPointF(m_stripRects.at(anchorSlot).topLeft());
+        }
+    }
+
     Q_UNUSED(colorSpace);
 
     m_stripPages.clear();
@@ -964,6 +998,23 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
         m_stripPages.append(slot.page);
         m_stripRects.append(slot.rect);
         m_stripCells.append(slot.cell);
+    }
+
+    /// And the canvas goes back on the same point of the same page. The two places that would
+    /// otherwise centre the view on the ACTIVE page stand down while m_rollAnchored is set
+    /// (activateWithinStrip() right below, and the 350 ms follow-up the queued roll schedules):
+    /// the active page is not necessarily the page being read, because the pen can scroll on
+    /// while the writes are landing.
+    if (anchorPage >= 0 && m_view && m_view->canvasController()) {
+        const int anchorNow = m_stripPages.indexOf(anchorPage);
+        if (anchorNow >= 0 && anchorNow < m_stripRects.size()) {
+            m_rollAnchor = QPointF(m_stripRects.at(anchorNow).topLeft()) + anchorInPage;
+            m_rollAnchored = true;
+            m_view->canvasController()->setPreferredCenter(m_rollAnchor);
+            m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 800;
+            say(QStringLiteral("strip: the window moved under page %1; the canvas stays on it")
+                    .arg(anchorPage + 1));
+        }
     }
 
     m_savingPages = wasSaving;
@@ -1007,7 +1058,12 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
     /// and a page taller than the viewport can be "in view" while sitting anywhere.
     /// Not when the scroll itself decided, for the reason in m_turnFromScroll: the canvas is
     /// already where the user put it. An explicit turn still moves the canvas.
-    if (!m_turnFromScroll && m_view && m_view->canvasController() && slot < m_stripRects.size()) {
+    /// And not when the roll has just put the canvas back on the page being read: that is a
+    /// different point from the active page's centre whenever the pen scrolled on while the
+    /// writes were landing, and moving to the active page's centre there would be the very jump
+    /// the anchor exists to remove.
+    if (!m_turnFromScroll && !m_rollAnchored && m_view && m_view->canvasController()
+        && slot < m_stripRects.size()) {
         m_view->canvasController()->setPreferredCenter(QPointF(m_stripRects.at(slot).center()));
         m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 800;
     }
@@ -1040,7 +1096,11 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
                     .arg(m_stripPages.first() + 1).arg(first + 1).arg(index + 1));
             m_lastWindowRoll = now;
             const int active = index;
-            QTimer::singleShot(0, this, [this, active]() {
+            /// Whether the view decided this turn, read now because by the time the roll runs the
+            /// flag belongs to whatever the user did in between. A roll the view decided must
+            /// leave the reader's page where it is; an explicit turn is meant to move the canvas.
+            const bool fromScroll = m_turnFromScroll;
+            QTimer::singleShot(0, this, [this, active, fromScroll]() {
                 if (m_rollingWindow || m_savingPages || m_stripPages.isEmpty()) {
                     return;
                 }
@@ -1054,7 +1114,7 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
                 const bool movingDown = (m_stripPages.indexOf(active) == m_stripPages.size() - 1);
                 const int centreOn = movingDown ? active + 1 : active - 1;
                 QString rollWhy;
-                const bool rolled = rollToPage(active, &rollWhy, centreOn);
+                const bool rolled = rollToPage(active, &rollWhy, centreOn, fromScroll);
                 m_rollingWindow = false;
                 if (!rolled) {
                     say(QStringLiteral("strip: could not move the window to page %1 (%2)")
@@ -1076,6 +1136,24 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
                     if (slot < 0 || slot >= m_stripRects.size()) {
                         return;
                     }
+                    if (m_rollAnchored) {
+                        /// The roll placed the canvas on the page being read rather than on the
+                        /// active page. Nothing moves it again, and the follow restarts from
+                        /// nothing known: the next reading says where the middle is, and no
+                        /// decision is taken from a value derived under the old mapping.
+                        m_rollAnchored = false;
+                        /// The same point again, for the same reason the other path repeats
+                        /// here: the first call can land before the canvas has taken the
+                        /// repainted slots.
+                        m_view->canvasController()->setPreferredCenter(m_rollAnchor);
+                        m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 1500;
+                        m_candidatePage = -1;
+                        m_candidateSince = QDateTime::currentMSecsSinceEpoch();
+                        m_lastTurn = QDateTime::currentMSecsSinceEpoch();
+                        m_windowSlot = -1;
+                        return;
+                    }
+
                     m_view->canvasController()->setPreferredCenter(
                         QPointF(m_stripRects.at(slot).center()));
                     m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 1500;
@@ -1128,6 +1206,9 @@ bool PdfPageNavigator::showPage(int index, QString *why)
         return false;
     }
     m_inPageTurn = true;
+    /// A new turn is a new intent: an anchor an earlier roll left for the canvas is stale the
+    /// moment the user asks for a page.
+    m_rollAnchored = false;
     /// Cleared on every way out of this function, the refusals below included.
     struct TurnGuard {
         bool &held;
@@ -1197,7 +1278,7 @@ bool PdfPageNavigator::showPage(int index, QString *why)
     /// A page one step outside it needs the window moved, not rebuilt.
     if (m_document && !m_stripPages.isEmpty()) {
         QString rollError;
-        if (rollToPage(index, &rollError)) {
+        if (rollToPage(index, &rollError, -1, m_turnFromScroll)) {
             return true;
         }
         say(QStringLiteral("strip: rolling was not possible (%1); building instead").arg(rollError));
