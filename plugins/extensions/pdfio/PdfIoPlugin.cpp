@@ -766,6 +766,15 @@ void PdfIoPlugin::runRestoreProbe()
         return;
     }
     stroke->paintDevice()->fill(QRect(100, 100, 200, 40), KoColor(Qt::black, image->colorSpace()));
+
+    /// The window only writes a page it believes is dirty, and a direct write into a paint device
+    /// does not set that. Measured: without this the turn away from the page wrote no artifact, the
+    /// reopen found nothing to restore, and this probe reported "ink bounds 0,0 0x0" -- testing the
+    /// probe's setup rather than the restore it exists for. A stroke in the application arrives at
+    /// the same flag through the undo system, which is what this stands in for.
+    if (KisDocument *page = navigator->currentDocument()) {
+        page->setModified(true);
+    }
     say(QStringLiteral("restore: drew a mark, ink bounds now %1,%2 %3x%4")
             .arg(stroke->paintDevice()->exactBounds().x())
             .arg(stroke->paintDevice()->exactBounds().y())

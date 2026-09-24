@@ -71,11 +71,18 @@ void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRe
             continue;
         }
 
+        /// Only the page's own rectangle is cloned. Cloning the whole device and shifting it
+        /// leaves every other page's ink inside the artifact's layer data -- clipped by the
+        /// artifact's bounds when it is rendered, and read back as a layer 6438 pixels tall for a
+        /// page 1189 tall. Measured with PDFIO_PROBE_RESTORE=1 on the desktop:
+        /// "ink bounds 100,100 841x6438 (expected 100,100 200x40)".
         KisPaintLayerSP copy = new KisPaintLayer(target, paint->name(), paint->opacity());
-        copy->paintDevice()->makeCloneFrom(paint->paintDevice(), paint->paintDevice()->extent());
+        copy->paintDevice()->makeCloneFrom(paint->paintDevice(), area);
 
-        /// Shifted so the region's top left becomes the origin, which is what makes an artifact of
-        /// a page inside a strip identical to one of a page on its own.
+        /// Shifted so the page's top left becomes the origin: the clone keeps the coordinates it
+        /// was taken from, and without this the page's pixels sit where the page sits inside the
+        /// strip -- outside a page-sized artifact. Measured by the roll test: "the mark did not
+        /// reach the artifact of the page that stayed".
         copy->setX(-area.x());
         copy->setY(-area.y());
 
