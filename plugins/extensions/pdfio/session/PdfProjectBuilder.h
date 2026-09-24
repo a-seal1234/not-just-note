@@ -43,6 +43,11 @@ public:
     static QString backgroundLayerName();
     static QString inkLayerName();
 
+    /// Whether \a name is what backgroundLayerName() hands out: the layer the page's render is
+    /// carried in, which a page artifact never persists because the source PDF and the manifest
+    /// can put it back.
+    static bool isPageRenderLayerName(const QString &name);
+
     /**
      * The paint layer inside the Ink group.
      *

@@ -656,8 +656,8 @@ void PdfIoPlugin::slotSavePage()
     }
 
     QString why;
-    KisDocument *inkOnly = PdfPageSaver::createInkOnlyDocument(document->image(), &why);
-    if (!inkOnly) {
+    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(document->image(), &why);
+    if (!pageDocument) {
         qWarning() << "pdfio: cannot prepare the page:" << why;
         return;
     }
@@ -668,14 +668,14 @@ void PdfIoPlugin::slotSavePage()
     /// Krita saves in the background, so the copy has to outlive this call. It is deleted when the
     /// save reports back, rather than by waiting here: a nested event loop around
     /// sigSavingFinished wedged on the second save.
-    connect(inkOnly, &KisDocument::sigSavingFinished, this, [inkOnly, path](const QString &) {
+    connect(pageDocument, &KisDocument::sigSavingFinished, this, [pageDocument, path](const QString &) {
         say(QStringLiteral("saved %1 (%2 bytes)").arg(path).arg(QFileInfo(path).size()));
-        KisPart::instance()->removeDocument(inkOnly, true);
+        KisPart::instance()->removeDocument(pageDocument, true);
     });
 
-    if (!PdfPageSaver::saveInkOnly(inkOnly, path, &why)) {
+    if (!PdfPageSaver::saveDocument(pageDocument, path, &why)) {
         qWarning() << "pdfio: cannot save:" << why;
-        KisPart::instance()->removeDocument(inkOnly, true);
+        KisPart::instance()->removeDocument(pageDocument, true);
     }
 }
 

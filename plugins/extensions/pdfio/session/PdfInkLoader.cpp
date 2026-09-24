@@ -27,13 +27,15 @@ void fail(QString *why, const QString &message)
     }
 }
 
-/// The merged image of an artifact whose document holds only ink *is* the ink.
+/// The merged image of an artifact whose document holds only the page's own layers *is* the page's
+/// content.
 ///
 /// The obvious approach, reading the paint layer, does not work: Krita stores a layer in its own
 /// tile format, not as a PNG, so the layer entry begins with "VERSION 2" and no image loader will
 /// touch it. The merged image is a PNG, and because page artifacts deliberately contain no page
-/// background it is the flatten of the ink and nothing else. It also gets the case of several ink
-/// layers right for free, which reading one layer would not.
+/// background it is the flatten of everything the user made on that page and nothing else. It also
+/// gets several layers right for free -- grouped ones included -- which reading one layer would
+/// not, and it is what makes "every layer except the background is saved" need no change here.
 bool isMergedImage(const QString &name)
 {
     return name.endsWith(QLatin1String("mergedimage.png"));

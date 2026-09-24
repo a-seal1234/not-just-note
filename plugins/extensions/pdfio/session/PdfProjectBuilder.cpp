@@ -47,6 +47,11 @@ QString PdfProjectBuilder::backgroundLayerName()
     return QStringLiteral("PDF page");
 }
 
+bool PdfProjectBuilder::isPageRenderLayerName(const QString &name)
+{
+    return name == backgroundLayerName();
+}
+
 QString PdfProjectBuilder::inkLayerName()
 {
     return QStringLiteral("Ink");

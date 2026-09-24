@@ -862,30 +862,30 @@ void PdfStripCursorTest::testAPageFolderWithSeveralLayersComesBackFlattened()
     QVERIFY(folders.image);
     QCOMPARE(folders.layers.size(), 3);
 
-    KisDocument *inkOnly = PdfPageSaver::createInkOnlyDocument(folders.image, nullptr);
-    QVERIFY(inkOnly);
+    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(folders.image, nullptr);
+    QVERIFY(pageDocument);
 
     /// The merged image is the document's projection (kis_kra_saver.cpp:658), and the projection is
     /// built by an update job. The production path has a document that has been on screen for a
     /// while; a document built and saved in the same few statements does not, and writes a
     /// transparent mergedimage.png. Measured: without this the reload comes back rgba(0,0,0,0) at
     /// every band. refreshGraphAsync + waitForDone is the pair KisImage documents for exactly this.
-    inkOnly->image()->refreshGraphAsync(inkOnly->image()->root(),
-                                        { inkOnly->image()->bounds() },
-                                        inkOnly->image()->bounds());
-    inkOnly->image()->waitForDone();
+    pageDocument->image()->refreshGraphAsync(pageDocument->image()->root(),
+                                        { pageDocument->image()->bounds() },
+                                        pageDocument->image()->bounds());
+    pageDocument->image()->waitForDone();
 
     const QString path = dir.filePath(QStringLiteral("page.kra"));
     bool finished = false;
-    QObject::connect(inkOnly, &KisDocument::sigSavingFinished, this, [&finished](const QString &) {
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, this, [&finished](const QString &) {
         finished = true;
     });
 
     QString why;
-    QVERIFY2(PdfPageSaver::saveInkOnly(inkOnly, path, &why), qPrintable(why));
+    QVERIFY2(PdfPageSaver::saveDocument(pageDocument, path, &why), qPrintable(why));
     QVERIFY2(waitForFlag(finished, 30000), "the save never reported back");
     QVERIFY(QFileInfo::exists(path));
-    KisPart::instance()->removeDocument(inkOnly, true);
+    KisPart::instance()->removeDocument(pageDocument, true);
 
     /// What the notebook reads back.
     QElapsedTimer loaderClock;
@@ -975,23 +975,23 @@ void PdfStripCursorTest::testRestoringTheLayerStackCostsAFullKraLoad()
     const PageFolders folders = buildBandedPage(source, pageWidth, pageHeight);
     QVERIFY(folders.image);
 
-    KisDocument *inkOnly = PdfPageSaver::createInkOnlyDocument(folders.image, nullptr);
-    QVERIFY(inkOnly);
+    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(folders.image, nullptr);
+    QVERIFY(pageDocument);
     /// The merged image is the projection; see the note in the test above.
-    inkOnly->image()->refreshGraphAsync(inkOnly->image()->root(),
-                                        { inkOnly->image()->bounds() },
-                                        inkOnly->image()->bounds());
-    inkOnly->image()->waitForDone();
+    pageDocument->image()->refreshGraphAsync(pageDocument->image()->root(),
+                                        { pageDocument->image()->bounds() },
+                                        pageDocument->image()->bounds());
+    pageDocument->image()->waitForDone();
     const QString path = dir.filePath(QStringLiteral("page.kra"));
 
     bool finished = false;
-    QObject::connect(inkOnly, &KisDocument::sigSavingFinished, this, [&finished](const QString &) {
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, this, [&finished](const QString &) {
         finished = true;
     });
     QString why;
-    QVERIFY2(PdfPageSaver::saveInkOnly(inkOnly, path, &why), qPrintable(why));
+    QVERIFY2(PdfPageSaver::saveDocument(pageDocument, path, &why), qPrintable(why));
     QVERIFY2(waitForFlag(finished, 30000), "the save never reported back");
-    KisPart::instance()->removeDocument(inkOnly, true);
+    KisPart::instance()->removeDocument(pageDocument, true);
 
     /// The cheap path: one PNG out of the zip.
     QElapsedTimer loaderClock;

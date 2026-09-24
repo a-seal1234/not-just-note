@@ -70,6 +70,7 @@ private Q_SLOTS:
     void testDirtyPageIsSavedBeforeEvictionAndTheInkComesBack();
     void testRefusedSaveKeepsThePageOpenAndTheInkIntact();
     void testInkIsNotWrittenWhileThePenIsStillBusy();
+    void testALayerThatIsNotInkIsSavedToo();
     void testQuittingWritesTheInkToo();
     void testClosingTheTabWritesTheInkAndAsksNothing();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
@@ -549,6 +550,39 @@ void PdfNavigatorIntegrationTest::testInkIsNotWrittenWhileThePenIsStillBusy()
     QVERIFY2(waitForInk(artifact), qPrintable(artifact));
     QVERIFY2(inkMarkInImage(PdfInkLoader::loadInk(artifact)),
              "the turn wrote the page without the ink that was on it");
+}
+
+/**
+ * A layer the user made is written too, wherever it is.
+ *
+ * The save used to take the contents of the Ink group and nothing else -- the strip's single layer
+ * called "Ink" -- so a layer made outside it, which is the obvious thing to do with a highlights
+ * layer or a second brush, was dropped without a word: the page came back as if those strokes had
+ * never been made. An artifact now holds every layer of the page except the render of the source,
+ * which is the one thing that is derivable and the one thing the file-size budget is about.
+ */
+void PdfNavigatorIntegrationTest::testALayerThatIsNotInkIsSavedToo()
+{
+    QVERIFY(useNotebook(QStringLiteral("layers")));
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+
+    /// A layer of the user's own, added above the Ink group rather than inside it.
+    KisPaintLayerSP mine = new KisPaintLayer(document->image(), QStringLiteral("Highlights"),
+                                             OPACITY_OPAQUE_U8);
+    mine->paintDevice()->fill(InkMark, KoColor(QColor(0, 0, 0), document->image()->colorSpace()));
+    document->image()->addNode(mine, document->image()->root());
+    document->setModified(true);
+    Q_EMIT document->image()->sigImageModified();
+
+    QString why;
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 1);
+
+    const QImage saved = PdfInkLoader::loadInk(artifactFor(0));
+    QVERIFY2(inkMarkInImage(saved),
+             "a layer the user made outside the Ink group was not written to the artifact");
 }
 
 /**

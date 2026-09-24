@@ -179,10 +179,10 @@ void runIfRequested()
                                     KoColor(Qt::black, image->colorSpace()));
     }
 
-    /// The file size bound: a document holding only the ink, never the page.
-    KisDocument *inkOnly = PdfPageSaver::createInkOnlyDocument(image, &why);
-    if (!inkOnly) {
-        note("ink only document failed: %s", qPrintable(why));
+    /// The file size bound: a document holding the page's own layers, never the page's render.
+    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(image, &why);
+    if (!pageDocument) {
+        note("page layers document failed: %s", qPrintable(why));
         return;
     }
 
@@ -191,11 +191,11 @@ void runIfRequested()
 
     QEventLoop loop;
     bool finished = false;
-    QObject::connect(inkOnly, &KisDocument::sigSavingFinished, &loop,
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, &loop,
                      [&loop, &finished](const QString &) { finished = true; loop.quit(); });
     QTimer::singleShot(60000, &loop, [&loop]() { loop.quit(); });
 
-    if (!PdfPageSaver::saveInkOnly(inkOnly, path, &why)) {
+    if (!PdfPageSaver::saveDocument(pageDocument, path, &why)) {
         note("save failed: %s", qPrintable(why));
         return;
     }
@@ -206,10 +206,10 @@ void runIfRequested()
     if (saved.open(QIODevice::ReadOnly)) {
         raw = saved.readAll();
     }
-    note("ink only saved: finished %d, %lld bytes, mergedimage %d",
+    note("page layers saved: finished %d, %lld bytes, mergedimage %d",
          int(finished), qint64(raw.size()), int(raw.contains("mergedimage.png")));
 
-    KisPart::instance()->removeDocument(inkOnly, true);
+    KisPart::instance()->removeDocument(pageDocument, true);
 
     /// The whole circle, and the only check that matters for an export: the ink that was just
     /// written is read back out of the artifact, composited over the source, and the result is

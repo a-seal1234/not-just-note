@@ -55,6 +55,10 @@ public:
     static QString inkGroupName(int page);
     static QString backgroundLayerName(int page);
     static QString inkLayerName(int page);
+
+    /// Whether \a name belongs to the room a slot's page sits in rather than to the page: the desk
+    /// the strip is laid out on, or one of the renders. What a page artifact never persists.
+    static bool isPageRenderLayerName(const QString &name);
 };
 
 #endif // PDFSTRIPBUILDER_H

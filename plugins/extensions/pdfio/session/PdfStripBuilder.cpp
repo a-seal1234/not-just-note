@@ -42,6 +42,14 @@ QString PdfStripBuilder::backgroundLayerName(int page)
     return QStringLiteral("PDF page %1").arg(page + 1);
 }
 
+bool PdfStripBuilder::isPageRenderLayerName(const QString &name)
+{
+    /// backgroundLayerName(page) is "PDF page %1", and the desk is the room around the pages. Both
+    /// are the strip's own, and both are written by the builders with those names.
+    return name == QStringLiteral("Desk")
+        || name.startsWith(QStringLiteral("PDF page "));
+}
+
 QString PdfStripBuilder::inkLayerName(int page)
 {
     /// Named after its page. Every page having a layer called "Layer 1" is legal -- they live in

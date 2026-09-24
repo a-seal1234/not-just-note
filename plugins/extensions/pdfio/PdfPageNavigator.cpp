@@ -1887,22 +1887,18 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
         return true;
     }
 
-    /// The rectangle that page occupies in the strip, and the one ink layer everything is in. A
-    /// document holding one page has neither, and needs no cropping.
+    /// The rectangle that page occupies in the strip. A document holding one page has none, and
+    /// needs no cropping.
     QRect pageArea;
-    QList<KisNodeSP> inkLayers;
     const int slot = m_stripPages.indexOf(page);
     if (slot >= 0 && slot < m_stripRects.size()) {
         pageArea = m_stripRects.at(slot);
-
-        for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
-            KisNodeSP child = m_document->image()->root()->at(i);
-            if (child->name() == QStringLiteral("Ink")) {
-                inkLayers.append(child);
-                break;
-            }
-        }
     }
+
+    /// Which layers are written is PdfPageSaver's decision now: the page's own layers, every one of
+    /// them, and never the render of the source page. It used to be decided here, by finding the
+    /// single layer called "Ink" -- so a layer the user made outside it was dropped in silence, and
+    /// a group inside it lost its contents to a flat copy.
 
     const QRect thumbArea = pageArea.isValid()
         ? pageArea
@@ -1925,13 +1921,10 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
 
     /// The copy is made while the page is still alive, and it owns its own pixels, so the editing
     /// document can be closed immediately afterwards.
-    KisDocument *inkOnly = nullptr;
-    if (pageArea.isValid() && !inkLayers.isEmpty()) {
-        inkOnly = PdfPageSaver::createInkOnlyDocument(m_document->image(), pageArea, inkLayers, why);
-    } else {
-        inkOnly = PdfPageSaver::createInkOnlyDocument(m_document->image(), why);
-    }
-    if (!inkOnly) {
+    KisDocument *pageDocument = pageArea.isValid()
+        ? PdfPageSaver::createPageLayersDocument(m_document->image(), pageArea, why)
+        : PdfPageSaver::createPageLayersDocument(m_document->image(), why);
+    if (!pageDocument) {
         return false;
     }
 
@@ -1941,10 +1934,10 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
 
     /// Deleted when the save reports back rather than by waiting: a nested event loop around
     /// sigSavingFinished wedged on the second save.
-    QObject::connect(inkOnly, &KisDocument::sigSavingFinished, inkOnly,
-                     [this, inkOnly, path, page, then](const QString &) {
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, pageDocument,
+                     [this, pageDocument, path, page, then](const QString &) {
         say(QStringLiteral("saved %1 (%2 bytes)").arg(path).arg(QFileInfo(path).size()));
-        KisPart::instance()->removeDocument(inkOnly, true);
+        KisPart::instance()->removeDocument(pageDocument, true);
 
         /// Whoever queued this page hears back only once it is actually on disk, which is how the
         /// pages of a strip are written one after another rather than all at once.
@@ -1953,8 +1946,8 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
         }
     });
 
-    if (!PdfPageSaver::saveInkOnly(inkOnly, path, why)) {
-        KisPart::instance()->removeDocument(inkOnly, true);
+    if (!PdfPageSaver::saveDocument(pageDocument, path, why)) {
+        KisPart::instance()->removeDocument(pageDocument, true);
         return false;
     }
 
