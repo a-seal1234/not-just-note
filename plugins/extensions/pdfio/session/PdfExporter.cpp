@@ -6,6 +6,8 @@
 
 #include "PdfExporter.h"
 
+#include <QDebug>
+
 #include <QFile>
 #include <QHash>
 #include <QSet>
@@ -1721,8 +1723,32 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         double y0 = 0;
         double x1 = 0;
         double y1 = 0;
-        if (!effectiveRect(&doc, page, why, &x0, &y0, &x1, &y1)) {
-            return false;
+        QString rectWhy;
+        if (!effectiveRect(&doc, page, &rectWhy, &x0, &y0, &x1, &y1)) {
+            /// The notebook measured this page from the same source when it was made, and the
+            /// measurement is kept in manifest.json, so it is what the overlay is placed against
+            /// when the source's own /MediaBox cannot be read.
+            ///
+            /// Measured on the tablet: a real 19-page notebook failed the whole export with
+            /// "page 3875 has an empty or inverted /MediaBox", and the page that failed was not
+            /// the first one -- so pressing Export did nothing at all, because the export had
+            /// already returned before the document picker could open. A page whose box cannot be
+            /// read is not a reason to refuse the other eighteen.
+            const QSizeF pageSize = manifest.pages.at(i).sizePt;
+            if (pageSize.isEmpty()) {
+                fail(why, QStringLiteral("page %1 (PDF object %2): %3, and the notebook has no "
+                                         "recorded size for it either")
+                              .arg(i + 1).arg(page.number).arg(rectWhy));
+                return false;
+            }
+
+            qWarning("[pdfio] page %d (PDF object %d): %s; using the notebook's own %.2fx%.2f points",
+                     i + 1, page.number, qPrintable(rectWhy),
+                     pageSize.width(), pageSize.height());
+            x0 = 0;
+            y0 = 0;
+            x1 = pageSize.width();
+            y1 = pageSize.height();
         }
         int rotation = 0;
         if (!effectiveRotation(&doc, page, why, &rotation)) {

@@ -65,6 +65,11 @@ private Q_SLOTS:
 private:
     void registerActions();
 
+    /// How many times a missing main window has been waited for while putting the menu up. The
+    /// window is still being built when the plugin is constructed, so a few retries are the
+    /// difference between a menu on the first screen and none at all.
+    int m_menuTries = 0;
+
     /// Puts the checked state of the strip action back in step with the navigator's scope, which is
     /// the mode that is actually in force.
     void updateStripAction();

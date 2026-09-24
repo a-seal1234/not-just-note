@@ -165,7 +165,39 @@ PdfIoPlugin::~PdfIoPlugin()
 
 void PdfIoPlugin::registerActions()
 {
+    /// The menu is made even when there is no view manager, because that is the state of the first
+    /// screen: the plugin is created once per view, and before a document exists there is no view,
+    /// so the whole "PDF Notebook" menu used to be missing exactly where "Open PDF as notebook" is
+    /// needed. Everything else in the menu means nothing without a notebook and arrives with the
+    /// first view.
+    KisMainWindow *window = viewManager() ? viewManager()->mainWindow()
+                                          : KisPart::instance()->currentMainwindow();
+    if (!window || !window->menuBar()) {
+        /// Start-up: the main window is still being built when the plugin is constructed, which is
+        /// what the probe path had to defer for. Retried a bounded number of times; past that
+        /// there is no window to hang a menu on, and the first view brings one.
+        if (m_menuTries < 20) {
+            ++m_menuTries;
+            QTimer::singleShot(500, this, [this]() { registerActions(); });
+        }
+        return;
+    }
+
     if (!viewManager() || !viewManager()->actionManager()) {
+        QMenu *alone = window->menuBar()->findChild<QMenu *>(QStringLiteral("pdfio_menu"));
+        if (!alone) {
+            alone = window->menuBar()->addMenu(i18n("PDF Notebook"));
+            alone->setObjectName(QStringLiteral("pdfio_menu"));
+        }
+
+        /// A plain action: the KisAction that carries the icon and the shortcut is the action
+        /// manager's to make, and there is none yet. The registration that does have a view
+        /// manager takes it off the menu again, so the entry is never doubled.
+        if (!alone->findChild<QAction *>(QStringLiteral("pdfio_open_notebook_alone"))) {
+            QAction *open = alone->addAction(i18n("Open PDF as notebook..."));
+            open->setObjectName(QStringLiteral("pdfio_open_notebook_alone"));
+            connect(open, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebook);
+        }
         return;
     }
 
@@ -185,13 +217,19 @@ void PdfIoPlugin::registerActions()
         { "pdfio_save_bundle", &PdfIoPlugin::slotSaveNotebookAsBundle },
     };
 
-    KisMainWindow *window = viewManager()->mainWindow();
     QMenu *menu = nullptr;
-    if (window && window->menuBar()) {
+    if (window->menuBar()) {
         menu = window->menuBar()->findChild<QMenu *>(QStringLiteral("pdfio_menu"));
         if (!menu) {
             menu = window->menuBar()->addMenu(i18n("PDF Notebook"));
             menu->setObjectName(QStringLiteral("pdfio_menu"));
+        }
+
+        /// And the first-screen stand-in goes before the real action is added: two entries that do
+        /// the same thing is how a menu starts looking broken.
+        if (QAction *standin = menu->findChild<QAction *>(QStringLiteral("pdfio_open_notebook_alone"))) {
+            menu->removeAction(standin);
+            standin->deleteLater();
         }
     }
 
@@ -583,6 +621,8 @@ void PdfIoPlugin::slotExportPdf()
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
     if (!navigator->hasNotebook()) {
         qWarning() << "pdfio: no notebook is open";
+        QMessageBox::warning(nullptr, i18n("Export to PDF"),
+                             i18n("No notebook is open. Open a PDF as a notebook first."));
         return;
     }
 
@@ -616,6 +656,10 @@ void PdfIoPlugin::slotExportPdf()
     if (!PdfExporter::exportWithInk(navigator->sourcePath(), navigator->manifest(),
                                     ink, target, &why)) {
         say(QStringLiteral("export failed: %1").arg(why));
+        /// Said to the user, not only to the log. Measured on the tablet: the export can be
+        /// refused before the document picker opens, and then pressing Export does nothing
+        /// visible at all -- which is indistinguishable from a dead menu item.
+        QMessageBox::warning(nullptr, i18n("Export to PDF"), why);
         return;
     }
 

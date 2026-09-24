@@ -1024,6 +1024,30 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         }
     }
 
+    /// And anything else the user put on the strip is folded away.
+    ///
+    /// Every layer of a page is saved now (see PdfPageSaver) and comes back inside the one managed
+    /// layer, "Ink", so a layer of the user's own left standing beside it would carry the same
+    /// strokes a second time -- and the layer panel would show a page's content floating outside
+    /// the notebook's own layer, which is what "the other layers are still floating" was. Nothing
+    /// is lost by dropping it here: phase one wrote its pixels into the page's artifact, and the
+    /// loop above has just read that artifact back into Ink.
+    if (m_document && m_document->image()) {
+        QList<KisNodeSP> strangers;
+        for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
+            KisNodeSP child = m_document->image()->root()->at(i);
+            if (child->name() == QStringLiteral("Ink") || PdfPageSaver::isPageBackground(child)) {
+                continue;
+            }
+            strangers.append(child);
+        }
+        for (KisNodeSP stranger : strangers) {
+            say(QStringLiteral("strip: folding layer \"%1\" into the notebook's own layer")
+                    .arg(stranger->name()));
+            m_document->image()->removeNode(stranger);
+        }
+    }
+
     Q_UNUSED(colorSpace);
 
     m_stripPages.clear();
