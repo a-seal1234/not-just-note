@@ -164,6 +164,22 @@ private:
      */
     bool saveThroughQueue(int index, QString *why = nullptr);
 
+    /**
+     * The value KisCanvasController::setPreferredCenter() wants so that \a imagePoint comes to
+     * rest under the middle of \a view's viewport.
+     *
+     * Not the image point itself. The controller's preferred centre is the offset of that point
+     * from the image's top-left corner in WIDGET pixels -- preferredCenter() is
+     * widgetCenterPoint() - imageRectInWidgetPixels().topLeft(), and setPreferredCenter() builds
+     * the new offset from it the same way -- so passing image pixels asks the widget centre to sit
+     * that many WIDGET pixels into the image. At a zoom of 0.26 that is nearly four pages too far:
+     * measured on the tablet, the canvas came to rest past the bottom of the strip, every reading
+     * the follow took fell outside the image and was dropped, and the notebook sat on the last
+     * page of the window with nobody having asked it to move. Every centring call in this plugin
+     * had the same unit mistake.
+     */
+    static QPointF preferredCenterFor(KisView *view, const QPointF &imagePoint);
+
     /// Waits for every write in flight -- the readers' side of the same rule. A page rebuilt
     /// from its artifact must not read the file while the write it depends on is still landing.
     /// Same \ref m_savingPages hold while it waits.

@@ -347,7 +347,7 @@ void PdfPageNavigator::checkScrollFollow()
     /// what stops a pinch from looking like a scroll, and it is right at the end of the notebook
     /// as well: at the bottom the reading is the bottom of the image minus half a viewport, which
     /// is inside the last page's own cell rather than two pages above it.
-    const QPointF centre = converter->widgetToImage(converter->widgetCenterPoint());
+    QPointF centre = converter->widgetToImage(converter->widgetCenterPoint());
 
     /// Which page the middle of the view is over, in document coordinates.
     ///
@@ -357,22 +357,44 @@ void PdfPageNavigator::checkScrollFollow()
     /// rule, from a page pulled down past its top. It then turned pages nobody had scrolled, every
     /// time the timer fired, until flooding the log was the only thing the application was doing.
 
-    /// A reading that cannot be true is not evidence about where the view is, so it is dropped
-    /// rather than acted on: an out-of-range zoom, or a centre outside the image, is the converter
-    /// answering from a canvas that has not been laid out yet.
+    /// A middle outside the image is not automatically a bad reading.
+    ///
+    /// The canvas can be scrolled past an edge -- Krita keeps half a viewport of room around the
+    /// document -- and at the end of a notebook that is exactly where a reader stops, so a middle
+    /// just past the bottom edge IS the last page being looked at. Clamped to the edge it answers
+    /// that, and the follow keeps working where it used to go blind: measured on the tablet, the
+    /// window sat at the bottom of the strip for fifty seconds with every reading dropped as
+    /// impossible, which is what "it just stays on the last page" was.
+    ///
+    /// A reading a whole viewport or more outside is still the converter answering from a canvas
+    /// that has not been laid out yet, and is dropped as before.
     const QRectF imageBounds(QPointF(0, 0), imageSize);
     if (!imageBounds.adjusted(-4, -4, 4, 4).contains(centre)) {
-        if (now - m_lastRejectLog > 2000) {
-            m_lastRejectLog = now;
-            say(QStringLiteral("scroll: dropped a reading: zoom %1, centre (%2,%3) of a %4x%5 image, "
-                               "bar %6 of %7..%8")
-                    .arg(zoom, 0, 'f', 3).arg(qRound(centre.x())).arg(qRound(centre.y()))
-                    .arg(qRound(imageSize.width())).arg(qRound(imageSize.height()))
-                    .arg(bar ? bar->value() : -1)
-                    .arg(bar ? bar->minimum() : 0)
-                    .arg(bar ? bar->maximum() : 0));
+        const qreal reach = 0.5 * widget->height() / qMax(qreal(0.0001), zoom);
+        if (!imageBounds.adjusted(-reach, -reach, reach, reach).contains(centre)) {
+            if (now - m_lastRejectLog > 2000) {
+                m_lastRejectLog = now;
+                say(QStringLiteral("scroll: dropped a reading: zoom %1, centre (%2,%3) of a %4x%5 image, "
+                                   "bar %6 of %7..%8")
+                        .arg(zoom, 0, 'f', 3).arg(qRound(centre.x())).arg(qRound(centre.y()))
+                        .arg(qRound(imageSize.width())).arg(qRound(imageSize.height()))
+                        .arg(bar ? bar->value() : -1)
+                        .arg(bar ? bar->minimum() : 0)
+                        .arg(bar ? bar->maximum() : 0));
+            }
+            return;
         }
-        return;
+
+        const QPointF raw = centre;
+        centre.setX(qBound(imageBounds.left(), centre.x(), imageBounds.right()));
+        centre.setY(qBound(imageBounds.top(), centre.y(), imageBounds.bottom()));
+        if (now - m_lastRejectLog > 5000) {
+            m_lastRejectLog = now;
+            say(QStringLiteral("scroll: centre (%1,%2) is past the edge of a %3x%4 image; read as (%5,%6)")
+                    .arg(qRound(raw.x())).arg(qRound(raw.y()))
+                    .arg(qRound(imageSize.width())).arg(qRound(imageSize.height()))
+                    .arg(qRound(centre.x())).arg(qRound(centre.y())));
+        }
     }
 
     /// The one conversion between the two page systems. Inside a window the slot is decided from
@@ -446,6 +468,19 @@ void PdfPageNavigator::checkScrollFollow()
     if (!turned) {
         say(QStringLiteral("scroll: could not open page %1 (%2)").arg(pageUnderCentre + 1).arg(why));
     }
+}
+
+QPointF PdfPageNavigator::preferredCenterFor(KisView *view, const QPointF &imagePoint)
+{
+    if (!view || !view->canvasBase() || !view->canvasBase()->coordinatesConverter()) {
+        /// No canvas to ask. The image point is the best guess there is for a view that does not
+        /// exist, and no caller reaches this point with one.
+        return imagePoint;
+    }
+
+    const KisCoordinatesConverter *converter = view->canvasBase()->coordinatesConverter();
+    return converter->imageToWidget(imagePoint)
+        - converter->imageRectInWidgetPixels().topLeft();
 }
 
 void PdfPageNavigator::ensureThumbnail(int index)
@@ -1010,7 +1045,7 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         if (anchorNow >= 0 && anchorNow < m_stripRects.size()) {
             m_rollAnchor = QPointF(m_stripRects.at(anchorNow).topLeft()) + anchorInPage;
             m_rollAnchored = true;
-            m_view->canvasController()->setPreferredCenter(m_rollAnchor);
+            m_view->canvasController()->setPreferredCenter(preferredCenterFor(m_view, m_rollAnchor));
             m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 800;
             say(QStringLiteral("strip: the window moved under page %1; the canvas stays on it")
                     .arg(anchorPage + 1));
@@ -1064,7 +1099,8 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
     /// the anchor exists to remove.
     if (!m_turnFromScroll && !m_rollAnchored && m_view && m_view->canvasController()
         && slot < m_stripRects.size()) {
-        m_view->canvasController()->setPreferredCenter(QPointF(m_stripRects.at(slot).center()));
+        m_view->canvasController()->setPreferredCenter(
+            preferredCenterFor(m_view, QPointF(m_stripRects.at(slot).center())));
         m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 800;
     }
 
@@ -1145,7 +1181,8 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
                         /// The same point again, for the same reason the other path repeats
                         /// here: the first call can land before the canvas has taken the
                         /// repainted slots.
-                        m_view->canvasController()->setPreferredCenter(m_rollAnchor);
+                        m_view->canvasController()->setPreferredCenter(
+                            preferredCenterFor(m_view, m_rollAnchor));
                         m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 1500;
                         m_candidatePage = -1;
                         m_candidateSince = QDateTime::currentMSecsSinceEpoch();
@@ -1155,7 +1192,7 @@ bool PdfPageNavigator::activateWithinStrip(int index, QString *why)
                     }
 
                     m_view->canvasController()->setPreferredCenter(
-                        QPointF(m_stripRects.at(slot).center()));
+                        preferredCenterFor(m_view, QPointF(m_stripRects.at(slot).center())));
                     m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 1500;
 
                     /// And the follow's counter is set from the truth, not left holding what it
@@ -1497,7 +1534,8 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
                     .arg(viewport.width()).arg(viewport.height()).arg(zoom));
 
             viewGuard->canvasController()->setZoom(KoZoomMode::ZOOM_CONSTANT, zoom);
-            viewGuard->canvasController()->setPreferredCenter(QPointF(pageRect.center()));
+            viewGuard->canvasController()->setPreferredCenter(
+                preferredCenterFor(viewGuard.data(), QPointF(pageRect.center())));
 
             /// The view has just been placed by this code. Let the follow logic start from a clean
             /// slate instead of from whatever the previous document left behind, or the page that
