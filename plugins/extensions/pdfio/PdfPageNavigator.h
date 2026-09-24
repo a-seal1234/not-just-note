@@ -11,9 +11,11 @@
 /// needs the complete type for its destructor.
 #include "backend/PdfRenderBackend.h"
 #include "session/PdfPageWindow.h"
+#include "session/PdfSaveQueue.h"
 #include "session/PdfSessionManifest.h"
 #include "session/PdfStripLayout.h"
 
+#include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -146,13 +148,35 @@ private:
      */
     bool saveCurrentPage(QString *why = nullptr, int index = -1, std::function<void()> then = nullptr);
 
-    /// Writes one page of the strip: its rectangle cropped out of the single ink layer. \a then
-    /// is called once the save has finished, which is how the pages are chained.
-    bool savePage(int index, std::function<void()> then = nullptr);
-
-    /// Saves one page and waits, bounded, for the file to have been written: saveCurrentPage()
-    /// returns when the write has started, and a close cannot go on before it has landed.
+    /// Saves one page and waits for the file to have been written -- through the queue, so a
+    /// second write never starts while one is in the air.
     bool savePageAndWait(int index, QString *why);
+
+    /**
+     * Writes \a index through the save queue and waits for the write to land: queued behind
+     * whatever is already in the air, started when it is this page's turn, and true only once
+     * the artifact holds it. This is the only way anything here saves -- the page window's
+     * saver, the strip roll, the close path -- because "the write started" is not an answer any
+     * of them may act on.
+     *
+     * While it waits, \ref m_savingPages is held: the follow timer and the queued roll both
+     * watch it, and neither may turn a page inside the very event loop this wait is spinning.
+     */
+    bool saveThroughQueue(int index, QString *why = nullptr);
+
+    /// Waits for every write in flight -- the readers' side of the same rule. A page rebuilt
+    /// from its artifact must not read the file while the write it depends on is still landing.
+    /// Same \ref m_savingPages hold while it waits.
+    bool drainWrites(QString *why = nullptr);
+
+    /// Marks every page the open document holds as carrying ink that is not on disk, which is
+    /// what a stroke means. All of a strip's pages rather than the active one: which page a
+    /// stroke belongs to is decided at save time by the rectangle, not at stroke time.
+    void markOpenPagesDirty();
+
+    /// The idle half of the pipeline: once the ink has been quiet for a beat, writes whatever is
+    /// marked unsaved, so a page turn is never the first thing to find out what was never saved.
+    void pumpAutoSave();
 
     /// Hangs prepareForClose() on the application's own quit, once.
     void hookApplicationQuitOnce();
@@ -266,6 +290,42 @@ private:
      * page turn instead of discarding the page.
      */
     PdfPageWindow m_window;
+
+    /**
+     * The single door every page write in the notebook goes through.
+     *
+     * One write in the air at a time, because Krita wedges when a second background save is
+     * started while the first is still running -- and scrolling a notebook reaches that on its
+     * own, with an eviction, an idle write and the next eviction inside a second of each other.
+     * Everything that has to be sure the ink is on disk waits here for a landing rather than for
+     * a start: the window evicting a page, the roll wiping a slot, a page rebuilt from its
+     * artifact, a tab closing.
+     */
+    PdfSaveQueue m_saves;
+
+    /// What the ink looked like when the current write took its copy. The page counts as clean
+    /// when that write lands only if nothing has changed since: a stroke that landed while the
+    /// write was in the air must not be forgiven by a write that never saw it.
+    QHash<int, qint64> m_saveStamps;
+
+    /// Why the last write could not even start, for the log and the refusal messages -- the
+    /// queue knows that a write failed, not what the disk said about it.
+    QString m_lastWriteError;
+
+    /// The idle-write cadence: its timer, when the ink last changed, and when a write last ran.
+    QTimer *m_autoSaveTimer = nullptr;
+    qint64 m_lastInkChange = 0;
+    qint64 m_lastAutoSave = 0;
+
+    /// Which image's change signal is being watched. The document is replaced on every page
+    /// turn, and the previous one's signal must not go on marking pages of the new one.
+    QMetaObject::Connection m_inkChangeConnection;
+
+    /// True while a page turn is being made. A second turn arriving from inside an event loop
+    /// this one is waiting in -- a click while a write is landing -- must be refused, not
+    /// interleaved: two turns deciding at once where the ink belongs is how it ends up neither
+    /// where it was drawn nor on disk.
+    bool m_inPageTurn = false;
 
     /// The pages the open strip holds and where each sits. Empty when the document is a single
     /// page, which is also how the code tells the two apart.

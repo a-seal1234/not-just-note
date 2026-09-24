@@ -8,6 +8,8 @@
 
 #include <QtGlobal>
 
+#include <algorithm>
+
 namespace {
 
 void fail(QString *why, const QString &message)
@@ -110,6 +112,15 @@ void PdfPageWindow::setDirty(int index, bool dirty)
 bool PdfPageWindow::isDirty(int index) const
 {
     return m_dirty.contains(index);
+}
+
+QList<int> PdfPageWindow::dirtyPages() const
+{
+    /// Sorted: the mark set is a QSet, and an order that changes with every insertion would make
+    /// the sequence of idle writes depend on nothing anyone chose.
+    QList<int> pages = m_dirty.values();
+    std::sort(pages.begin(), pages.end());
+    return pages;
 }
 
 bool PdfPageWindow::isOpen(int index) const

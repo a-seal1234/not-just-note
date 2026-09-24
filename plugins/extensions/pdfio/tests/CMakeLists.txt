@@ -129,6 +129,29 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
     set_tests_properties(pdfio-PdfPageWindowTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # The save queue is the pipeline every page write goes through -- one at a time, in order,
+    # with a watchdog for the write that never reports -- and like PdfPageWindow it is plain
+    # bookkeeping over std::functions, so the rule that no two writes are ever in the air at once
+    # can be exercised in ctest instead of only by scrolling a notebook on the tablet.
+    add_executable(PdfSaveQueueTest
+        PdfSaveQueueTest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSaveQueue.cpp
+        )
+
+    target_include_directories(PdfSaveQueueTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+    target_link_libraries(PdfSaveQueueTest PRIVATE
+        Qt${QT_MAJOR_VERSION}::Core
+        Qt${QT_MAJOR_VERSION}::Gui
+        Qt${QT_MAJOR_VERSION}::Test)
+
+    set_target_properties(PdfSaveQueueTest PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+    add_test(NAME pdfio-PdfSaveQueueTest COMMAND PdfSaveQueueTest)
+    set_tests_properties(pdfio-PdfSaveQueueTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     add_executable(PdfStripLayoutTest
         PdfStripLayoutTest.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
@@ -208,6 +231,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageSaver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageWindow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfProjectBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSaveQueue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSession.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripBuilder.cpp

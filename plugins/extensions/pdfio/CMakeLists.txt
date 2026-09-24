@@ -12,6 +12,7 @@ set(kritapdfio_SOURCES
     session/PdfPageSaver.cpp
     session/PdfPageWindow.cpp
     session/PdfProjectBuilder.cpp
+    session/PdfSaveQueue.cpp
     session/PdfSession.cpp
     session/PdfSessionManifest.cpp
     session/PdfStripBuilder.cpp

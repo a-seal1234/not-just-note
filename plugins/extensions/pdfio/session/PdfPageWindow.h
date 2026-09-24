@@ -84,6 +84,11 @@ public:
     void setDirty(int index, bool dirty = true);
     bool isDirty(int index) const;
 
+    /// The pages believed to carry ink that is not on disk yet, in ascending order -- what the
+    /// notebook's idle write flushes, and what a caller can ask for without walking the open
+    /// list one page at a time.
+    QList<int> dirtyPages() const;
+
     bool isOpen(int index) const;
     int openCount() const;
 

@@ -130,12 +130,25 @@ constexpr qreal StripSlotGap = 200.0;
 /// so the answer does not flip on every 150 ms tick.
 constexpr qreal StripCentreHysteresis = 48.0;
 
-/// How long a close waits for the page write it started.
+/// How long one page write may take to reach the disk before the save queue declares it failed.
 ///
-/// saveCurrentPage() returns when the write has begun, not when it has landed, and a close cannot
-/// go on before the ink is on disk. The wait is bounded because a close that never finishes is
-/// worse than one that says it could not: on timeout the close falls back to Krita's own prompt.
-constexpr int CloseSaveTimeoutMs = 15000;
+/// A write that never reports is the wedge: the ink it carries is on disk nowhere, and everything
+/// queued behind it would wait forever. The bound turns that into one failed page instead of the
+/// permanent state of the notebook -- and it is the same number everything waits on, because a
+/// wait that never finishes is worse than one that says it could not. On a close that cannot be
+/// completed, the fallback is still Krita's own prompt: the user is told rather than the ink
+/// silently dropped.
+constexpr int SaveLandingTimeoutMs = 15000;
+
+/// The idle half of the saving pipeline: how long the ink has to be quiet before it is written
+/// down, how often that is asked, and the smallest gap between two such writes.
+///
+/// Long enough that a paragraph is not copied to disk between every two strokes, short enough
+/// that putting the pen down and the app dying within the same breath still loses nothing but
+/// the last stroke -- and a page turn never has to be what makes an unsaved page safe.
+constexpr qint64 InkSettleMs = 600;
+constexpr qint64 AutoSaveTickMs = 250;
+constexpr qint64 AutoSaveMinGapMs = 800;
 
 /// The gap the strip decoration leaves between pages, in widget pixels.
 constexpr qreal GapWidgetPixels = 16;
@@ -151,12 +164,41 @@ constexpr qreal ThumbnailRenderDpi = 96;
 } // namespace
 
 PdfPageNavigator::PdfPageNavigator()
+    : m_saves(SaveLandingTimeoutMs)
 {
     /// The window's save is the plugin's own page save: the ink-only document, the crop when the
     /// page lives in a strip, and the asynchronous write saveCurrentPage already owns. Wired once
-    /// here rather than at each call site, so no page switch can run without it.
+    /// here rather than at each call site, so no page switch can run without it -- and through
+    /// the queue, because the window decides an eviction from this answer, and its answer has to
+    /// be "the ink is on disk", not "the write was started".
     m_window.setCapacity(m_scope);
-    m_window.setSaver([this](int index, QString *why) { return saveCurrentPage(why, index); });
+    m_window.setSaver([this](int index, QString *why) { return saveThroughQueue(index, why); });
+
+    /// The one place a write is started, and never more than one at a time.
+    ///
+    /// The stamp is the other half. saveCurrentPage() takes its copy of the ink at the moment it
+    /// starts, so the page may only be called clean when the write lands if the ink has not moved
+    /// since that copy was taken -- a stroke that lands while the write is in the air keeps the
+    /// page marked, and the next idle write picks it up. Without the stamp, "the write landed"
+    /// would quietly mean "the write landed, except for the stroke made during it", and the
+    /// window would evict the page on exactly that lie.
+    m_saves.setStarter([this](int page, PdfSaveQueue::DoneFn done) {
+        m_lastWriteError.clear();
+        m_saveStamps[page] = m_lastInkChange;
+
+        QString startWhy;
+        if (!saveCurrentPage(&startWhy, page, [this, page, done]() {
+                if (m_lastInkChange == m_saveStamps.value(page, -1)) {
+                    m_window.setDirty(page, false);
+                }
+                done(true);
+            })) {
+            m_lastWriteError = startWhy;
+            m_saveStamps.remove(page);
+            return false;
+        }
+        return true;
+    });
 }
 
 PdfPageNavigator *PdfPageNavigator::instance()
@@ -608,9 +650,11 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
 
     /// A page of a notebook that is being replaced is written before the new manifest takes over:
     /// after the assignment below, its index and its file name would be read out of the new file.
+    /// Through the queue and waited for -- an unwaited write here would be carrying ink across
+    /// the very manifest swap that decides which file it belongs to.
     if (m_document && m_document->image() && m_index >= 0) {
         QString saveError;
-        if (!saveCurrentPage(&saveError)) {
+        if (!saveThroughQueue(m_index, &saveError)) {
             say(QStringLiteral("could not save the page of the notebook being replaced: %1").arg(saveError));
         }
     }
@@ -623,6 +667,11 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
     /// The new notebook starts with an empty window, and its counters describe one notebook rather
     /// than the whole process.
     m_window.clear();
+
+    /// And with no ink-change history: the clock the idle write waits on starts at the first
+    /// stroke actually made in this notebook, not wherever the last one left it.
+    m_lastInkChange = 0;
+    m_lastAutoSave = 0;
 
     m_projectDir = projectDir;
     m_manifest = manifest;
@@ -637,6 +686,16 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
         connect(m_scrollWatch, &QTimer::timeout, this, &PdfPageNavigator::checkScrollFollow);
     }
     m_scrollWatch->start(150);
+
+    /// And the idle write, on a timer of its own: the follow asks where the view has settled,
+    /// this asks whether the ink has been quiet long enough to be written down. Separate
+    /// questions that used to be the same one -- there was no answer to the second at all until
+    /// a page turn made it the only chance to save anything.
+    if (!m_autoSaveTimer) {
+        m_autoSaveTimer = new QTimer(this);
+        connect(m_autoSaveTimer, &QTimer::timeout, this, &PdfPageNavigator::pumpAutoSave);
+    }
+    m_autoSaveTimer->start(AutoSaveTickMs);
 
     return shown;
 }
@@ -664,6 +723,12 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     }
 
     say(QStringLiteral("building a strip of %1 around page %2").arg(m_scope).arg(index + 1));
+
+    /// PdfStripBuilder::build() reads every slot's saved ink back out of its artifact, so the
+    /// queue is drained first: any one of those pages may be the one a write is still carrying,
+    /// and a read before it lands shows the page as it was before the ink that is on its way.
+    drainWrites(nullptr);
+
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(m_manifest, index, m_scope, m_dpi,
                                                                 *backend, m_projectDir, why);
     if (!strip.image) {
@@ -733,6 +798,44 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
     const QList<PdfStripLayout::Slot> slots = target.slots();
     int changed = 0;
 
+    /// Phase one: write every page whose band is about to disappear, and touch not a single pixel
+    /// until every one of those writes has landed.
+    ///
+    /// The write used to be started from inside the repaint below, and its result was dropped on
+    /// the floor -- the band was wiped straight afterwards whatever the write did. A write that
+    /// failed to start, or that never reported back (which is what Krita does to a second
+    /// background save started while the first is running), therefore took the only copy of that
+    /// page's ink with the wipe, and a scroll was enough to reach it: ink gone, sometimes, and
+    /// only when the timing lined up. Failing before any wipe leaves the strip exactly as it was:
+    /// a roll that cannot be completed safely is a roll that does not happen -- the rule the
+    /// bounded page window already follows for evicting a page.
+    ///
+    /// m_savingPages is held for the whole roll: the follow timer and the queued re-centre both
+    /// watch it, and neither may turn a page on top of the writes this is waiting for.
+    const bool wasSaving = m_savingPages;
+    m_savingPages = true;
+    for (int i = 0; i < slots.size(); ++i) {
+        const int oldPage = i < m_stripPages.size() ? m_stripPages.at(i) : -1;
+        const int newPage = slots.at(i).page;
+        if (oldPage == newPage || oldPage < 0) {
+            continue;
+        }
+        QString saveWhy;
+        if (!saveThroughQueue(oldPage, &saveWhy)) {
+            m_savingPages = wasSaving;
+            fail(why, QStringLiteral("the window cannot move past page %1: %2. The strip is unchanged.")
+                          .arg(oldPage + 1)
+                          .arg(saveWhy));
+            say(QStringLiteral("strip: roll refused before touching anything: %1").arg(*why));
+            return false;
+        }
+    }
+
+    /// And nothing is still landing when the incoming pages are read back out of their artifacts
+    /// below: an idle write queued behind the ones just made would have those reads waiting on a
+    /// file it has not finished yet.
+    drainWrites(nullptr);
+
     for (int i = 0; i < slots.size(); ++i) {
         const int oldPage = i < m_stripPages.size() ? m_stripPages.at(i) : -1;
         const int newPage = slots.at(i).page;
@@ -741,13 +844,9 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
         }
         ++changed;
 
-        /// The page leaving is written before its band is cleared: its ink is in the layer this is
-        /// about to wipe.
-        if (oldPage >= 0) {
-            savePage(oldPage, nullptr);
-        }
-
         /// The whole band, because the page arriving may be smaller than the one that was there.
+        /// The leaving page's ink is already on disk -- phase one wrote every leaving page before
+        /// this loop was allowed to run -- so the wipe below cannot take anything with it.
         if (ink) {
             ink->paintDevice()->fill(slots.at(i).cell,
                                      KoColor(Qt::transparent, m_document->image()->colorSpace()));
@@ -807,6 +906,7 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn)
         m_stripCells.append(slot.cell);
     }
 
+    m_savingPages = wasSaving;
     say(QStringLiteral("strip: rolled the window, repainting %1 slot(s)").arg(changed));
     return activateWithinStrip(index, why);
 }
@@ -957,6 +1057,20 @@ void PdfPageNavigator::setScope(int scope)
 
 bool PdfPageNavigator::showPage(int index, QString *why)
 {
+    if (m_inPageTurn) {
+        /// A second turn arriving from inside an event loop this one is waiting in -- a click
+        /// while a write is landing -- is refused, not interleaved. Two turns deciding at once
+        /// where the ink belongs is how it ends up neither where it was drawn nor on disk.
+        fail(why, QStringLiteral("a page turn is already in progress"));
+        return false;
+    }
+    m_inPageTurn = true;
+    /// Cleared on every way out of this function, the refusals below included.
+    struct TurnGuard {
+        bool &held;
+        ~TurnGuard() { held = false; }
+    } guard{ m_inPageTurn };
+
     if (!hasNotebook()) {
         fail(why, QStringLiteral("no notebook is open"));
         return false;
@@ -978,7 +1092,14 @@ bool PdfPageNavigator::showPage(int index, QString *why)
     /// document's flag is the page's flag. The strip (design B) keeps several pages in one document
     /// and has its own save ordering -- it is off at scope one, and it is left alone here.
     if (m_stripPages.isEmpty() && m_document && m_document->image() && m_index != index) {
-        m_window.setDirty(m_index, m_document->isModified());
+        /// Only ever promoted to dirty here, never cleared. The modified flag is Krita's, and a
+        /// page's mark is cleared by the write that put its ink on disk (see the queue's starter
+        /// in the constructor) -- reading a flag this code does not own used to be able to call
+        /// a page with ink nowhere "clean", and a clean page is the one the window evicts
+        /// without saving.
+        if (m_document->isModified()) {
+            m_window.setDirty(m_index, true);
+        }
     }
 
     /// And the window is told about the page being opened whenever it does not already hold it,
@@ -1057,6 +1178,25 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
     /// Whatever was already drawn on this page is put back before it is shown. Saving alone is not
     /// enough: a page rebuilt from the source comes back with an untouched Ink layer, so without
     /// this step ink that was written is invisible the moment the page is left and returned to.
+    ///
+    /// But only once the queue says nothing is still writing it. This page can be rebuilt while
+    /// its own write is still in the air -- the turn that left it started that write only moments
+    /// ago -- and reading the artifact before the write lands rebuilds the page WITHOUT the very
+    /// ink it was evicted for. That is what "the ink comes back sometimes" was: not missing, just
+    /// not landed yet, read too early, and then overwritten by the next save of a page that never
+    /// saw it.
+    {
+        QString drainWhy;
+        if (!drainWrites(&drainWhy)) {
+            /// Not fatal: the read below may be stale, but refusing to open the page would trade
+            /// a visible miss for an unusable notebook. The write's own outcome has already been
+            /// reported through the queue, and the ink lands eventually if it can land at all.
+            say(QStringLiteral("page %1: a write was still in flight while rebuilding (%2)")
+                    .arg(index + 1)
+                    .arg(drainWhy));
+        }
+    }
+
     const QString kraPath = QDir(m_projectDir).filePath(m_manifest.pages.at(index).kraFile);
     const QImage savedInk = PdfInkLoader::loadInk(kraPath, nullptr);
     if (!savedInk.isNull()) {
@@ -1244,6 +1384,26 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
     }
     m_stripActiveSlot = layout.isValid() ? layout.activeSlot() : -1;
 
+    /// The pipeline hears about the ink itself, from the image that carries it.
+    ///
+    /// sigImageModified is what every stroke goes through on its way into the undo stack, and it
+    /// fires however the image was changed -- unlike the document's modified flag, which the
+    /// strip's direct writes into a paint device never set. Every mark it raises makes a page
+    /// the idle write will pick up and the page window will refuse to evict unsaved.
+    ///
+    /// Connected here, to this image, and the old connection dropped first: the document is
+    /// replaced whenever a turn rebuilds, and the previous image's signal must not go on marking
+    /// pages of the new one -- a mark nothing could ever clear, because no write of this
+    /// notebook could reach it.
+    if (m_inkChangeConnection) {
+        disconnect(m_inkChangeConnection);
+    }
+    m_inkChangeConnection = QObject::connect(image.data(), &KisImage::sigImageModified, this,
+                                             [this]() {
+        m_lastInkChange = QDateTime::currentMSecsSinceEpoch();
+        markOpenPagesDirty();
+    });
+
     /// The paper of each slot, in slot order, so the rolling window can repaint one of them.
     m_stripPaper.clear();
     for (quint32 i = 0; i < image->root()->childCount(); ++i) {
@@ -1289,9 +1449,12 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
 bool PdfPageNavigator::saveStripPages()
 {
     if (m_stripPages.isEmpty()) {
-        /// A document holding one page has nothing to crop; the usual save is the whole of it.
+        /// A document holding one page has nothing to crop; the usual save is the whole of it --
+        /// and through the queue, so this save cannot start while an idle write is still in the
+        /// air (two in the air is the wedge, and this action is exactly the one a user reaches
+        /// for while the idle write may be running).
         QString why;
-        if (!saveCurrentPage(&why)) {
+        if (!saveThroughQueue(m_index, &why)) {
             say(QStringLiteral("could not save the page: %1").arg(why));
             return false;
         }
@@ -1336,11 +1499,6 @@ bool PdfPageNavigator::saveStripPages()
     return ok;
 }
 
-bool PdfPageNavigator::savePage(int index, std::function<void()> then)
-{
-    return saveCurrentPage(nullptr, index, then);
-}
-
 void PdfPageNavigator::hookApplicationQuitOnce()
 {
     if (m_quitHookInstalled || !QCoreApplication::instance()) {
@@ -1360,6 +1518,14 @@ bool PdfPageNavigator::prepareForClose()
     if (!m_document || !m_document->image() || m_index < 0) {
         /// No page open: there is nothing here to lose.
         return true;
+    }
+
+    /// Whatever an idle write or an earlier turn already started lands first, whatever the
+    /// modified flag below says: that flag describes the editing document, not the queue, and a
+    /// write still in the air is ink that has reached disk nowhere yet.
+    {
+        QString drainWhy;
+        drainWrites(&drainWhy);
     }
 
     if (!m_document->isModified()) {
@@ -1398,34 +1564,126 @@ bool PdfPageNavigator::prepareForClose()
 
 bool PdfPageNavigator::savePageAndWait(int index, QString *why)
 {
-    QEventLoop wait;
-    bool finished = false;
+    /// The queue's wait, not a private one. This page queues behind whatever is already in the
+    /// air and waits for its own landing, and the bound -- and the recovery when a write never
+    /// reports at all -- belong to the queue. A private wait here would start a second write
+    /// while one was running, which is exactly the wedge this pipeline exists to remove.
+    return saveThroughQueue(index, why);
+}
 
-    const bool started = saveCurrentPage(why, index, [&wait, &finished]() {
-        finished = true;
-        wait.quit();
-    });
+bool PdfPageNavigator::saveThroughQueue(int index, QString *why)
+{
+    /// Writes block, and the rest of the notebook is told so for as long as they do.
+    ///
+    /// checkScrollFollow() refuses to turn a page with m_savingPages held, the queued roll
+    /// refuses to repaint, and pumpAutoSave() stands down -- all three would otherwise run inside
+    /// the very event loop this wait is spinning, turning a page on top of the write that is
+    /// cropping the layer it would move.
+    const bool wasSaving = m_savingPages;
+    m_savingPages = true;
+    const bool ok = m_saves.saveNow(index, why);
+    m_savingPages = wasSaving;
 
-    if (!started) {
-        return false;
+    if (ok) {
+        return true;
     }
 
-    if (!finished) {
-        /// The write is asynchronous: saveCurrentPage() returns when it has started, and this
-        /// waits for the notification the plugin already relies on. Bounded, and if the bound is
-        /// reached the caller must not close quietly.
-        QTimer::singleShot(CloseSaveTimeoutMs, &wait, &QEventLoop::quit);
-        wait.exec();
-    }
-
-    if (!finished) {
-        fail(why, QStringLiteral("page %1 was still being written after %2 ms")
+    /// The queue knows the page failed; the navigator is what knows what the disk said.
+    if (why && !m_lastWriteError.isEmpty()) {
+        fail(why, QStringLiteral("page %1 was not written: %2")
                       .arg(index + 1)
-                      .arg(CloseSaveTimeoutMs));
-        return false;
+                      .arg(m_lastWriteError));
+    }
+    say(QStringLiteral("queue: page %1 did not land (%2)")
+            .arg(index + 1)
+            .arg(why && !why->isEmpty() ? *why : QStringLiteral("no reason recorded")));
+    return false;
+}
+
+bool PdfPageNavigator::drainWrites(QString *why)
+{
+    const bool wasSaving = m_savingPages;
+    m_savingPages = true;
+    const bool ok = m_saves.waitIdle(why);
+    m_savingPages = wasSaving;
+
+    if (!ok) {
+        say(QStringLiteral("queue: writes were still in flight (%1)")
+                .arg(why && !why->isEmpty() ? *why : QStringLiteral("no reason recorded")));
+    }
+    return ok;
+}
+
+void PdfPageNavigator::markOpenPagesDirty()
+{
+    if (m_index < 0) {
+        return;
     }
 
-    return true;
+    if (m_stripPages.isEmpty()) {
+        m_window.setDirty(m_index, true);
+        return;
+    }
+
+    /// Every page the strip holds, not only the active one. Which page a stroke belongs to is
+    /// decided when the page is saved, by the rectangle it sits in -- at stroke time the
+    /// navigator does not know, and marking only the active page would let a stroke drawn on a
+    /// neighbour leave the strip with nothing but its own memory to live in.
+    for (int page : m_stripPages) {
+        if (page >= 0) {
+            m_window.setDirty(page, true);
+        }
+    }
+}
+
+void PdfPageNavigator::pumpAutoSave()
+{
+    if (!hasNotebook() || !m_document || !m_document->image() || m_index < 0) {
+        return;
+    }
+    if (m_savingPages || m_rollingWindow || m_inPageTurn || m_saves.pendingCount() > 0) {
+        /// A turn or a write owns the notebook right now. The queue decides when writes run;
+        /// this tick only asks for one when nothing else is happening.
+        return;
+    }
+    if (m_lastInkChange <= 0) {
+        return;
+    }
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastInkChange < InkSettleMs) {
+        /// The pen may still be down. A write takes a copy of the whole ink of its page, and
+        /// copying a paragraph one stroke at a time is work the settle gap exists to avoid.
+        return;
+    }
+    if (now - m_lastAutoSave < AutoSaveMinGapMs) {
+        return;
+    }
+
+    /// Everything the window holds that the ink itself has marked unsaved -- and only pages this
+    /// document can actually crop. A mark left by a page that is no longer in the strip has
+    /// nowhere to be written from, and saving it would put this document's ink into that page's
+    /// file, which is the mistake the rectangle-cropping design exists to avoid.
+    QList<int> mine;
+    for (int page : m_window.dirtyPages()) {
+        if (m_stripPages.isEmpty() ? page == m_index : m_stripPages.contains(page)) {
+            mine.append(page);
+        }
+    }
+    if (mine.isEmpty()) {
+        return;
+    }
+
+    m_lastAutoSave = now;
+    for (int page : mine) {
+        QString why;
+        if (!saveThroughQueue(page, &why)) {
+            /// The page stays marked: the next quiet tick tries again rather than pretending it
+            /// reached the disk. A mark cleared by a failed write is the same lie as evicting on
+            /// one.
+            say(QStringLiteral("autosave: page %1 is still unsaved (%2)").arg(page + 1).arg(why));
+        }
+    }
 }
 
 bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<void()> then)
@@ -1434,7 +1692,13 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
     /// in one go, because which page a stroke belongs to is decided by the rectangle it sits in.
     const int page = index >= 0 ? index : m_index;
     if (!m_document || !m_document->image() || page < 0 || page >= m_manifest.pages.size()) {
-        /// Nothing open is not a failure; it only means there is nothing to write.
+        /// Nothing open is not a failure; it only means there is nothing to write. The caller is
+        /// told the same moment -- the queue is owed exactly one completion for every write it
+        /// starts, and it would go on waiting for a landing this function is never going to
+        /// report if the promise went unkept here.
+        if (then) {
+            then();
+        }
         return true;
     }
 

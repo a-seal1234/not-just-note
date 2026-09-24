@@ -228,6 +228,7 @@ void PdfPageWindowTest::testDirtyPageIsSavedBeforeItIsEvicted()
     QVERIFY(window.open(0));
     window.setDirty(0);
     QVERIFY(window.isDirty(0));
+    QCOMPARE(window.dirtyPages(), QList<int>({ 0 }));
 
     QVERIFY(window.open(1));
     QCOMPARE(saves, 1);
@@ -239,6 +240,10 @@ void PdfPageWindowTest::testDirtyPageIsSavedBeforeItIsEvicted()
     QVERIFY(!window.isOpen(0));
     QVERIFY(window.isOpen(1));
     QVERIFY(!window.isOpen(1) || !window.isDirty(1));
+
+    /// The write that bought the eviction is also what clears the mark: what the idle save
+    /// walks is exactly the ink that has not reached the disk.
+    QCOMPARE(window.dirtyPages(), QList<int>());
 }
 
 void PdfPageWindowTest::testDirtyPagesAreLeftAloneWhileCleanOnesCanGo()
