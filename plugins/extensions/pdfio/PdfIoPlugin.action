@@ -5,7 +5,7 @@
 
      <Action name="pdfio_open_notebook">
        <icon></icon>
-       <text>Open PDF as notebook</text>
+       <text>Import PDF as notebook</text>
        <whatsThis></whatsThis>
        <toolTip></toolTip>
        <iconText></iconText>

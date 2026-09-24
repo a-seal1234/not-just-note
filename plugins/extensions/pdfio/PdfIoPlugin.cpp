@@ -194,7 +194,7 @@ void PdfIoPlugin::registerActions()
         /// manager's to make, and there is none yet. The registration that does have a view
         /// manager takes it off the menu again, so the entry is never doubled.
         if (!alone->findChild<QAction *>(QStringLiteral("pdfio_open_notebook_alone"))) {
-            QAction *open = alone->addAction(i18n("Open PDF as notebook..."));
+            QAction *open = alone->addAction(i18n("Import PDF as notebook..."));
             open->setObjectName(QStringLiteral("pdfio_open_notebook_alone"));
             connect(open, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebook);
         }
@@ -387,7 +387,7 @@ void PdfIoPlugin::slotOpenNotebook()
     });
 #else
     const QString path = QFileDialog::getOpenFileName(nullptr,
-                                                      i18n("Open PDF as notebook"),
+                                                      i18n("Import PDF as notebook"),
                                                       QString(),
                                                       i18n("PDF documents (*.pdf)"));
     if (path.isEmpty()) {

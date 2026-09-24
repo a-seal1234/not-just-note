@@ -42,6 +42,56 @@ void reportJniException(const char *where)
     qWarning() << "[pdfio] JNI exception at" << where;
 }
 
+/// The name the file has where the user chose it, from the provider's _display_name column.
+///
+/// Without this the copy the notebook is made from is called after the cache name it is written
+/// under -- "pdfio-picked.pdf" -- and every name derived from it follows: the notebook folder, the
+/// export suggestion ("pdfio-picked-notes.pdf"), and whatever a recent list would show. Measured
+/// on the tablet as exactly that: the export did not carry the name of the PDF it came from.
+QString displayNameForUri(const QString &uri)
+{
+    QJniObject activity = QJniObject::callStaticObjectMethod("org/qtproject/qt5/android/QtNative",
+                                                             "activity",
+                                                             "()Landroid/app/Activity;");
+    if (!activity.isValid()) {
+        return QString();
+    }
+
+    QJniObject contentResolver = activity.callObjectMethod("getContentResolver",
+                                                           "()Landroid/content/ContentResolver;");
+    QJniObject juri = QJniObject::callStaticObjectMethod("android/net/Uri", "parse",
+                                                         "(Ljava/lang/String;)Landroid/net/Uri;",
+                                                         QJniObject::fromString(uri).object<jstring>());
+    if (!contentResolver.isValid() || !juri.isValid()) {
+        return QString();
+    }
+
+    QJniObject cursor = contentResolver.callObjectMethod(
+        "query",
+        "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)"
+        "Landroid/database/Cursor;",
+        juri.object(), nullptr, nullptr, nullptr, nullptr);
+    reportJniException("ContentResolver.query");
+    if (!cursor.isValid()) {
+        return QString();
+    }
+
+    const jint column = cursor.callMethod<jint>(
+        "getColumnIndex", "(Ljava/lang/String;)I",
+        QJniObject::fromString(QStringLiteral("_display_name")).object<jstring>());
+    QString name;
+    if (column >= 0) {
+        QJniObject value = cursor.callObjectMethod("getString", "(I)Ljava/lang/String;", column);
+        if (value.isValid()) {
+            name = value.toString();
+        }
+    }
+    cursor.callMethod<void>("close", "()V");
+
+    /// Whatever the provider sent, only its last component is a file name.
+    return QFileInfo(name).fileName();
+}
+
 /// Copies what a content:// URI offers into a real file, and returns that path.
 QString copyContentToCache(const QString &uri, const QString &cacheFileName)
 {
@@ -237,7 +287,15 @@ struct AndroidDocumentPicker::Private
         QJniObject text = uri.callObjectMethod("toString", "()Ljava/lang/String;");
         qWarning("[pdfio] picked uri: %s", qPrintable(text.toString()));
 
-        const QString local = copyContentToCache(text.toString(), pendingCacheName);
+        /// The user's own name for the file, when the provider gives one: the notebook is named
+        /// after the copy, and so is everything derived from it.
+        QString cacheName = pendingCacheName;
+        const QString displayName = displayNameForUri(text.toString());
+        if (!displayName.isEmpty()) {
+            cacheName = displayName;
+        }
+
+        const QString local = copyContentToCache(text.toString(), cacheName);
         qWarning("[pdfio] copied to %s (%lld bytes)", qPrintable(local),
                  qint64(local.isEmpty() ? 0 : QFileInfo(local).size()));
         if (local.isEmpty()) {
