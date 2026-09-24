@@ -950,6 +950,16 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         }
     }
 
+    /// The one layer that always exists, and the fallback for anything that cannot be put where it
+    /// belongs.
+    KisPaintLayer *ink = nullptr;
+    for (KisPaintLayer *layer : content) {
+        if (layer->name() == QStringLiteral("Ink")) {
+            ink = layer;
+            break;
+        }
+    }
+
     for (int i = 0; i < slots.size(); ++i) {
         const int newPage = slots.at(i).page;
 
@@ -1007,12 +1017,21 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
                 }
             }
             if (!target) {
-                KisPaintLayerSP added = new KisPaintLayer(m_document->image(), saved.first,
-                                                          OPACITY_OPAQUE_U8);
-                m_document->image()->addNode(added, m_document->image()->root());
-                target = added.data();
-                content.append(target);
-                say(QStringLiteral("strip: layer \"%1\" joined the strip").arg(saved.first));
+                /// The page carries a layer this strip was not built with, and adding one here is
+                /// what crashed: measured on the tablet, a window move onto pages whose artifacts
+                /// hold a layer of their own took the application down. The pixels still have to
+                /// land somewhere, and "Ink" is the layer that is always there, so the content is
+                /// folded into it rather than into a layer built mid-roll.
+                target = ink;
+                if (target) {
+                    say(QStringLiteral("strip: the page carries layer \"%1\" and the strip has "
+                                       "none; its pixels go into Ink")
+                            .arg(saved.first));
+                }
+            }
+
+            if (!target) {
+                continue;
             }
 
             target->paintDevice()->convertFromQImage(saved.second, nullptr,
