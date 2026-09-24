@@ -1045,6 +1045,31 @@ void PdfIoPlugin::runStripProbe()
                 say(QStringLiteral("strip: after six turns the active page is %1")
                         .arg(navigator->currentIndex() + 1));
 
+                /// The same artifact, read AGAIN after the window moved.
+                ///
+                /// The measurement below runs before the roll, and before a window move the page has
+                /// not been written at all -- which is what made the line below report 0x0 while
+                /// every artifact on disk carries a 16 to 24 KB merged image. This is the read that
+                /// says whether the content actually came back.
+                const QImage afterRoll = PdfInkLoader::loadInk(
+                    QDir(navigator->projectDir()).filePath(page.kraFile), nullptr);
+                QRect rolledBounds;
+                for (int y = 0; y < afterRoll.height(); ++y) {
+                    for (int x = 0; x < afterRoll.width(); ++x) {
+                        if (qAlpha(afterRoll.pixel(x, y)) > 0) {
+                            rolledBounds = rolledBounds.isNull()
+                                ? QRect(x, y, 1, 1)
+                                : rolledBounds.united(QRect(x, y, 1, 1));
+                        }
+                    }
+                }
+                say(QStringLiteral("strip: after the roll, page %1 artifact %2x%3, ink at "
+                                   "%4,%5 %6x%7 (expected 100,100 200x40)")
+                        .arg(first + 1)
+                        .arg(afterRoll.width()).arg(afterRoll.height())
+                        .arg(rolledBounds.x()).arg(rolledBounds.y())
+                        .arg(rolledBounds.width()).arg(rolledBounds.height()));
+
                 say(QStringLiteral("strip: artifact %1x%2, page is %3x%4, ink at %5,%6 %7x%8 "
                                    "(expected 100,100 200x40)")
                         .arg(ink.width()).arg(ink.height())
