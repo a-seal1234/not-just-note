@@ -60,6 +60,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSession.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfProjectBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSourceRenderers.cpp
         )
 
     target_include_directories(PdfProjectBuilderTest PRIVATE
@@ -234,6 +235,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfPageNavigator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfPageStripDecoration.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfInkLoader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageRotator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageSaver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageWindow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfProjectBuilder.cpp

@@ -32,6 +32,16 @@ public:
     static QImage loadInk(const QString &kraPath, QString *why = nullptr);
 
     /**
+     * The pixel size of the page an artifact was written for, or an empty size when there is no
+     * artifact or it cannot be read.
+     *
+     * A rotation needs this before it loads anything: the image it turns has to be built at the
+     * size the artifact already has. The merged image is no way to ask -- an ink-only artifact
+     * need not carry one.
+     */
+    static QSize artifactSize(const QString &kraPath, QString *why = nullptr);
+
+    /**
      * Puts the artifact's own layers into \a parent of \a target, keeping their names, order and
      * opacity, and returns true when at least one layer came back.
      *

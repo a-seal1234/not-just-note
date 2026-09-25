@@ -6,8 +6,10 @@
 
 #include "PdfPageNavigator.h"
 
+#include "backends/poppler/PopplerRenderBackend.h"
 #include "session/PdfInkLoader.h"
 #include "session/PdfNotebookOps.h"
+#include "session/PdfPageRotator.h"
 #include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
@@ -81,6 +83,7 @@ private Q_SLOTS:
     void testInsertingOnAStripWritesThePageAndNotTheStrip();
     void testAMovedPageKeepsTheReaderAndTheirInk();
     void testADeletedPageLeavesTheReaderOnTheNextOne();
+    void testRotatingAPageTurnsTheInkWithThePaper();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -189,6 +192,41 @@ bool inkMarkPresent(const KisImageSP &image)
     }
 
     return inkMarkInImage(layer->paintDevice()->convertToQImage(0, image->bounds()));
+}
+
+/**
+ * The bounding box of the marked pixels of a layer, which is where the ink is. Empty when there is
+ * none -- and an empty box would make every position comparison below vacuous, so callers check it.
+ */
+QRect markedBounds(const QImage &pixels)
+{
+    int x0 = pixels.width();
+    int y0 = pixels.height();
+    int x1 = -1;
+    int y1 = -1;
+    for (int y = 0; y < pixels.height(); ++y) {
+        for (int x = 0; x < pixels.width(); ++x) {
+            const QRgb pixel = pixels.pixel(x, y);
+            if (qAlpha(pixel) > 128 && qGray(pixel) < 128) {
+                x0 = qMin(x0, x);
+                y0 = qMin(y0, y);
+                x1 = qMax(x1, x);
+                y1 = qMax(y1, y);
+            }
+        }
+    }
+    return x1 < 0 ? QRect() : QRect(QPoint(x0, y0), QPoint(x1, y1));
+}
+
+/// The layer called \a name out of what an artifact holds, or a null image.
+QImage layerNamed(const QList<QPair<QString, QImage>> &layers, const QString &name)
+{
+    for (const QPair<QString, QImage> &entry : layers) {
+        if (entry.first == name) {
+            return entry.second;
+        }
+    }
+    return QImage();
 }
 
 /// Every .kra sitting directly in the user's home directory.
@@ -1212,6 +1250,141 @@ void PdfNavigatorIntegrationTest::testADeletedPageLeavesTheReaderOnTheNextOne()
     QCOMPARE(navigator()->currentIndex(), 0);
     QVERIFY2(inkMarkPresent(navigator()->currentDocument()->image()),
              "the page that was not deleted lost its ink to the delete");
+}
+
+/**
+ * Turning a page turns the paper AND the ink: a stroke stays on the line it was drawn on.
+ *
+ * The paper is easy -- it is rendered from the source every time, so a turn is a turn of the render.
+ * The ink is the part that can silently go wrong: it lives in the artifact as pixels, and a page
+ * whose paper turned by 90 degrees while its ink did not is a page whose notes are suddenly along
+ * the wrong edge. So this test measures both, on the same page:
+ *
+ *  - the artifact's Ink layer is the quarter-turn of what it was, at the pixel level, and the page
+ *    is the turned shape;
+ *  - the background of the reopened page is the turned render of the source, not the upright one.
+ *
+ * The ink is drawn in the top-left corner, which a quarter turn moves to the top-right: a mark that
+ * had stayed where it was would fail both the box comparison and the paper comparison.
+ */
+void PdfNavigatorIntegrationTest::testRotatingAPageTurnsTheInkWithThePaper()
+{
+    QVERIFY(useNotebook(QStringLiteral("ops-rotate")));
+    QCOMPARE(navigator()->currentIndex(), 0);
+    QVERIFY(navigator()->pageCount() >= 2);
+
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+
+    const QString artifact = artifactFor(0);
+    const QList<QPair<QString, QImage>> artifactLayers = PdfInkLoader::loadInkLayers(artifact, &why);
+    QStringList names;
+    for (const QPair<QString, QImage> &entry : artifactLayers) {
+        names << QStringLiteral("%1(%2x%3)").arg(entry.first).arg(entry.second.width())
+                     .arg(entry.second.height());
+    }
+    qInfo("the artifact %s exists=%d holds %d layer(s): %s",
+          qPrintable(artifact), int(QFileInfo::exists(artifact)), int(artifactLayers.size()),
+          qPrintable(names.join(QStringLiteral(", "))));
+    /// The stroke layer's own name: the page's Ink GROUP holds a paint layer called
+    /// PdfProjectBuilder::inkStrokeLayerName(), and the artifact holds the flattened leaves.
+    const QImage inkBefore =
+        layerNamed(artifactLayers, PdfProjectBuilder::inkStrokeLayerName());
+    QVERIFY2(!inkBefore.isNull(), qPrintable(QStringLiteral("%1: layers are [%2] (%3)")
+                                                 .arg(why, names.join(QStringLiteral(", ")),
+                                                      artifact)));
+    const QRect markBefore = markedBounds(inkBefore);
+    QVERIFY2(!markBefore.isEmpty(), "the page has no marked pixels to follow through the turn");
+
+    /// The real rotator, through the operation the menu runs: journalled, committed, atomic.
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::rotatePages(
+        navigator()->projectDir(), 0, 1, 90, PdfPageRotator::rotateInto, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, 0);
+
+    QVERIFY2(navigator()->reloadNotebook(0, &why), qPrintable(why));
+    QElapsedTimer clock;
+    clock.start();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload never finished");
+
+    /// The page the reader is on is the turned one: the record says so, and the reader sees it.
+    QCOMPARE(navigator()->manifest().pages.at(0).extraRotation, 90);
+    const KisImageSP image = navigator()->currentDocument()->image();
+    QVERIFY(image);
+    QCOMPARE(QSize(image->width(), image->height()),
+             QSize(inkBefore.height(), inkBefore.width()));
+
+    /// The ink turned with it. For a 90 degree clockwise turn of a WxH image, the pixel at (x, y)
+    /// is the pixel at (H-1-y, x) -- so the mark's box moves from the top left to the top right.
+    const QImage inkAfter =
+        layerNamed(PdfInkLoader::loadInkLayers(artifact, &why),
+                   PdfProjectBuilder::inkStrokeLayerName());
+    QVERIFY2(!inkAfter.isNull(), qPrintable(why));
+    QCOMPARE(inkAfter.size(), inkBefore.size().transposed());
+
+    const QRect markAfter = markedBounds(inkAfter);
+    const QRect expected(QPoint(inkBefore.height() - 1 - markBefore.bottom(), markBefore.left()),
+                         QSize(markBefore.height(), markBefore.width()));
+    qInfo("the mark: %d,%d %dx%d before -> %d,%d %dx%d after; a clockwise turn puts it at %d,%d %dx%d",
+          markBefore.x(), markBefore.y(), markBefore.width(), markBefore.height(),
+          markAfter.x(), markAfter.y(), markAfter.width(), markAfter.height(),
+          expected.x(), expected.y(), expected.width(), expected.height());
+    QCOMPARE(markAfter, expected);
+
+    /// And the paper under it is the turned render of the source, not the upright one. Compared on
+    /// a grid with a tolerance: the two went through different colour paths, and what is being
+    /// asserted is that the page turned, not that two codecs agree byte for byte.
+    PopplerRenderBackend pdf;
+    QVERIFY(pdf.open(navigator()->sourcePath()));
+    const QImage turnedRender =
+        pdf.renderPage(0, 200.0).transformed(QTransform().rotate(90), Qt::FastTransformation);
+
+    KisNodeSP background;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        if (image->root()->at(i)->name() == PdfProjectBuilder::backgroundLayerName()) {
+            background = image->root()->at(i);
+            break;
+        }
+    }
+    QVERIFY2(background, "the reopened page has no background layer");
+    const QImage paper = background->paintDevice()->convertToQImage(0, image->bounds());
+    QCOMPARE(paper.size(), turnedRender.size());
+
+    int compared = 0;
+    int close = 0;
+    for (int y = 8; y < paper.height(); y += 37) {
+        for (int x = 8; x < paper.width(); x += 41) {
+            const QColor mine = paper.pixelColor(x, y);
+            const QColor theirs = turnedRender.pixelColor(x, y);
+            ++compared;
+            if (qAbs(mine.red() - theirs.red()) <= 48 && qAbs(mine.green() - theirs.green()) <= 48
+                && qAbs(mine.blue() - theirs.blue()) <= 48) {
+                ++close;
+            }
+        }
+    }
+    QVERIFY2(compared > 50, "too few pixels were compared for the answer to mean anything");
+    qInfo("the turned paper: %d of %d sampled pixels agree with the turned render", close, compared);
+    QVERIFY2(close * 10 >= compared * 9,
+             qPrintable(QStringLiteral("%1 of %2 sampled pixels differ: the paper is not the turned "
+                                       "page").arg(compared - close).arg(compared)));
+
+    /// The tab is closed, the way the other tests that leave a page open close theirs: the document
+    /// is marked clean first -- its ink is on disk -- so closing asks nothing.
+    navigator()->currentDocument()->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
 }
 
 /**

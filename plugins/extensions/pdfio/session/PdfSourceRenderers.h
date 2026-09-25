@@ -54,9 +54,22 @@ public:
     PdfPageInfo pageInfo(const PdfSessionManifest &manifest, const QString &projectDir,
                          int page, QString *why = nullptr);
 
-    /// \a page's page inside its source, rendered at \a dpi.
+    /**
+     * \a page's page inside its source, rendered at \a dpi and turned by the notebook's own
+     * quarter turn: what the reader sees, which is what the paper under the ink has to be.
+     */
     QImage renderPage(const PdfSessionManifest &manifest, const QString &projectDir,
                       int page, qreal dpi, QString *why = nullptr);
+
+    /**
+     * \a rendered turned by the notebook's rotation on top of whatever the source declares.
+     *
+     * Public because the single-page path builds its image from a render too: a page the notebook
+     * has turned must come back turned whether it was rendered for a strip or for a page of its
+     * own. The ink is turned with it -- the artifact is rotated when the page is -- which is what
+     * keeps a stroke on the line it was drawn on.
+     */
+    static QImage turnedForDisplay(const QImage &rendered, int extraRotation);
 
     /// Closes and forgets every renderer. For a notebook change.
     void clear();

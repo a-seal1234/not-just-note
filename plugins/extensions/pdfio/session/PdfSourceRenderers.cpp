@@ -7,6 +7,7 @@
 #include "session/PdfSourceRenderers.h"
 
 #include <QDir>
+#include <QTransform>
 
 namespace {
 
@@ -84,7 +85,20 @@ QImage PdfSourceRenderers::renderPage(const PdfSessionManifest &manifest,
     if (!backend) {
         return QImage();
     }
-    return backend->renderPage(manifest.pages.at(page).index, dpi);
+    return turnedForDisplay(backend->renderPage(manifest.pages.at(page).index, dpi),
+                            manifest.pages.at(page).extraRotation);
+}
+
+QImage PdfSourceRenderers::turnedForDisplay(const QImage &rendered, int extraRotation)
+{
+    if (rendered.isNull() || extraRotation == 0) {
+        return rendered;
+    }
+
+    /// FastTransformation on purpose: a right angle is exactly a transpose of the pixels, so the
+    /// smooth filter would blur the page for nothing. The same call turns the artifact's layers, so
+    /// the two agree about which way is clockwise.
+    return rendered.transformed(QTransform().rotate(extraRotation), Qt::FastTransformation);
 }
 
 PdfRenderBackend *PdfSourceRenderers::backendForFile(const QString &sourceFile,

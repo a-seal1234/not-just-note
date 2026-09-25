@@ -37,6 +37,7 @@
 #include "session/PdfInkLoader.h"
 #include "session/PdfNotebookBundle.h"
 #include "session/PdfNotebookOps.h"
+#include "session/PdfPageRotator.h"
 #include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfStripBuilder.h"
@@ -719,6 +720,8 @@ void updateNotebookOpsActions(QMenu *ops)
     set("pdfio_ops_move_down", index >= 0 && index < pages - 1);
     set("pdfio_ops_move_to", pages > 1);
     set("pdfio_ops_duplicate", pages >= 1);
+    set("pdfio_ops_rotate_right", pages >= 1);
+    set("pdfio_ops_rotate_left", pages >= 1);
     /// A notebook keeps at least one page, and the engine refuses to delete the last one.
     set("pdfio_ops_delete", pages > 1);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
@@ -810,6 +813,25 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QObject::connect(duplicate, &QAction::triggered, ops, []() {
         applyNotebookOperation(i18n("Duplicate page"), [](const QString &dir, int page) {
             return PdfNotebookOps::duplicatePage(dir, page, page);
+        });
+    });
+
+    /// Turning a page turns the paper AND the ink: the artifact is rotated through the same
+    /// journal and commit protocol as every other operation, so a page that could not be turned
+    /// fails whole rather than leaving a turned sheet under an upright stroke.
+    QAction *rotateRight = ops->addAction(i18n("Rotate page right"));
+    rotateRight->setObjectName(QStringLiteral("pdfio_ops_rotate_right"));
+    QObject::connect(rotateRight, &QAction::triggered, ops, []() {
+        applyNotebookOperation(i18n("Rotate page right"), [](const QString &dir, int page) {
+            return PdfNotebookOps::rotatePages(dir, page, 1, 90, PdfPageRotator::rotateInto, page);
+        });
+    });
+
+    QAction *rotateLeft = ops->addAction(i18n("Rotate page left"));
+    rotateLeft->setObjectName(QStringLiteral("pdfio_ops_rotate_left"));
+    QObject::connect(rotateLeft, &QAction::triggered, ops, []() {
+        applyNotebookOperation(i18n("Rotate page left"), [](const QString &dir, int page) {
+            return PdfNotebookOps::rotatePages(dir, page, 1, -90, PdfPageRotator::rotateInto, page);
         });
     });
 
@@ -1018,10 +1040,54 @@ void PdfIoPlugin::placeInsertedImage(const QString &picked, const QString &why,
 
 
 
+namespace {
+
+/**
+ * Opens the "Notebook ops" submenu for a screenshot run, retrying while the window is still being
+ * built.
+ *
+ * The container's screenshot script has no way to click: no xdotool, no window manager, only Xvfb
+ * and one capture. So the menu opens itself when PDFIO_PROBE_MENU is set, on the same terms as the
+ * other PDFIO_PROBE_* hooks -- a run-time switch a screenshot needs, not a code path a user takes.
+ */
+void showNotebookOpsMenuForShot(int attemptsLeft)
+{
+    KisMainWindow *window = KisPart::instance()->currentMainwindow();
+    QMenu *notebook = (window && window->menuBar())
+                          ? window->menuBar()->findChild<QMenu *>(QStringLiteral("pdfio_menu"))
+                          : nullptr;
+    QMenu *ops =
+        notebook ? notebook->findChild<QMenu *>(QStringLiteral("pdfio_notebook_ops")) : nullptr;
+    if (!ops) {
+        if (attemptsLeft > 0) {
+            QTimer::singleShot(500, qApp,
+                               [attemptsLeft]() { showNotebookOpsMenuForShot(attemptsLeft - 1); });
+        } else {
+            qWarning("[pdfio] PDFIO_PROBE_MENU: no Notebook ops submenu was found to show");
+        }
+        return;
+    }
+
+    ops->popup(QPoint(320, 220));
+    qWarning("[pdfio] PDFIO_PROBE_MENU: the Notebook ops submenu is up");
+}
+
+} // namespace
+
 PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
     : KisActionPlugin(parent)
 {
     registerActions();
+
+    /// A screenshot run asks for the submenu to be put on screen; once per process, because the
+    /// plugin is constructed for every view.
+    if (qEnvironmentVariableIntValue("PDFIO_PROBE_MENU") > 0) {
+        static bool scheduled = false;
+        if (!scheduled) {
+            scheduled = true;
+            QTimer::singleShot(4000, qApp, []() { showNotebookOpsMenuForShot(20); });
+        }
+    }
 
     /// Once per process: a view plugin is created for every view.
     registerPdfIoDocker();

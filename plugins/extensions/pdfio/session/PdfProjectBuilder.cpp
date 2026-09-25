@@ -6,6 +6,8 @@
 
 #include "PdfProjectBuilder.h"
 
+#include "session/PdfSourceRenderers.h"
+
 #include <cmath>
 #include <unistd.h>
 
@@ -191,6 +193,11 @@ KisImageSP PdfProjectBuilder::buildPageImage(const PdfPageRecord &page,
         return KisImageSP();
     }
 
+    /// And turned by the notebook's own quarter turn, if it has one: the renderer hands back the
+    /// source's orientation, and a page the user has turned comes back turned. The ink is turned
+    /// with it -- the artifact was rotated when the page was -- so a stroke stays on its line.
+    const QImage oriented = PdfSourceRenderers::turnedForDisplay(rendered, page.extraRotation);
+
     const KoColorSpace *colorSpace = KoColorSpaceRegistry::instance()->rgb8();
     if (!colorSpace) {
         fail(why, QStringLiteral("no RGB color space is available"));
@@ -199,12 +206,12 @@ KisImageSP PdfProjectBuilder::buildPageImage(const PdfPageRecord &page,
 
     /// The image is measured in pixels of the render, so nothing downstream has to redo the
     /// point-to-pixel conversion that the renderer already made.
-    KisImageSP image = new KisImage(0, rendered.width(), rendered.height(), colorSpace,
+    KisImageSP image = new KisImage(0, oriented.width(), oriented.height(), colorSpace,
                                     QStringLiteral("PDF page %1").arg(page.index + 1));
     image->setResolution(dpi, dpi);
 
     KisPaintLayerSP background = new KisPaintLayer(image, backgroundLayerName(), OPACITY_OPAQUE_U8);
-    background->paintDevice()->convertFromQImage(rendered, 0, 0, 0);
+    background->paintDevice()->convertFromQImage(oriented, 0, 0, 0);
 
     /// The page artwork is not ours to edit; only the Ink group is written by the session.
     background->setUserLocked(true);

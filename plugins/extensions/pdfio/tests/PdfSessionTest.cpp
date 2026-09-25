@@ -39,6 +39,47 @@ QByteArray readBytes(const QString &path)
     return file.readAll();
 }
 
+/**
+ * A rotator that turns nothing: it writes a file the test can recognise at the destination, plus the
+ * sidecar a page save writes, and remembers what it was asked for.
+ *
+ * What is under test here is the OPERATION -- the journal, the order of the swaps and atomicity --
+ * so a stub is enough. That the rotation itself puts the ink where the paper went is checked
+ * against a real artifact in PdfNavigatorIntegrationTest, with PdfPageRotator doing the turning.
+ */
+struct StubRotator {
+    struct Call {
+        QString source;
+        QString destination;
+        int degrees = 0;
+    };
+
+    QList<Call> calls;
+    bool fail = false;
+
+    PdfNotebookOps::ArtifactRotator fn()
+    {
+        return [this](const QString &source, const QString &destination, int degrees, QString *why) {
+            calls.append(Call{source, destination, degrees});
+            if (fail) {
+                /// Written and THEN failed, so the operation has something to clean up: a rotator
+                /// that leaves nothing behind would pass a test of the cleanup by doing nothing.
+                writeBytes(destination, QByteArrayLiteral("half a turn"));
+                writeBytes(destination + QStringLiteral(".layers.txt"),
+                           QByteArrayLiteral("half a sidecar"));
+                if (why) {
+                    *why = QStringLiteral("the stub was asked to fail");
+                }
+                return false;
+            }
+            writeBytes(destination, QByteArrayLiteral("turned"));
+            writeBytes(destination + QStringLiteral(".layers.txt"), QByteArrayLiteral("turned sidecar"));
+            writeBytes(destination + QStringLiteral(".layers/Ink.png"), QByteArrayLiteral("turned layer"));
+            return true;
+        };
+    }
+};
+
 } // namespace
 
 /**
@@ -89,6 +130,12 @@ private Q_SLOTS:
     void testUndoingAnInsertTakesTheCopiedPdfWithIt();
     void testInsertingFromTheNotebooksOwnPdfReusesItsSource();
     void testInsertingRefusesAPageRangeThePdfDoesNotHave();
+
+    /// Turning pages: the manifest records the turn, the ink is turned with the paper, a page that
+    /// was never drawn on is the manifest's alone, and a turn that cannot be made changes nothing.
+    void testRotatingAPageTurnsTheManifestAndTheArtifact();
+    void testRotatingPagesWithoutArtifactsIsManifestOnly();
+    void testARotationThatFailsChangesNothing();
 
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
@@ -1106,6 +1153,162 @@ void PdfSessionTest::testInsertingRefusesAPageRangeThePdfDoesNotHave()
     QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("sources"))));
     QVERIFY(!PdfNotebookOps::canUndo(project));
+}
+
+/**
+ * Turning a page records the turn in the manifest, turns the ink with the paper, and keeps the
+ * original in the journal.
+ *
+ * The paper is turned at render time from extraRotation; the ink cannot be, because it is pixels in
+ * the artifact -- so the artifact is turned through the same journalled, committed path as every
+ * other operation. What is checked here is the ordering and the books: the record's rotation, the
+ * turned file in place, the original in the journal, and an undo that puts all of it back.
+ */
+void PdfSessionTest::testRotatingAPageTurnsTheManifestAndTheArtifact()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    const PdfPageRecord page = before.pages.at(0);
+    const QString artifact = QDir(project).filePath(page.kraFile);
+    const QByteArray ink = QByteArrayLiteral("the page's ink");
+    writeBytes(artifact, ink);
+    writeBytes(QDir(project).filePath(page.kraFile + QStringLiteral(".layers.txt")),
+               QByteArrayLiteral("the sidecar"));
+    writeBytes(QDir(project).filePath(page.thumbFile), QByteArrayLiteral("the preview"));
+
+    StubRotator rotator;
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::rotatePages(project, 0, 1, 90, rotator.fn(), 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    /// Turning a page is not a move: the reader stays on it.
+    QCOMPARE(outcome.anchorPage, 0);
+
+    /// The rotator was asked for the artifact, into a name beside it, by the turn that was asked for.
+    QCOMPARE(rotator.calls.size(), 1);
+    QCOMPARE(rotator.calls.at(0).source, artifact);
+    QCOMPARE(rotator.calls.at(0).destination, artifact + QStringLiteral(".rotating"));
+    QCOMPARE(rotator.calls.at(0).degrees, 90);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.at(0).extraRotation, 90);
+    /// sizePt is what the file declares and does not change; what the reader sees does.
+    QCOMPARE(after.pages.at(0).sizePt, page.sizePt);
+    QCOMPARE(after.pages.at(0).displaySizePt(), QSizeF(page.sizePt.height(), page.sizePt.width()));
+
+    /// The turned artifact is in place, its sidecar with it, and the original is in the journal.
+    QCOMPARE(readBytes(artifact), QByteArrayLiteral("turned"));
+    QCOMPARE(readBytes(QDir(project).filePath(page.kraFile + QStringLiteral(".layers.txt"))),
+             QByteArrayLiteral("turned sidecar"));
+    QVERIFY(QFileInfo::exists(QDir(project).filePath(page.kraFile + QStringLiteral(".layers/Ink.png"))));
+
+    const QString removed = QDir(PdfNotebookOps::journalDir(project)).filePath(QStringLiteral("removed"));
+    QCOMPARE(readBytes(QDir(removed).filePath(page.kraFile)), ink);
+    QCOMPARE(readBytes(QDir(removed).filePath(page.kraFile + QStringLiteral(".layers.txt"))),
+             QByteArrayLiteral("the sidecar"));
+
+    /// The preview is a picture of the page as it was: dropped rather than left showing the old
+    /// orientation.
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(page.thumbFile)));
+
+    /// And the undo puts the ink, its sidecar, the preview and the rotation back.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+    QCOMPARE(readBytes(artifact), ink);
+    QCOMPARE(readBytes(QDir(project).filePath(page.kraFile + QStringLiteral(".layers.txt"))),
+             QByteArrayLiteral("the sidecar"));
+    QCOMPARE(readBytes(QDir(project).filePath(page.thumbFile)), QByteArrayLiteral("the preview"));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(page.kraFile + QStringLiteral(".rotating"))));
+}
+
+/**
+ * A page that was never drawn on has no artifact, so its turn is the manifest's alone: the rotator
+ * is never asked for it, and nothing is written for it.
+ */
+void PdfSessionTest::testRotatingPagesWithoutArtifactsIsManifestOnly()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+    for (const PdfPageRecord &page : before.pages) {
+        QVERIFY(!QFileInfo::exists(QDir(project).filePath(page.kraFile)));
+    }
+
+    /// A range, and a left turn: 270 is what a -90 is recorded as.
+    StubRotator rotator;
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::rotatePages(project, 0, 3, -90, rotator.fn(), 1);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, 1);
+    QVERIFY2(rotator.calls.isEmpty(), "the rotator was asked to turn a page that has no artifact");
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    for (const PdfPageRecord &page : after.pages) {
+        QCOMPARE(page.extraRotation, 270);
+    }
+
+    /// Nothing was written for those pages, and nothing is left over.
+    const QDir pages(QDir(project).filePath(QStringLiteral("pages")));
+    QVERIFY2(pages.entryList(QStringList() << QStringLiteral("*.rotating*")).isEmpty(),
+             "a rotation left a temporary file behind");
+
+    /// One undo puts every turn back.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+}
+
+/**
+ * A turn that cannot be made refuses the whole operation: the manifest is the one that was there,
+ * the artifact is untouched, and the rotator's half-written temporary is cleaned up.
+ */
+void PdfSessionTest::testARotationThatFailsChangesNothing()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    /// The artifact is on the second page, so the range passes over an empty page first.
+    const PdfPageRecord page = before.pages.at(1);
+    const QString artifact = QDir(project).filePath(page.kraFile);
+    writeBytes(artifact, QByteArrayLiteral("the second page's ink"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    StubRotator rotator;
+    rotator.fail = true;
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::rotatePages(project, 0, 3, 90, rotator.fn(), 0);
+    QVERIFY2(!outcome.ok, "a failed rotation was reported as done");
+    QVERIFY(!outcome.why.isEmpty());
+    QCOMPARE(rotator.calls.size(), 1);
+
+    /// Nothing changed: the manifest, the artifact, and no journal to undo.
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QCOMPARE(readBytes(artifact), QByteArrayLiteral("the second page's ink"));
+    QVERIFY(!QFileInfo::exists(PdfNotebookOps::journalDir(project)));
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+    /// And the half-written turn is gone.
+    QVERIFY(!QFileInfo::exists(artifact + QStringLiteral(".rotating")));
+    QVERIFY(!QFileInfo::exists(artifact + QStringLiteral(".rotating.layers.txt")));
 }
 
 /**

@@ -61,6 +61,13 @@ struct Plan {
     QStringList removeAfter;
     /// relative paths this operation creates, for the rollback and for an undo.
     QStringList added;
+    /// Artifacts to turn in place. Each is turned into a name beside itself, the original is
+    /// journalled, and only then does the turned file take its place -- all before the commit.
+    struct Rotation {
+        QString kraFile;
+        int degrees = 0;
+    };
+    QList<Rotation> rotations;
     QString summary;
 };
 
@@ -163,7 +170,8 @@ void undoCreatedFiles(const QString &projectDir, const Plan &plan)
 /// The journal's before.json is a copy of the manifest file itself, so this does not need the
 /// already-parsed manifest: an undo restores the bytes that were there, including anything a hand
 /// edit put in them that this code does not understand.
-bool applyPlan(const QString &projectDir, const Plan &plan, QString *why)
+bool applyPlan(const QString &projectDir, const Plan &plan,
+                const PdfNotebookOps::ArtifactRotator &rotator, QString *why)
 {
     const QDir project(projectDir);
     const QString journal = PdfNotebookOps::journalDir(projectDir);
@@ -204,9 +212,19 @@ bool applyPlan(const QString &projectDir, const Plan &plan, QString *why)
         }
     }
 
-    /// What this operation creates, written before it creates any of it: a crash then leaves a
-    /// list of the files to clean up rather than an unknown pile of them.
-    if (!writeLines(QDir(journal).filePath(QLatin1String(AddedName)), plan.added)) {
+    /// What this operation writes at a path, written before it writes any of it: a crash then
+    /// leaves a list of the files to clean up rather than an unknown pile of them.
+    ///
+    /// A turned artifact belongs on that list even though it is not "created": it takes the place
+    /// of a file the journal holds, and an undo has to remove it before the original can be renamed
+    /// back. It is kept out of plan.added on purpose -- that list is also the rollback's, and a
+    /// failure BEFORE the turn must not delete the artifact it was going to replace.
+    QStringList written = plan.added;
+    for (const Plan::Rotation &rotation : plan.rotations) {
+        written << rotation.kraFile << rotation.kraFile + QStringLiteral(".layers")
+                << rotation.kraFile + QStringLiteral(".layers.txt");
+    }
+    if (!writeLines(QDir(journal).filePath(QLatin1String(AddedName)), written)) {
         fail(why, QStringLiteral("cannot journal the files this change creates"));
         QDir(journal).removeRecursively();
         return false;
@@ -248,17 +266,93 @@ bool applyPlan(const QString &projectDir, const Plan &plan, QString *why)
         }
     }
 
-    /// Two: the manifest, atomically. This is the commit -- before it the notebook is exactly what
+    /// Three: the pages that are turned. Each artifact is turned into a name beside itself and read
+    /// back by the rotator, then the original is journalled and the turned file takes its place --
+    /// so at every instant there is a complete artifact under one name or the other, and a failure
+    /// here puts back everything already turned before the operation gives up.
+    QStringList turned;
+    const auto removeTemporaryTurn = [](const QString &path) {
+        removePath(path);
+        removePath(path + QStringLiteral(".layers"));
+        removePath(path + QStringLiteral(".layers.txt"));
+    };
+    const auto putTurnsBack = [&projectDir, &journal, &turned]() {
+        const QDir project(projectDir);
+        for (const QString &relative : turned) {
+            for (const QString &suffix : { QString(), QStringLiteral(".layers"),
+                                           QStringLiteral(".layers.txt") }) {
+                removePath(project.filePath(relative + suffix));
+                const QString held = QDir(journal).filePath(QLatin1String(RemovedDirName)
+                                                             + QLatin1Char('/') + relative + suffix);
+                if (QFileInfo::exists(held)) {
+                    QDir().rename(held, project.filePath(relative + suffix));
+                }
+            }
+        }
+    };
+
+    for (const Plan::Rotation &rotation : plan.rotations) {
+        const QString original = project.filePath(rotation.kraFile);
+        if (!QFileInfo::exists(original)) {
+            /// A page that was never drawn on has no artifact: its turn is the manifest's alone.
+            continue;
+        }
+
+        const QString temporary = original + QStringLiteral(".rotating");
+        if (!rotator || !rotator(original, temporary, rotation.degrees, why)) {
+            if (!why || why->isEmpty()) {
+                fail(why, QStringLiteral("the page %1 could not be turned").arg(rotation.kraFile));
+            }
+            removeTemporaryTurn(temporary);
+            putTurnsBack();
+            undoCreatedFiles(projectDir, plan);
+            QDir(journal).removeRecursively();
+            return false;
+        }
+
+        bool swapped = true;
+        for (const QString &suffix : { QString(), QStringLiteral(".layers"), QStringLiteral(".layers.txt") }) {
+            if (!moveIntoJournal(projectDir, journal, rotation.kraFile + suffix, why)) {
+                swapped = false;
+                break;
+            }
+        }
+        if (swapped) {
+            for (const QString &suffix : { QString(), QStringLiteral(".layers"), QStringLiteral(".layers.txt") }) {
+                const QString from = temporary + suffix;
+                if (QFileInfo::exists(from) && !QDir().rename(from, original + suffix)) {
+                    fail(why, QStringLiteral("the turned page could not take the place of %1")
+                                  .arg(rotation.kraFile));
+                    swapped = false;
+                    break;
+                }
+            }
+        }
+        if (!swapped) {
+            removeTemporaryTurn(temporary);
+            putTurnsBack();
+            undoCreatedFiles(projectDir, plan);
+            QDir(journal).removeRecursively();
+            return false;
+        }
+
+        turned.append(rotation.kraFile);
+    }
+
+    /// Four: the manifest, atomically. This is the commit -- before it the notebook is exactly what
     /// it was, and after it the change has happened.
     PdfSessionManifest after = plan.after;
     after.refreshNextPageNumber();
     if (!after.writeTo(PdfSession::manifestPath(projectDir), why)) {
+        /// The turned pages go back first: the manifest was not committed, so the notebook has to
+        /// be the one it was, artifacts included.
+        putTurnsBack();
         undoCreatedFiles(projectDir, plan);
         QDir(journal).removeRecursively();
         return false;
     }
 
-    /// Three, and last: the files the change displaced. They are unreferenced now, so a failure
+    /// Five, and last: the files the change displaced. They are unreferenced now, so a failure
     /// here costs space and an undo that is only partly reversible -- not a broken notebook.
     QString moveFailure;
     for (const QString &relative : plan.removeAfter) {
@@ -374,7 +468,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::movePage(const QString &projectDir, int 
     plan.summary = QStringLiteral("page %1 moved to position %2").arg(from + 1).arg(to + 1);
 
     Outcome outcome;
-    if (!applyPlan(projectDir, plan, &why)) {
+    if (!applyPlan(projectDir, plan, ArtifactRotator(), &why)) {
         outcome.why = why;
         return outcome;
     }
@@ -431,7 +525,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::duplicatePage(const QString &projectDir,
     plan.summary = QStringLiteral("page %1 duplicated as page %2").arg(page + 1).arg(page + 2);
 
     Outcome outcome;
-    if (!applyPlan(projectDir, plan, &why)) {
+    if (!applyPlan(projectDir, plan, ArtifactRotator(), &why)) {
         outcome.why = why;
         return outcome;
     }
@@ -570,7 +664,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::insertPages(const QString &projectDir, i
               .arg(at + count);
 
     Outcome outcome;
-    if (!applyPlan(projectDir, plan, &why)) {
+    if (!applyPlan(projectDir, plan, ArtifactRotator(), &why)) {
         outcome.why = why;
         return outcome;
     }
@@ -587,6 +681,82 @@ PdfNotebookOps::Outcome PdfNotebookOps::insertPages(const QString &projectDir, i
 QString PdfNotebookOps::sourceFileNameFor(const QString &pdfPath)
 {
     return sourceRelativeName(PdfSessionManifest::sha256OfFile(pdfPath), safeSourceBase(pdfPath), 1);
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::rotatePages(const QString &projectDir, int first, int count,
+                                                    int degrees, const ArtifactRotator &rotator,
+                                                    int currentPage)
+{
+    PdfSessionManifest before;
+    QString why;
+    if (!loadManifest(projectDir, &before, &why)) {
+        return refused(why);
+    }
+
+    const int pages = before.pages.size();
+    if (count < 1) {
+        return refused(QStringLiteral("there is no page to turn"));
+    }
+    if (first < 0 || first + count > pages) {
+        return refused(QStringLiteral("pages %1..%2 are not part of the notebook: it has %3 page(s)")
+                           .arg(first + 1)
+                           .arg(first + count)
+                           .arg(pages));
+    }
+
+    /// One value for the turn, normalized once, and used for both halves: the record's rotation and
+    /// the angle the artifact is turned by. A left turn of 90 degrees is a right turn of 270, with
+    /// the same result.
+    const int turn = ((degrees % 360) + 360) % 360;
+    if (turn != 90 && turn != 180 && turn != 270) {
+        return refused(QStringLiteral("%1 degrees is not a quarter turn").arg(degrees));
+    }
+    if (currentPage < 0 || currentPage >= pages) {
+        currentPage = first;
+    }
+
+    Plan plan;
+    plan.after = before;
+    plan.opName = "rotate";
+    for (int i = first; i < first + count; ++i) {
+        PdfPageRecord &page = plan.after.pages[i];
+        page.extraRotation = ((page.extraRotation + turn) % 360 + 360) % 360;
+
+        Plan::Rotation rotation;
+        rotation.kraFile = page.kraFile;
+        rotation.degrees = turn;
+        plan.rotations.append(rotation);
+
+        /// The turned artifact is written AT this path, so an undo has to remove it before the
+        /// journal's copy can go back -- applyPlan() records it in added.txt for exactly that, and
+        /// deliberately NOT in plan.added, which the rollback removes on a failure before the turn.
+
+        /// A preview is a picture of the page as it was. Dropped rather than left showing the old
+        /// orientation; the docker makes a new one when it asks for that page.
+        if (!page.thumbFile.isEmpty()) {
+            plan.removeAfter << page.thumbFile;
+        }
+    }
+
+    plan.anchorBefore = currentPage;
+    plan.summary = count == 1
+        ? QStringLiteral("page %1 turned by %2 degrees").arg(first + 1).arg(turn)
+        : QStringLiteral("pages %1..%2 turned by %3 degrees")
+              .arg(first + 1)
+              .arg(first + count)
+              .arg(turn);
+
+    Outcome outcome;
+    if (!applyPlan(projectDir, plan, rotator, &why)) {
+        outcome.why = why;
+        return outcome;
+    }
+
+    /// Turning a page moves nothing and changes no position: the reader stays where they were.
+    outcome.ok = true;
+    outcome.anchorPage = currentPage;
+    outcome.summary = plan.summary;
+    return outcome;
 }
 
 PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, int first, int count,
@@ -636,7 +806,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, i
         : QStringLiteral("pages %1..%2 deleted").arg(first + 1).arg(first + count);
 
     Outcome outcome;
-    if (!applyPlan(projectDir, plan, &why)) {
+    if (!applyPlan(projectDir, plan, ArtifactRotator(), &why)) {
         outcome.why = why;
         return outcome;
     }
@@ -683,7 +853,16 @@ PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
         }
     }
 
-    /// One: the files the change moved aside go back. Before the manifest, always: a crash between
+    /// One: the files the change created go away, and only then do the files it displaced come
+    /// back. The order matters because an operation that turned an artifact wrote over a path the
+    /// journal also holds -- the turned file has to be gone before the original can be renamed into
+    /// its place. For an operation that only created files the two steps are disjoint either way.
+    /// Directories are removed whole: an artifact's sidecar is listed as the directory it is.
+    for (const QString &relative : readLines(QDir(journal).filePath(QLatin1String(AddedName)))) {
+        removePath(project.filePath(relative));
+    }
+
+    /// Two: the files the change moved aside go back. Before the manifest, always: a crash between
     /// the two leaves files nothing references rather than a manifest naming files in the journal.
     const QString removedRoot = QDir(journal).filePath(QLatin1String(RemovedDirName));
     const QDir removed(removedRoot);
@@ -703,12 +882,6 @@ PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
                 return refused(QStringLiteral("cannot put %1 back").arg(relative));
             }
         }
-    }
-
-    /// Two: the files the change created go away. Directories are removed whole; an artifact's
-    /// sidecar is listed as the directory it is.
-    for (const QString &relative : readLines(QDir(journal).filePath(QLatin1String(AddedName)))) {
-        removePath(project.filePath(relative));
     }
 
     /// Three: the manifest, as it was -- byte for byte in meaning, and atomically.

@@ -12,6 +12,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <functional>
+
 class PdfRenderBackend;
 
 /**
@@ -41,6 +43,16 @@ class PdfRenderBackend;
 class PdfNotebookOps
 {
 public:
+    /**
+     * Turns the artifact at the first path into the second, by the given quarter turn.
+     *
+     * PdfPageRotator::rotateInto is what the plugin passes. It is a parameter rather than a call so
+     * that the operations here stay free of Krita: the engine decides WHAT is turned, when and in
+     * what order, and the rotator only knows how. A test passes a stub for the same reason.
+     */
+    using ArtifactRotator = std::function<bool(const QString &source, const QString &destination,
+                                               int degrees, QString *why)>;
+
     /**
      * What an operation did, in the terms a caller needs to report it and to reload afterwards.
      */
@@ -103,6 +115,22 @@ public:
      * for the log, and for a caller that wants to say where the pages are about to come from.
      */
     static QString sourceFileNameFor(const QString &pdfPath);
+
+    /**
+     * Turns \a count pages starting at \a first by \a degrees, which has to be a quarter turn
+     * (90, 180 or 270; a negative value is the same turn the other way, normalized).
+     *
+     * The paper is turned by the manifest -- the record's extraRotation, and the size the reader
+     * sees follows from displaySizePt() -- and the ink is turned by the artifact: \a rotator turns
+     * each artifact into a temporary name, the operation journals the original and only then swaps
+     * the turned file in, all of it before the manifest is committed. A page that was never drawn on
+     * has no artifact, and its turn is recorded in the manifest alone.
+     *
+     * The pages' previews are dropped rather than left showing the page as it was: the docker makes
+     * a new one when it asks for it.
+     */
+    static Outcome rotatePages(const QString &projectDir, int first, int count, int degrees,
+                               const ArtifactRotator &rotator, int currentPage = -1);
 
     /**
      * Deletes \a count pages starting at \a first.
