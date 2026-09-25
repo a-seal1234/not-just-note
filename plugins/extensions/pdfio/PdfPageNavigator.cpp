@@ -31,8 +31,10 @@
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
 
+#include <KoColorSpaceConstants.h>
 #include <KoDocumentInfo.h>
 
+#include <kis_group_layer.h>
 #include <kis_paint_device.h>
 #include <kis_paint_layer.h>
 
@@ -112,6 +114,95 @@ void say(const QString &message)
             log.write("\n");
         }
     }
+}
+
+/// The root node the notebook calls "Ink": the group its content belongs in.
+///
+/// A single page always has a KisGroupLayer there. The strip has its one managed paint layer of
+/// that name, because the group PdfStripBuilder.cpp makes is never added to the image (the ink
+/// layer goes to the root instead), so the rule below makes the group at the moment there is a
+/// layer to move into it rather than inventing one for a notebook that has nothing outside it.
+KisNodeSP inkNodeOf(const KisImageSP &image)
+{
+    if (!image || !image->root()) {
+        return KisNodeSP();
+    }
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        const KisNodeSP child = image->root()->at(i);
+        if (child->name() == QStringLiteral("Ink")) {
+            return child;
+        }
+    }
+    return KisNodeSP();
+}
+
+/**
+ * Moves every content layer that ended up outside the Ink group into it, keeping its name and its
+ * pixels. Nothing is deleted and nothing is flattened: a page's render (the desk and the
+ * "PDF page N" layers) stays where it is, and every other root layer -- one the user made, or one
+ * the roll restored from an artifact under a name the strip did not have -- goes inside the group.
+ *
+ * The Ink node has to be a group to hold them, and the strip's is a paint layer, so the group is
+ * made here and the managed layer moves into it together with the strays -- which is the shape
+ * both modes are meant to have. a image by value: KisSharedPtr hands back a const KisImage
+ * through a const smart pointer, and addNode()/moveNode() are not const methods.
+ *
+ * How many content layers are still outside the group is reported, which is the measurable form of
+ * the rule: zero once it has run.
+ */
+int adoptContentIntoInk(KisImageSP image)
+{
+    if (!image || !image->root()) {
+        return 0;
+    }
+
+    KisNodeSP ink = inkNodeOf(image);
+
+    QList<KisNodeSP> strays;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        const KisNodeSP child = image->root()->at(i);
+        if (child == ink || PdfPageSaver::isPageBackground(child)) {
+            continue;
+        }
+        strays.append(child);
+    }
+
+    if (!strays.isEmpty()) {
+        if (!qobject_cast<KisGroupLayer *>(ink.data())) {
+            KisGroupLayerSP group = new KisGroupLayer(image, QStringLiteral("Ink"),
+                                                      OPACITY_OPAQUE_U8, image->colorSpace());
+            /// Above the managed layer, so the group lands where the content already was.
+            if (ink) {
+                image->addNode(group, image->root(), ink);
+            } else {
+                image->addNode(group, image->root());
+            }
+
+            /// The managed layer goes in first, so the strays keep the order they had above it.
+            if (ink && image->moveNode(ink, group, KisNodeSP())) {
+                say(QStringLiteral("moved layer \"%1\" into Ink").arg(ink->name()));
+            }
+            ink = group;
+        }
+
+        KisNodeSP above = ink->childCount() > 0 ? ink->lastChild() : KisNodeSP();
+        for (KisNodeSP child : strays) {
+            if (image->moveNode(child, ink, above)) {
+                say(QStringLiteral("moved layer \"%1\" into Ink").arg(child->name()));
+                above = child;
+            }
+        }
+    }
+
+    int outside = 0;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        const KisNodeSP child = image->root()->at(i);
+        if (child != ink && !PdfPageSaver::isPageBackground(child)) {
+            ++outside;
+        }
+    }
+    say(QStringLiteral("layers outside Ink: %1").arg(outside));
+    return outside;
 }
 
 /// One gesture, one page.
@@ -939,18 +1030,25 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     /// layers inside that page's rectangle, which is how the artifact is written.
     QList<KisPaintLayer *> content;
     KisPaintLayer *ink = nullptr;
-    for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
-        KisNodeSP child = m_document->image()->root()->at(i);
-        if (PdfPageSaver::isPageBackground(child)) {
-            continue;
-        }
-        if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
-            content.append(layer);
-            if (!ink && layer->name() == QStringLiteral("Ink")) {
-                ink = layer;
+    /// Recursive, because the rule below can have moved the strip's content inside an Ink group: a
+    /// reader that walked the root children only would stop finding the very layer it repaints.
+    std::function<void(KisNodeSP)> collectContent = [&](KisNodeSP parent) {
+        for (quint32 i = 0; i < parent->childCount(); ++i) {
+            KisNodeSP child = parent->at(i);
+            if (PdfPageSaver::isPageBackground(child)) {
+                continue;
+            }
+            if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
+                content.append(layer);
+                if (!ink && layer->name() == QStringLiteral("Ink")) {
+                    ink = layer;
+                }
+            } else if (qobject_cast<KisGroupLayer *>(child.data())) {
+                collectContent(child);
             }
         }
-    }
+    };
+    collectContent(m_document->image()->root());
 
     /// Read every page's layers BEFORE the repainting starts.
     ///
@@ -1074,6 +1172,13 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             paper->setDirty(slots.at(i).cell);
         }
     }
+
+    /// And the placement rule the notebook asked for: a content layer that ended up outside the
+    /// Ink group -- one the user made, or one restored from an artifact under a name the strip did
+    /// not have, which the block above adds at the root -- is moved INTO it, keeping its name and
+    /// its pixels. Never deleted, never flattened, and the number still outside is logged so the
+    /// rule is measurable.
+    adoptContentIntoInk(m_document->image());
 
     /// What the roll is not allowed to change: the page being read.
     ///
@@ -1495,6 +1600,10 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
             }
         }
     }
+
+    /// The same placement rule as the strip's roll: a content layer that is outside the page's
+    /// Ink group is moved into it, keeping its name and its pixels.
+    adoptContentIntoInk(image);
 
     /// The node to draw on: the group's own stroke layer when the restored layers left one, and
     /// the first layer of the group when they took its place.
