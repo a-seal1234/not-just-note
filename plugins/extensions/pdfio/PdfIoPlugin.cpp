@@ -18,10 +18,13 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QScrollBar>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -87,6 +90,315 @@ qint64 residentKb()
         return -1;
     }
     return fields.at(1).toLongLong() * (sysconf(_SC_PAGESIZE) / 1024);
+}
+
+/// One recent notebook is remembered as its project directory, a separator, and the name to show.
+/// A directory cannot contain the separator and the name has it stripped, so the split is never
+/// ambiguous; a name alone would not find the notebook again, and the directory alone would show a
+/// hash-derived folder name.
+const QChar RecentSeparator = QLatin1Char(10);
+
+const int MaxRecentNotebooks = 10;
+const char *const RecentNotebooksKey = "pdfio/recentNotebooks";
+
+/// The notebook's name as it is on disk right now. Read from the manifest rather than from the
+/// navigator: the navigator holds the copy it loaded when the notebook was opened, and a rename is
+/// written after that, so its copy is one rename behind.
+QString notebookNameFromDisk(const QString &projectDir)
+{
+    if (projectDir.isEmpty()) {
+        return QString();
+    }
+    QString why;
+    const PdfSessionManifest manifest =
+        PdfSessionManifest::readFrom(PdfSession::manifestPath(projectDir), &why);
+    return manifest.isValid() ? manifest.displayName() : QString();
+}
+
+/// A name that can also be offered as a file name: printable, without path separators, bounded.
+/// The manifest may have been written by another tool or edited by hand, so the rule is applied on
+/// the way out rather than trusted.
+QString nameForFile(const QString &name)
+{
+    /// 92 is the backslash, written as a code so the intent cannot be lost in an escape.
+    const QChar backslash = QLatin1Char(92);
+
+    QString clean;
+    for (const QChar character : name) {
+        if (character.isPrint() && character != QLatin1Char('/') && character != backslash) {
+            clean.append(character);
+        }
+    }
+    clean = clean.trimmed();
+    if (clean.size() > 120) {
+        clean.truncate(120);
+    }
+    return clean;
+}
+
+/// The name the export dialog should offer: the notebook's own name when it has one, the source
+/// file's as the fallback, and "notebook" when neither gives anything usable.
+QString exportSuggestion(PdfPageNavigator *navigator)
+{
+    QString base = notebookNameFromDisk(navigator->projectDir());
+    if (base.isEmpty()) {
+        base = QFileInfo(navigator->manifest().sourceFile).completeBaseName();
+    }
+    base = nameForFile(base);
+    if (base.isEmpty()) {
+        base = QStringLiteral("notebook");
+    }
+    return base + QStringLiteral("-notes.pdf");
+}
+
+/// Puts the open notebook's name on every docker. The docker reads the manifest itself; this is
+/// what makes a rename visible without waiting for the next page turn.
+void reloadDockerNames()
+{
+    KisMainWindow *window = KisPart::instance()->currentMainwindow();
+    if (!window) {
+        return;
+    }
+    const QList<PdfIoDocker *> dockers = window->findChildren<PdfIoDocker *>();
+    for (PdfIoDocker *docker : dockers) {
+        docker->reloadNotebookName();
+    }
+}
+
+QStringList recentNotebookEntries()
+{
+    QSettings settings;
+    return settings.value(QLatin1String(RecentNotebooksKey)).toStringList();
+}
+
+void writeRecentNotebooks(const QStringList &entries)
+{
+    QSettings settings;
+    settings.setValue(QLatin1String(RecentNotebooksKey), entries.mid(0, MaxRecentNotebooks));
+}
+
+QString recentNotebookDir(const QString &entry)
+{
+    return entry.section(RecentSeparator, 0, 0);
+}
+
+/// Remembers the open notebook as the most recent one. An older entry for the same project
+/// directory is dropped, so a renamed notebook appears once, at the top, under its new name.
+void rememberRecentNotebook()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook() || navigator->projectDir().isEmpty()) {
+        return;
+    }
+
+    const QString dir = QFileInfo(navigator->projectDir()).absoluteFilePath();
+    QString name = notebookNameFromDisk(navigator->projectDir());
+    if (name.isEmpty()) {
+        name = QFileInfo(navigator->manifest().sourceFile).completeBaseName();
+    }
+
+    QStringList entries = recentNotebookEntries();
+    for (int i = entries.size() - 1; i >= 0; --i) {
+        const QString existing = recentNotebookDir(entries.at(i));
+        if (existing.isEmpty()
+            || QFileInfo(existing).absoluteFilePath() == dir) {
+            entries.removeAt(i);
+        }
+    }
+    entries.prepend(dir + RecentSeparator + name);
+    writeRecentNotebooks(entries);
+}
+
+/// Gives a notebook its name the first time it is opened: the source PDF's own name, which is what
+/// the user picked the file by. A notebook that already has one is left alone. On a platform whose
+/// picker copies the file under a cache name this falls back to that name, which is the honest
+/// answer until the provider's own name can be asked for -- see the note on the import path.
+void ensureNotebookName()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return;
+    }
+
+    const QString path = PdfSession::manifestPath(navigator->projectDir());
+    QString why;
+    PdfSessionManifest manifest = PdfSessionManifest::readFrom(path, &why);
+    if (!manifest.isValid() || !manifest.name.isEmpty()) {
+        return;
+    }
+
+    manifest.name = manifest.displayName();
+    if (!manifest.writeTo(path, &why)) {
+        say(QStringLiteral("could not write the notebook's name: %1").arg(why));
+        return;
+    }
+    say(QStringLiteral("the notebook is named \"%1\"").arg(manifest.name));
+}
+
+/// What every successful open does, and nothing more: name the notebook if it has no name,
+/// remember it, and put its name on the docker. Deliberately called after the open -- the picker's
+/// copy step stays exactly where it is, and nothing here runs inside an activity callback.
+void notebookOpened()
+{
+    ensureNotebookName();
+    rememberRecentNotebook();
+    reloadDockerNames();
+}
+
+/// Writes \a entered into the open notebook's manifest as its name, with the same rejection the
+/// dialog path has, and puts it on the docker. Shared so the menu action and the probe do not
+/// drift apart.
+bool applyNotebookName(const QString &entered)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return false;
+    }
+
+    const QString clean = nameForFile(entered);
+    if (clean.isEmpty()) {
+        say(QStringLiteral("that name was refused: it has no printable characters"));
+        return false;
+    }
+
+    const QString path = PdfSession::manifestPath(navigator->projectDir());
+    QString why;
+    PdfSessionManifest manifest = PdfSessionManifest::readFrom(path, &why);
+    if (!manifest.isValid()) {
+        say(QStringLiteral("cannot read the notebook's manifest: %1").arg(why));
+        return false;
+    }
+
+    manifest.name = clean;
+    if (!manifest.writeTo(path, &why)) {
+        say(QStringLiteral("cannot write the notebook's name: %1").arg(why));
+        return false;
+    }
+
+    say(QStringLiteral("the notebook is now named \"%1\"").arg(clean));
+    reloadDockerNames();
+    rememberRecentNotebook();
+    return true;
+}
+
+void renameNotebook()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        say(QStringLiteral("rename: no notebook is open"));
+        QMessageBox::information(nullptr, i18n("Rename notebook"),
+                                 i18n("No notebook is open. Import a PDF as a notebook first."));
+        return;
+    }
+
+    bool accepted = false;
+    const QString entered = QInputDialog::getText(nullptr,
+                                                  i18n("Rename notebook"),
+                                                  i18n("Notebook name:"),
+                                                  QLineEdit::Normal,
+                                                  notebookNameFromDisk(navigator->projectDir()),
+                                                  &accepted);
+    if (!accepted) {
+        return;
+    }
+
+    if (!applyNotebookName(entered)) {
+        QMessageBox::warning(nullptr, i18n("Rename notebook"),
+                             i18n("The name could not be saved. The notebook keeps the name it had."));
+    }
+}
+
+/// Opens a notebook that is no longer in the menu's list under its own source, which is how the
+/// navigator finds the project directory it was unpacked into.
+void openRecentNotebook(const QString &projectDir)
+{
+    QString why;
+    const PdfSessionManifest manifest =
+        PdfSessionManifest::readFrom(PdfSession::manifestPath(projectDir), &why);
+    if (!manifest.isValid()) {
+        say(QStringLiteral("that recent notebook can no longer be read: %1").arg(why));
+        return;
+    }
+
+    const QString source = PdfSession::sourcePath(projectDir, manifest.sourceFile);
+    QTimer::singleShot(0, PdfPageNavigator::instance(), [source, projectDir]() {
+        QString error;
+        if (!PdfPageNavigator::instance()->openNotebook(source, &error)) {
+            say(QStringLiteral("could not open the recent notebook %1: %2").arg(projectDir, error));
+            return;
+        }
+        notebookOpened();
+    });
+}
+
+void rebuildRecentNotebooks(QMenu *menu)
+{
+    menu->clear();
+
+    QStringList entries = recentNotebookEntries();
+    QStringList alive;
+    for (const QString &entry : entries) {
+        const QString dir = recentNotebookDir(entry);
+        /// A notebook whose directory has gone is dropped rather than offered as a dead click.
+        if (dir.isEmpty() || !QFileInfo::exists(PdfSession::manifestPath(dir))) {
+            continue;
+        }
+        alive.append(entry);
+    }
+    if (alive != entries) {
+        writeRecentNotebooks(alive);
+    }
+
+    if (alive.isEmpty()) {
+        QAction *empty = menu->addAction(i18n("(no notebooks yet)"));
+        empty->setEnabled(false);
+        return;
+    }
+
+    for (const QString &entry : alive) {
+        const QString dir = recentNotebookDir(entry);
+        const QString name = entry.section(RecentSeparator, 1);
+        QAction *open = menu->addAction(name.isEmpty() ? dir : name);
+        QObject::connect(open, &QAction::triggered, menu, [dir]() { openRecentNotebook(dir); });
+    }
+}
+
+/// The two entries that are about the notebook's own name rather than an action from the action
+/// manager: no .action file describes a rename, and the recent list is rebuilt every time it opens.
+void addNotebookNameActions(QMenu *menu)
+{
+    if (!menu) {
+        return;
+    }
+
+    /// A stale group from an earlier view's plugin instance goes first: its connections died with
+    /// that instance, and two entries doing the same thing is how a menu starts looking broken.
+    if (QAction *previous = menu->findChild<QAction *>(QStringLiteral("pdfio_rename_notebook"))) {
+        menu->removeAction(previous);
+        previous->deleteLater();
+    }
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_recent_notebooks"))) {
+        menu->removeAction(previous->menuAction());
+        previous->deleteLater();
+    }
+    /// The separator belongs to this group and is tracked by its object name like the other two:
+    /// registerActions() runs again for a second view and is retried while the first screen has no
+    /// window, so a separator added unconditionally would leave one more behind on every call.
+    if (QAction *previous = menu->findChild<QAction *>(QStringLiteral("pdfio_name_separator"))) {
+        menu->removeAction(previous);
+        previous->deleteLater();
+    }
+
+    QAction *separator = menu->addSeparator();
+    separator->setObjectName(QStringLiteral("pdfio_name_separator"));
+    QAction *rename = menu->addAction(i18n("Rename notebook..."));
+    rename->setObjectName(QStringLiteral("pdfio_rename_notebook"));
+    QObject::connect(rename, &QAction::triggered, menu, []() { renameNotebook(); });
+
+    QMenu *recent = menu->addMenu(i18n("Recent notebooks"));
+    recent->setObjectName(QStringLiteral("pdfio_recent_notebooks"));
+    QObject::connect(recent, &QMenu::aboutToShow, recent,
+                     [recent]() { rebuildRecentNotebooks(recent); });
 }
 
 } // namespace
@@ -198,6 +510,10 @@ void PdfIoPlugin::registerActions()
             open->setObjectName(QStringLiteral("pdfio_open_notebook_alone"));
             connect(open, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebook);
         }
+
+        /// The recent list belongs on this screen too: it is the one menu entry that is useful
+        /// before any document exists.
+        addNotebookNameActions(alone);
         return;
     }
 
@@ -276,6 +592,8 @@ void PdfIoPlugin::registerActions()
             menu->addAction(followAction);
         }
     }
+
+    addNotebookNameActions(menu);
 }
 
 void PdfIoPlugin::updateStripAction()
@@ -382,7 +700,11 @@ void PdfIoPlugin::slotOpenNotebook()
             QString error;
             if (!PdfPageNavigator::instance()->openNotebook(localPath, &error)) {
                 say(QStringLiteral("could not open the chosen file: %1").arg(error));
+                return;
             }
+            /// After the open, never inside the activity callback: the picker's copy step is
+            /// untouched, and the name the provider may give is asked for later still.
+            notebookOpened();
         });
     });
 #else
@@ -396,7 +718,9 @@ void PdfIoPlugin::slotOpenNotebook()
 
     if (!PdfPageNavigator::instance()->openNotebook(path, nullptr)) {
         qWarning() << "pdfio could not open" << path;
+        return;
     }
+    notebookOpened();
 #endif
 }
 
@@ -613,6 +937,8 @@ void PdfIoPlugin::openBundleFile(const QString &bundlePath, bool replaceWithoutA
                                "the navigator's, and the ink that came in the file was not used")
                     .arg(PdfPageNavigator::instance()->projectDir(), destination));
         }
+
+        notebookOpened();
     });
 }
 
@@ -634,7 +960,7 @@ void PdfIoPlugin::slotExportPdf()
 #else
     const QString target = QFileDialog::getSaveFileName(nullptr,
                                                         i18n("Export the notebook to PDF"),
-                                                        QStringLiteral("notebook.pdf"),
+                                                        exportSuggestion(navigator),
                                                         i18n("PDF documents (*.pdf)"));
     if (target.isEmpty()) {
         return;
@@ -670,8 +996,7 @@ void PdfIoPlugin::slotExportPdf()
     /// Off to wherever the user chooses. The temporary file is left behind on purpose: it is what
     /// the content resolver reads from, and the system may take its time getting there.
     auto *writer = new AndroidDocumentPicker(this);
-    const QString suggested = QStringLiteral("%1-notes.pdf")
-                                  .arg(QFileInfo(navigator->manifest().sourceFile).completeBaseName());
+    const QString suggested = exportSuggestion(navigator);
     writer->createPdf(suggested, target, [writer, this](bool written, const QString &why) {
         writer->deleteLater();
         if (!written) {
@@ -729,14 +1054,22 @@ bool PdfIoPlugin::openNotebook(const QString &pdfPath)
     const bool opened = PdfPageNavigator::instance()->openNotebook(pdfPath, &why);
     if (!opened) {
         say(QStringLiteral("openNotebook failed: %1").arg(why));
+        return false;
     }
-    return opened;
+    notebookOpened();
+    return true;
 }
 
 void PdfIoPlugin::runRestoreProbe()
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
     QString why;
+
+    /// Pinned to one page before anything is opened: PdfProjectBuilder::inkStrokeLayer() only
+    /// answers for a page-shaped image, and the notebook ships with a five-page strip, so without
+    /// this the probe reaches "no paintable Ink layer" before it has drawn and the page path it
+    /// exists to check is never exercised.
+    navigator->setScope(1);
 
     /// The docker is put up first, because the crash being chased happened with it visible and a
     /// page clicked in it. Without it the probe is not reproducing the same thing.
@@ -935,16 +1268,23 @@ void PdfIoPlugin::runStripProbe()
     const QRect area = layout.slots().at(slot).rect;
 
     KisPaintLayer *stroke = nullptr;
-    const QString groupName = PdfStripBuilder::inkGroupName(first);
-    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+    for (quint32 i = 0; i < image->root()->childCount() && !stroke; ++i) {
         KisNodeSP child = image->root()->at(i);
-        /// The strip holds ONE content layer, "Ink" (PdfStripBuilder::build), and a page is the
-        /// part of it inside that page's rectangle. This used to look for a group per page, a
-        /// design the strip no longer has: the probe answered "no Ink layer for page 1" and never
-        /// reached the turn it exists to exercise.
-        if (child->name() == QStringLiteral("Ink")) {
-            stroke = qobject_cast<KisPaintLayer *>(child.data());
+        if (child->name() != QStringLiteral("Ink")) {
+            continue;
+        }
+        /// Both modes keep the stroke inside an "Ink" group now; a bare paint layer of that name
+        /// is the older shape and is still accepted. The page is the part of the stroke inside its
+        /// own rectangle, so either way this is the layer the mark is drawn into.
+        if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
+            stroke = layer;
             break;
+        }
+        for (quint32 c = 0; c < child->childCount(); ++c) {
+            if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child->at(c).data())) {
+                stroke = layer;
+                break;
+            }
         }
     }
     if (!stroke) {

@@ -61,7 +61,22 @@ public:
     /// Hex encoded SHA-256 of the source, so a moved or edited source is detected.
     QByteArray sourceSha256;
     qint64 sourceByteSize = 0;
+
+    /**
+     * The notebook's own name, as the user sees it: the docker's title and the suggestion the
+     * export dialog offers.
+     *
+     * Empty is legal and means "no name of its own yet", which is every notebook made before this
+     * field existed; displayName() then stands in the source file's name. It is a display label,
+     * never a path: nothing joins it onto a directory, which is why it is not checked by
+     * isSafeRelativePath() the way the file names are.
+     */
+    QString name;
+
     QList<PdfPageRecord> pages;
+
+    /// The name to show: name when there is one, otherwise the source file's own base name.
+    QString displayName() const;
 
     /**
      * Whether \a path is a file name this manifest may carry, and the one rule for all of them.

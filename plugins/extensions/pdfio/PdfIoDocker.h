@@ -29,6 +29,14 @@ public:
     PdfIoDocker();
     ~PdfIoDocker() override;
 
+    /**
+     * Puts the open notebook's own name on the title, right after a rename.
+     *
+     * The docker reads the name from the manifest itself, so a notebook opened after a rename is
+     * already titled correctly; this is only what makes the change visible without a page turn.
+     */
+    void reloadNotebookName();
+
 private Q_SLOTS:
     void refresh(int index, int pageCount, const QString &label);
     void openSelected();
@@ -54,7 +62,14 @@ private:
     /// Recomputes the card size for the room the list has now.
     void refitCards();
 
+    /// The open notebook's own name, read from its manifest once per notebook. Empty when there is
+    /// no notebook, or when the manifest carries no name -- the caller falls back to the label.
+    QString notebookName();
+
     QLabel *m_status = nullptr;
+    /// The project directory the cached name belongs to, so a notebook change re-reads it.
+    QString m_nameDir;
+    QString m_name;
     QListWidget *m_pages = nullptr;
     QPushButton *m_previous = nullptr;
     QPushButton *m_next = nullptr;

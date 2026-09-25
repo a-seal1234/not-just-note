@@ -6,6 +6,7 @@
 
 #include "PdfIoDocker.h"
 #include "PdfPageNavigator.h"
+#include "session/PdfSession.h"
 
 #include <QDir>
 #include <QEvent>
@@ -169,6 +170,46 @@ bool PdfIoDocker::eventFilter(QObject *watched, QEvent *event)
     return QDockWidget::eventFilter(watched, event);
 }
 
+QString PdfIoDocker::notebookName()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        m_nameDir.clear();
+        m_name.clear();
+        return QString();
+    }
+
+    const QString dir = navigator->projectDir();
+    if (dir == m_nameDir) {
+        return m_name;
+    }
+
+    m_nameDir = dir;
+    m_name.clear();
+
+    /// Read from the manifest on disk rather than from the navigator's copy: the navigator loaded
+    /// that when the notebook was opened and a rename is written after it, so its copy would be one
+    /// rename behind -- which is exactly the title still showing the old name after a rename.
+    QString why;
+    const PdfSessionManifest manifest =
+        PdfSessionManifest::readFrom(PdfSession::manifestPath(dir), &why);
+    if (manifest.isValid()) {
+        m_name = manifest.displayName();
+    }
+    return m_name;
+}
+
+void PdfIoDocker::reloadNotebookName()
+{
+    m_nameDir.clear();
+
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    const QString fallback = navigator->hasNotebook()
+        ? QFileInfo(navigator->manifest().sourceFile).completeBaseName()
+        : QString();
+    refresh(navigator->currentIndex(), navigator->pageCount(), fallback);
+}
+
 void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
@@ -195,8 +236,14 @@ void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
     /// thumbnails already there.
     queueThumbnails();
 
+    /// The notebook's own name when it has one, and the label the navigator sent otherwise: the
+    /// docker is named after the notebook, not after the file it was copied from.
+    const QString name = notebookName();
+    const QString shown = name.isEmpty() ? label : name;
+    setWindowTitle(shown.isEmpty() ? QStringLiteral("Notebook") : shown);
+
     m_status->setText(pageCount > 0
-                          ? QStringLiteral("%1 — page %2 of %3").arg(label).arg(index + 1).arg(pageCount)
+                          ? QStringLiteral("%1 — page %2 of %3").arg(shown).arg(index + 1).arg(pageCount)
                           : QStringLiteral("No notebook is open"));
 
     if (index >= 0 && index < m_pages->count()) {

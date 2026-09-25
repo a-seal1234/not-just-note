@@ -9,6 +9,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
@@ -79,6 +80,16 @@ bool PdfSessionManifest::isSafeRelativePath(const QString &path, QString *why)
         }
     }
     return true;
+}
+
+QString PdfSessionManifest::displayName() const
+{
+    /// A name of its own, or the source's. Not trimmed here: a manifest is written by this code
+    /// and the rename path refuses an empty name, so a name that is there is usable as it is.
+    if (!name.isEmpty()) {
+        return name;
+    }
+    return QFileInfo(sourceFile).completeBaseName();
 }
 
 bool PdfSessionManifest::isValid(QString *why) const
@@ -157,6 +168,7 @@ QJsonObject PdfSessionManifest::toJson() const
 
     QJsonObject root;
     root.insert(QStringLiteral("schema"), schema);
+    root.insert(QStringLiteral("name"), name);
     root.insert(QStringLiteral("source"), source);
     root.insert(QStringLiteral("pages"), pageArray);
     return root;
@@ -172,6 +184,10 @@ PdfSessionManifest PdfSessionManifest::fromJson(const QJsonObject &object, QStri
     }
 
     manifest.schema = object.value(QStringLiteral("schema")).toInt();
+
+    /// Absent in a manifest written before the field existed, and every notebook made then must
+    /// keep opening: a missing name is simply no name of its own.
+    manifest.name = object.value(QStringLiteral("name")).toString();
 
     const QJsonObject source = object.value(QStringLiteral("source")).toObject();
     manifest.sourceFile = source.value(QStringLiteral("file")).toString();
