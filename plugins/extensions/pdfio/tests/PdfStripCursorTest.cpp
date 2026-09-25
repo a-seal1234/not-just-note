@@ -533,8 +533,11 @@ void PdfStripCursorTest::testThreeSlotStripRendersEachPageInItsOwnSlot()
         QVERIFY(inkIndex > rootIndex(PdfStripBuilder::backgroundLayerName(slot.page)));
     }
 
+    /// A temporary file by default: writing the strip into tests/data left a modified fixture
+    /// behind after every run, which makes the next run's tree dirty and the measurement
+    /// non-deterministic. PDFIO_STRIP_PNG still names an explicit place when one is wanted.
     const QString out = qEnvironmentVariable(
-        "PDFIO_STRIP_PNG", QStringLiteral(FILES_DATA_DIR) + QStringLiteral("mr-strip-three-slot.png"));
+        "PDFIO_STRIP_PNG", m_dir.filePath(QStringLiteral("mr-strip-three-slot.png")));
     QVERIFY2(composed.save(out, "PNG"), qPrintable(out));
     qInfo("strip %dx%d written to %s", composed.width(), composed.height(), qPrintable(out));
 }

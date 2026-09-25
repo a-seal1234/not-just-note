@@ -26,6 +26,7 @@ private Q_SLOTS:
     void testEvenScopeIsMadeOdd();
     void testScopeLargerThanTheNotebook();
     void testRefusesNonsense();
+    void testCellBandsCoverTheirPagesAndTheImage();
 
 private:
     /// Three pages: A4, then A5 rotated, then a small square. Mixed on purpose.
@@ -144,6 +145,42 @@ void PdfStripLayoutTest::testRefusesNonsense()
     QVERIFY(!PdfStripLayout::forWindow(PdfSessionManifest(), 0, 3, 200.0).isValid());
     QVERIFY(!PdfStripLayout::forWindow(manifest(), 9, 3, 200.0).isValid());
     QVERIFY(!PdfStripLayout::forWindow(manifest(), 0, 3, 0.0).isValid());
+}
+
+/**
+ * The bands the roll wipes and repaints: each contains its page, and together they tile the image.
+ *
+ * A band that did not contain its page would leave part of that page unpainted when the roll
+ * repaints from the artifact; bands that left a row uncovered would leave stale pixels from the
+ * window before. Both are checked on the mixed-size manifest, where the pages do not fill the
+ * height the tallest window needs.
+ */
+void PdfStripLayoutTest::testCellBandsCoverTheirPagesAndTheImage()
+{
+    const PdfStripLayout layout = PdfStripLayout::forWindow(manifest(), 1, 3, 200.0);
+    const QList<PdfStripLayout::Slot> slots = layout.slots();
+    QCOMPARE(slots.size(), 3);
+
+    for (const PdfStripLayout::Slot &slot : slots) {
+        QVERIFY2(slot.cell.contains(slot.rect), "the band must contain the page it belongs to");
+        QCOMPARE(slot.cell.width(), layout.imageSize().width());
+    }
+
+    /// They meet, with no gap and no overlap, from the top edge to the bottom.
+    QVERIFY2(slots.first().cell.top() <= 0, "the first band reaches the top edge");
+    for (int i = 1; i < slots.size(); ++i) {
+        QCOMPARE(slots.at(i).cell.top(), slots.at(i - 1).cell.bottom() + 1);
+    }
+    QCOMPARE(slots.last().cell.bottom() + 1, layout.imageSize().height());
+
+    qInfo("cells %d,%d %dx%d / %d,%d %dx%d / %d,%d %dx%d tile a %dx%d image",
+          slots.at(0).cell.x(), slots.at(0).cell.y(),
+          slots.at(0).cell.width(), slots.at(0).cell.height(),
+          slots.at(1).cell.x(), slots.at(1).cell.y(),
+          slots.at(1).cell.width(), slots.at(1).cell.height(),
+          slots.at(2).cell.x(), slots.at(2).cell.y(),
+          slots.at(2).cell.width(), slots.at(2).cell.height(),
+          layout.imageSize().width(), layout.imageSize().height());
 }
 
 QTEST_MAIN(PdfStripLayoutTest)

@@ -32,6 +32,7 @@ private Q_SLOTS:
     void testOnlyTheInkLayerIsPaintable();
     void testPagesAreWhereTheLayoutSays();
     void testPaperIsBelowEveryInkGroup();
+    void testConsecutiveGapsAreEqual();
 
 private:
     QString fixturePath() const
@@ -193,6 +194,45 @@ void PdfStripBuilderTest::testPaperIsBelowEveryInkGroup()
     QVERIFY(highestPaper >= 0);
     QVERIFY2(inkIndex > highestPaper,
              "the ink has to sit above every page, or ink vanishes behind the page below it");
+}
+
+/**
+ * The space between two pages is the same however different their sizes are.
+ *
+ * Every page used to be centred inside a cell sized for the largest page in the notebook, so the
+ * gap the user saw between a small page and a large one was SlotGap plus the centring slack of
+ * both. text-fixture.pdf carries three real sizes (A4 595x842, A5 420x595, square 300x300), which
+ * is the case this measures; the three heights are checked to differ first, so equality of the
+ * gaps below cannot pass by being trivial.
+ */
+void PdfStripBuilderTest::testConsecutiveGapsAreEqual()
+{
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixturePath()));
+
+    QString why;
+    const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
+                                                               backend, QString(), &why);
+    QVERIFY2(strip.image, qPrintable(why));
+
+    const QList<PdfStripLayout::Slot> slots = strip.layout.slots();
+    QCOMPARE(slots.size(), 3);
+
+    /// Three pages, three sizes -- otherwise the assertion below would hold just as well on the
+    /// old layout.
+    QVERIFY(slots.at(0).rect.height() != slots.at(1).rect.height());
+    QVERIFY(slots.at(1).rect.height() != slots.at(2).rect.height());
+
+    /// The blank space between two pages, measured the way it is seen: the rows between the
+    /// bottom of one page rectangle and the top of the next.
+    const int gap = slots.at(1).rect.top() - slots.at(0).rect.bottom() - 1;
+    QVERIFY2(gap > 0, "the pages must not touch");
+    for (int i = 2; i < slots.size(); ++i) {
+        QCOMPARE(slots.at(i).rect.top() - slots.at(i - 1).rect.bottom() - 1, gap);
+    }
+
+    qInfo("text-fixture.pdf: slot heights %d, %d, %d; every gap %d px",
+          slots.at(0).rect.height(), slots.at(1).rect.height(), slots.at(2).rect.height(), gap);
 }
 
 QTEST_MAIN(PdfStripBuilderTest)

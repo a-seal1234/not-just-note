@@ -52,16 +52,17 @@ PdfStripLayout PdfStripLayout::forWindow(const PdfSessionManifest &manifest,
     }
     scope = qMin(scope, manifest.pages.size());
 
-    /// Every slot is the same cell, sized to the largest page, so that the image size does not
-    /// change as the window moves. Wasteful for a notebook of mixed sizes, and the price of not
-    /// rebuilding the document on every turn.
-    QSize cell;
+    /// The width is the widest page of the notebook, so every page is centred in the same column
+    /// whichever pages the window happens to hold; the heights are collected for the image size
+    /// below, because the pages are packed by their own heights.
+    QList<int> pageHeights;
+    int cellWidth = 0;
     for (const PdfPageRecord &page : manifest.pages) {
         const QSize size = pageSizeInPixels(manifest, page, dpi);
-        cell.setWidth(qMax(cell.width(), size.width()));
-        cell.setHeight(qMax(cell.height(), size.height()));
+        pageHeights.append(size.height());
+        cellWidth = qMax(cellWidth, size.width());
     }
-    if (cell.isEmpty()) {
+    if (cellWidth <= 0) {
         return layout;
     }
 
@@ -71,6 +72,41 @@ PdfStripLayout PdfStripLayout::forWindow(const PdfSessionManifest &manifest,
     int first = activePage - half;
     first = qBound(0, first, qMax(0, manifest.pages.size() - scope));
 
+    /// The image is as tall as the TALLEST window of this scope, not as this window's own packed
+    /// height.
+    ///
+    /// Packing the pages by their own heights makes the height of a window depend on which pages
+    /// it holds. If the image followed that, a notebook of mixed page sizes -- the fifty page
+    /// fixture is exactly that, four geometries cycling -- would change the document's size on
+    /// every window move, and the roll, which writes every page the window holds before it moves
+    /// and is the reason a page turn neither rebuilds the document nor loses ink, refuses a window
+    /// of a different size. The tallest window keeps the size constant, so the roll still runs.
+    /// For a notebook whose pages are all one size, which is the common case, every window is that
+    /// tall and this is exactly sum(h_i + SlotGap) + SlotGap.
+    const auto packedHeight = [&pageHeights, scope](int from) {
+        int sum = 0;
+        for (int i = from; i < from + scope; ++i) {
+            sum += pageHeights.at(i);
+        }
+        return sum + scope * SlotGap;
+    };
+    int imageHeight = 0;
+    const int lastFirst = qMax(0, pageHeights.size() - scope);
+    for (int from = 0; from <= lastFirst; ++from) {
+        imageHeight = qMax(imageHeight, packedHeight(from));
+    }
+    /// One gap of slack under the tallest window, on top of the gaps the pages carry, so the last
+    /// page's half-gap band and the bottom edge of the image are not the same line.
+    imageHeight += SlotGap;
+
+    /// Each page is placed by its own height: y_0 = 0 and y_i = y_{i-1} + h_{i-1} + SlotGap.
+    ///
+    /// Every page used to be centred inside one cell sized for the largest page in the notebook,
+    /// so the space between a small page and a large one was SlotGap plus the centring slack of
+    /// both -- a small page sat in a hole, which is what the user saw. Packed by their own heights,
+    /// every consecutive pair is separated by exactly SlotGap whatever the two pages' sizes are.
+    const int halfGap = SlotGap / 2;
+    int y = 0;
     for (int i = 0; i < scope; ++i) {
         const int pageIndex = first + i;
 
@@ -81,13 +117,23 @@ PdfStripLayout PdfStripLayout::forWindow(const PdfSessionManifest &manifest,
             ? pageSizeInPixels(manifest, manifest.pages.at(slot.page), dpi)
             : QSize();
 
-        /// Centred in its cell, both ways. Top aligned looked like a mistake: a smaller page sat
-        /// against the top of a cell sized for the largest page in the notebook, with a stretch of
-        /// empty strip under it that reads as the page being wrong rather than as room.
-        const int x = (cell.width() - pageSize.width()) / 2;
-        const int y = i * (cell.height() + SlotGap) + (cell.height() - pageSize.height()) / 2;
+        /// Centred horizontally, as before. Vertically there is no cell to centre in any more:
+        /// the page sits at the top of its own band, which is what makes the gaps equal.
+        const int x = (cellWidth - pageSize.width()) / 2;
         slot.rect = QRect(x, y, pageSize.width(), pageSize.height());
-        slot.cell = QRect(0, i * (cell.height() + SlotGap), cell.width(), cell.height());
+
+        /// The band the roll wipes and repaints: the page plus half a gap above and below, so the
+        /// bands meet in the middle of every gap. The last band runs to the bottom of the image,
+        /// absorbing the slack a shorter window leaves under the tallest one: the roll clears what
+        /// it repaints band by band, so the bands have to cover every pixel of the image and no
+        /// window may leave stale pixels below its last page.
+        int cellBottom = y + pageSize.height() + halfGap;
+        if (i == scope - 1) {
+            cellBottom = imageHeight;
+        }
+        slot.cell = QRect(0, y - halfGap, cellWidth, cellBottom - (y - halfGap));
+
+        y += pageSize.height() + SlotGap;
 
         if (slot.page == activePage) {
             layout.m_activeSlot = i;
@@ -97,7 +143,7 @@ PdfStripLayout PdfStripLayout::forWindow(const PdfSessionManifest &manifest,
     }
 
     layout.m_activePage = activePage;
-    layout.m_imageSize = QSize(cell.width(), scope * (cell.height() + SlotGap));
+    layout.m_imageSize = QSize(cellWidth, imageHeight);
     return layout;
 }
 

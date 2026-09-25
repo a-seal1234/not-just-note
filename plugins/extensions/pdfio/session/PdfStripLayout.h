@@ -20,11 +20,13 @@
  * Pure geometry, separated from everything that builds or paints, because this is the part of
  * design B that has to be right and the part that can be tested without a canvas.
  *
- * The strip is vertical and its image size is fixed for a given scope: every slot is the same
- * cell, sized to the largest page in the notebook, and a page sits at the top of its own cell at
- * its own size. A fixed image size is the point -- rolling the window repaints the slot that goes
- * out of view rather than rebuilding the document, which is what makes a page turn cost a render
- * instead of a document and a view.
+ * The strip is vertical and every page is centred in the same column, packed under the page above
+ * it by its own height: the space between two pages is exactly the gap whatever their sizes are.
+ * The image is as tall as the tallest window of the scope -- not as this window -- so a window move
+ * never changes the document's size and rolling the window repaints the slots that changed rather
+ * than rebuilding the document, which is what makes a page turn cost a render instead of a
+ * document and a view. For a notebook whose pages are all one size, the tallest window is every
+ * window and the image is exactly the pages plus one gap each.
  *
  * Pages are laid out in page order, so the strip reads downwards, and the window is centred on
  * the active page as far as the ends of the notebook allow.
@@ -38,8 +40,10 @@ public:
         /// Where the page sits in the strip image, in pixels.
         QRect rect;
 
-        /// The whole band this slot owns, page or no page. Clearing a slot means clearing this,
-        /// because the page that was there may have been larger than the one arriving.
+        /// The whole band this slot owns, page or no page: the page plus half the gap above and
+        /// half below, so the bands meet in the middle of every gap; the last band runs to the
+        /// bottom of the image so the bands cover it completely. Clearing a slot means clearing
+        /// this, because the page that was there may have been larger than the one arriving.
         QRect cell;
     };
 
