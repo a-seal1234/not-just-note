@@ -7,6 +7,7 @@
 #include "PdfPageNavigator.h"
 
 #include "session/PdfInkLoader.h"
+#include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
 
@@ -75,6 +76,7 @@ private Q_SLOTS:
     void testQuittingWritesTheInkToo();
     void testClosingTheTabWritesTheInkAndAsksNothing();
     void testAnInsertedImageStaysItsOwnLayerAcrossAReopen();
+    void testInsertingOnAStripWritesThePageAndNotTheStrip();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -826,6 +828,225 @@ void PdfNavigatorIntegrationTest::testAnInsertedImageStaysItsOwnLayerAcrossAReop
     /// And the tab is closed, the way the roll test closes its own: a view nobody closed takes the
     /// main window down with it in the teardown. The document is marked clean first -- its ink is on
     /// disk and nothing was drawn since -- so closing asks nothing.
+    reopened->setModified(false);
+    navigator()->setScope(1);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+}
+
+/**
+ * "Insert image..." writes the page, not the strip.
+ *
+ * slotSavePage() built its document from the whole editing image, and a five-page strip is five
+ * pages tall: page 1's artifact came out the size of the strip (measured in the user's notebook:
+ * maindoc 1653x5273 where page 1 renders 1653x2339). The next roll rewrote it cropped, so it
+ * self-corrected on the first page switch -- but a close, a reopen or an export right after the
+ * insert read a page-sized rectangle full of strip.
+ *
+ * The write now goes through PdfPageNavigator::pageLayersDocument(), the same crop the roll uses.
+ * This test measures both on one image: the call the insert used to make, which is still the whole
+ * strip, and the one it makes now, which is the page. Then it opens the notebook again with no page
+ * switch in between and checks that the picture came back as its own layer, at its own place.
+ */
+void PdfNavigatorIntegrationTest::testInsertingOnAStripWritesThePageAndNotTheStrip()
+{
+    /// A source long enough that a five-page window is a real strip.
+    const QString usualFixture = m_fixture;
+    m_fixture = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(m_fixture), qPrintable(m_fixture));
+    QVERIFY(useNotebook(QStringLiteral("insert-crop"), 5));
+    m_fixture = usualFixture;
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisImageSP image = document->image();
+    QVERIFY(image);
+
+    const PdfStripLayout layout = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
+    QVERIFY(layout.isValid());
+    const int slot = layout.slotForPage(0);
+    QVERIFY(slot >= 0);
+    const QRect pageRect = layout.slots().at(slot).rect;
+
+    /// The strip has to be taller than one page, or the two writes would be the same size and the
+    /// measurement would say nothing.
+    QVERIFY2(image->height() > pageRect.height(),
+             qPrintable(QStringLiteral("the strip is %1 px tall and page 1 is %2 -- not a strip")
+                            .arg(image->height()).arg(pageRect.height())));
+
+    KisNodeSP group;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        KisNodeSP child = image->root()->at(i);
+        if (child->name() == QStringLiteral("Ink")
+            && qobject_cast<KisGroupLayer *>(child.data())) {
+            group = child;
+            break;
+        }
+    }
+    QVERIFY2(group, "the strip has no Ink group");
+
+    /// The picture, as placeInsertedImage() puts one there: its own layer, its own pixels, the place
+    /// carried by the layer offset, well inside page 1.
+    const QPoint pictureOnStrip(200, 300);
+    const QRect pictureOnStripRect(pictureOnStrip, QSize(60, 60));
+    QVERIFY2(pageRect.contains(pictureOnStripRect),
+             qPrintable(QStringLiteral("the picture at %1,%2 is not inside page 1 (%3,%4 %5x%6)")
+                            .arg(pictureOnStrip.x()).arg(pictureOnStrip.y())
+                            .arg(pageRect.x()).arg(pageRect.y())
+                            .arg(pageRect.width()).arg(pageRect.height())));
+    KisPaintLayerSP inserted = new KisPaintLayer(image, QStringLiteral("Inserted image"),
+                                                 OPACITY_OPAQUE_U8);
+    inserted->paintDevice()->fill(QRect(QPoint(0, 0), pictureOnStripRect.size()),
+                                  KoColor(QColor(255, 0, 0), image->colorSpace()));
+    inserted->setX(pictureOnStrip.x());
+    inserted->setY(pictureOnStrip.y());
+    QVERIFY2(image->addNode(inserted, group), "the picture could not be added to the Ink group");
+
+    QString why;
+
+    /// The call the insert made before, kept here as its measurement: the whole editing image.
+    KisDocument *whole = PdfPageSaver::createPageLayersDocument(image, &why);
+    QVERIFY2(whole, qPrintable(why));
+    const QSize wholeSize(whole->image()->width(), whole->image()->height());
+    qInfo("the call the insert used to make: %dx%d; page 1's rectangle: %dx%d; the strip: %dx%d",
+          wholeSize.width(), wholeSize.height(), pageRect.width(), pageRect.height(),
+          image->width(), image->height());
+    QCOMPARE(wholeSize, QSize(image->width(), image->height()));
+    QVERIFY(wholeSize.height() > pageRect.height());
+    KisPart::instance()->removeDocument(whole, true);
+
+    /// And the one it makes now: page 1's own rectangle, through the door the roll crops by.
+    KisDocument *pageDocument = navigator()->pageLayersDocument(document, 0, &why);
+    QVERIFY2(pageDocument, qPrintable(why));
+    const QSize pageSize(pageDocument->image()->width(), pageDocument->image()->height());
+    qInfo("pageLayersDocument(): %dx%d, page 1's rectangle %dx%d",
+          pageSize.width(), pageSize.height(), pageRect.width(), pageRect.height());
+    QCOMPARE(pageSize, pageRect.size());
+
+    const QString artifact = artifactFor(0);
+    bool finished = false;
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, this,
+                     [&finished](const QString &) { finished = true; });
+    QVERIFY2(PdfPageSaver::saveDocument(pageDocument, artifact, &why), qPrintable(why));
+    QElapsedTimer saveClock;
+    saveClock.start();
+    while (!finished && saveClock.elapsed() < 30000) {
+        QTest::qWait(25);
+    }
+    QVERIFY2(finished, "the save never reported back");
+    KisPart::instance()->removeDocument(pageDocument, true);
+
+    QFile list(artifact + QStringLiteral(".layers.txt"));
+    QVERIFY2(list.open(QIODevice::ReadOnly | QIODevice::Text), qPrintable(list.fileName()));
+    const QString listing = QString::fromUtf8(list.readAll());
+    qInfo("page 1's sidecar right after the insert:\n%s", qPrintable(listing));
+    QVERIFY2(listing.contains(QStringLiteral("Inserted image")),
+             "the artifact does not list the inserted layer");
+
+    const QList<QPair<QString, QImage>> layers =
+        PdfInkLoader::loadInkLayersFromSidecar(artifact, &why);
+    QVERIFY2(layers.size() >= 2, qPrintable(why));
+
+    const QPoint pictureInPage = pictureOnStrip - pageRect.topLeft();
+    QImage insertedPixels;
+    for (const QPair<QString, QImage> &entry : layers) {
+        QCOMPARE(entry.second.size(), pageRect.size());
+        if (entry.first == QStringLiteral("Inserted image")) {
+            insertedPixels = entry.second;
+        }
+    }
+    QVERIFY2(!insertedPixels.isNull(), "the artifact has no inserted image entry");
+
+    const QPoint inPicture = pictureInPage + QPoint(pictureOnStripRect.width() / 2,
+                                                    pictureOnStripRect.height() / 2);
+    const QRgb atPlace = insertedPixels.pixel(inPicture);
+    const QRgb corner = insertedPixels.pixel(2, 2);
+    qInfo("right after the insert: %d layer(s), each %dx%d; the picture's own place %d,%d is "
+          "rgba(%d,%d,%d,%d); a corner of its layer is rgba(%d,%d,%d,%d)",
+          int(layers.size()), pageRect.width(), pageRect.height(), inPicture.x(), inPicture.y(),
+          qRed(atPlace), qGreen(atPlace), qBlue(atPlace), qAlpha(atPlace),
+          qRed(corner), qGreen(corner), qBlue(corner), qAlpha(corner));
+    QVERIFY2(qAlpha(atPlace) > 200 && qRed(atPlace) > 200 && qGreen(atPlace) < 60
+                 && qBlue(atPlace) < 60,
+             "the inserted picture is not at its own place inside the page's rectangle");
+    QCOMPARE(qAlpha(corner), 0);
+
+    /// No page switch in between: the notebook is opened again straight away, which is the read the
+    /// defect broke.
+    QVERIFY(useNotebook(QStringLiteral("insert-crop"), 5));
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *reopened = navigator()->currentDocument();
+    QVERIFY(reopened);
+    KisImageSP strip = reopened->image();
+    QVERIFY(strip);
+
+    KisNodeSP reopenedGroup;
+    for (quint32 i = 0; i < strip->root()->childCount(); ++i) {
+        KisNodeSP child = strip->root()->at(i);
+        if (qobject_cast<KisGroupLayer *>(child.data())) {
+            reopenedGroup = child;
+            break;
+        }
+    }
+    QVERIFY2(reopenedGroup, "the rebuilt strip has no Ink group");
+
+    QStringList names;
+    KisPaintLayer *restored = nullptr;
+    KisPaintLayer *strokes = nullptr;
+    for (quint32 i = 0; i < reopenedGroup->childCount(); ++i) {
+        names.append(reopenedGroup->at(i)->name());
+        KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(reopenedGroup->at(i).data());
+        if (!layer) {
+            continue;
+        }
+        if (layer->name() == QStringLiteral("Inserted image")) {
+            restored = layer;
+        } else if (layer->name() == QStringLiteral("Ink")) {
+            strokes = layer;
+        }
+    }
+    qInfo("after the reopen with no page switch: the Ink group holds %d child(ren): %s",
+          int(names.size()), qPrintable(names.join(QStringLiteral(", "))));
+    QVERIFY2(names.contains(QStringLiteral("Inserted image")),
+             "the picture did not come back as its own layer");
+    QVERIFY(strokes);
+    QVERIFY(restored);
+
+    const auto redPixelsIn = [](const QImage &pixels, const QRect &area) {
+        int count = 0;
+        const QRect clipped = area.intersected(pixels.rect());
+        for (int y = clipped.top(); y <= clipped.bottom(); ++y) {
+            for (int x = clipped.left(); x <= clipped.right(); ++x) {
+                const QRgb pixel = pixels.pixel(x, y);
+                if (qAlpha(pixel) > 200 && qRed(pixel) > 200 && qGreen(pixel) < 60
+                    && qBlue(pixel) < 60) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    };
+
+    const QImage restoredPixels = restored->paintDevice()->convertToQImage(0, strip->bounds());
+    const int redInInk = redPixelsIn(strokes->paintDevice()->convertToQImage(0, strip->bounds()),
+                                     pageRect);
+    const QColor backAtPlace = restoredPixels.pixelColor(
+        pictureOnStrip + QPoint(pictureOnStripRect.width() / 2, pictureOnStripRect.height() / 2));
+    qInfo("after the reopen: red pixels inside page 1's slot -- Ink %d, the inserted layer %d; the "
+          "picture's place rgba(%d,%d,%d,%d)",
+          redInInk, redPixelsIn(restoredPixels, pageRect), backAtPlace.red(), backAtPlace.green(),
+          backAtPlace.blue(), backAtPlace.alpha());
+    QCOMPARE(redInInk, 0);
+    QVERIFY2(backAtPlace.red() > 200 && backAtPlace.green() < 60 && backAtPlace.blue() < 60,
+             "the picture did not come back at its own place on the page");
+
+    /// The tab is closed, the way the roll test closes its own: a view nobody closed takes the main
+    /// window down with it in the teardown.
     reopened->setModified(false);
     navigator()->setScope(1);
     if (KisView *view = navigator()->currentView()) {

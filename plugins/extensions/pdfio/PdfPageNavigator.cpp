@@ -2097,6 +2097,33 @@ void PdfPageNavigator::pumpAutoSave()
     }
 }
 
+QRect PdfPageNavigator::pageAreaFor(int index) const
+{
+    const int slot = m_stripPages.indexOf(index);
+    if (slot < 0 || slot >= m_stripRects.size()) {
+        return QRect();
+    }
+    return m_stripRects.at(slot);
+}
+
+KisDocument *PdfPageNavigator::pageLayersDocument(KisDocument *page, int index, QString *why)
+{
+    if (!page || !page->image()) {
+        fail(why, QStringLiteral("the page has no image to write"));
+        return nullptr;
+    }
+
+    /// The window's geometry describes this window's document and nothing else. A page document the
+    /// navigator does not have open -- another notebook's page, shown in another view -- has no
+    /// rectangle here, and is written whole rather than cropped by a stranger's numbers.
+    const QRect area = page == m_document.data() ? pageAreaFor(index) : QRect();
+
+    /// A document holding one page has no rectangle and needs no cropping.
+    return area.isValid()
+        ? PdfPageSaver::createPageLayersDocument(page->image(), area, why)
+        : PdfPageSaver::createPageLayersDocument(page->image(), why);
+}
+
 bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<void()> then)
 {
     /// Which page to write. Not necessarily the one that is open: the whole strip can be written
@@ -2114,12 +2141,8 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
     }
 
     /// The rectangle that page occupies in the strip. A document holding one page has none, and
-    /// needs no cropping.
-    QRect pageArea;
-    const int slot = m_stripPages.indexOf(page);
-    if (slot >= 0 && slot < m_stripRects.size()) {
-        pageArea = m_stripRects.at(slot);
-    }
+    /// needs no cropping. Worked out in one place, so every writer of a page crops by the same one.
+    const QRect pageArea = pageAreaFor(page);
 
     /// Which layers are written is PdfPageSaver's decision now: the page's own layers, every one of
     /// them, and never the render of the source page. It used to be decided here, by finding the
@@ -2159,10 +2182,9 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
     }
 
     /// The copy is made while the page is still alive, and it owns its own pixels, so the editing
-    /// document can be closed immediately afterwards.
-    KisDocument *pageDocument = pageArea.isValid()
-        ? PdfPageSaver::createPageLayersDocument(m_document->image(), pageArea, why)
-        : PdfPageSaver::createPageLayersDocument(m_document->image(), why);
+    /// document can be closed immediately afterwards. The same door "Insert image..." writes
+    /// through, so the two crop by one rectangle.
+    KisDocument *pageDocument = pageLayersDocument(m_document, page, why);
     if (!pageDocument) {
         return false;
     }

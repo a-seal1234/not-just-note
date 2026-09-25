@@ -1454,8 +1454,14 @@ void PdfIoPlugin::slotSavePage()
         return;
     }
 
+    /// Cropped to the page the notebook has open, by the same rectangle the roll writes through.
+    ///
+    /// This used to build the document from the whole image, so on a strip page 1's artifact was
+    /// the whole strip until the next roll rewrote it -- and a close, a reopen or an export right
+    /// after an insert read a page-sized rectangle full of strip.
     QString why;
-    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(document->image(), &why);
+    KisDocument *pageDocument =
+        PdfPageNavigator::instance()->pageLayersDocument(document, pageIndex, &why);
     if (!pageDocument) {
         qWarning() << "pdfio: cannot prepare the page:" << why;
         return;

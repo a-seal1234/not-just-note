@@ -68,6 +68,20 @@ public:
     bool saveStripPages();
 
     /**
+     * The document a page write starts from: \a page's own layers, cropped to the rectangle \a index
+     * occupies in the open strip, or the whole document when it holds a single page.
+     *
+     * This is the crop the roll writes through, and the one "Insert image..." has to write through
+     * too: the insert built its document from the whole image, so on a strip page 1's artifact was
+     * the whole strip until the next roll rewrote it, and a close, a reopen or an export right after
+     * the insert read a page-sized rectangle full of strip.
+     *
+     * Returns nullptr and sets \a why when there is nothing to write. The caller owns the document
+     * and has to delete it once the save has reported.
+     */
+    KisDocument *pageLayersDocument(KisDocument *page, int index, QString *why = nullptr);
+
+    /**
      * Writes what the open page -- every page the window holds -- still has unsaved, so that
      * closing a tab or quitting Krita cannot lose ink.
      *
@@ -147,6 +161,11 @@ private:
      * remove the document, and nothing had ever been saved from it, so the ink went with it.
      */
     bool saveCurrentPage(QString *why = nullptr, int index = -1, std::function<void()> then = nullptr);
+
+    /// The rectangle \a index occupies in the open strip, or an invalid one when the document holds
+    /// a single page or that page is not in the window. The one place the crop is worked out, so
+    /// every writer of a page uses the same rectangle.
+    QRect pageAreaFor(int index) const;
 
     /// Saves one page and waits for the file to have been written -- through the queue, so a
     /// second write never starts while one is in the air.
