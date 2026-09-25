@@ -6,6 +6,7 @@
 
 #include "PdfPageSaver.h"
 
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QTextStream>
@@ -72,6 +73,26 @@ void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRe
 
         KisPaintLayer *paint = qobject_cast<KisPaintLayer *>(child.data());
         if (!paint) {
+            /// Not paint. The case that matters is a file layer -- File > Insert Image... -- and
+            /// skipping it silently is why an inserted image never reached the page's .kra nor the
+            /// exported PDF. Its projection is rasterised into a plain paint layer with the same
+            /// name, opacity and place, so the artifact stays self-contained and does not depend on
+            /// the inserted file still being where it was.
+            ///
+            /// Nothing to read means nothing to write: a file layer whose source has gone is
+            /// skipped with a line in the log rather than failing the whole save.
+            KisPaintDeviceSP projection = child->projection();
+            if (!projection || projection->exactBounds().isEmpty()) {
+                qWarning() << "pdfio: skipping the layer" << child->name()
+                           << "-- nothing can be read from it (an image layer whose source is gone)";
+                continue;
+            }
+
+            KisPaintLayerSP copy = new KisPaintLayer(target, child->name(), child->opacity());
+            copy->paintDevice()->makeCloneFrom(projection, area);
+            copy->setX(-area.x());
+            copy->setY(-area.y());
+            target->addNode(copy, parent);
             continue;
         }
 
@@ -161,6 +182,13 @@ KisDocument *PdfPageSaver::createPageLayersDocument(const KisImageSP &source,
                                    area.width(), area.height(), source->colorSpace(),
                                    QStringLiteral("page"));
     page->setResolution(source->xRes(), source->yRes());
+
+    /// The source's own graph is refreshed first: a non-paint layer's pixels live only in its
+    /// projection -- a file layer has no paint device of its own -- and a graph that has not been
+    /// computed reads back empty, so the copy would skip the very layer this exists for.
+    KisImageSP sourceImage = source;
+    sourceImage->refreshGraphAsync(sourceImage->root(), { area }, area);
+    sourceImage->waitForDone();
 
     copyPageLayers(page, layers, area, page->rootLayer());
     document->setCurrentImage(page, false);

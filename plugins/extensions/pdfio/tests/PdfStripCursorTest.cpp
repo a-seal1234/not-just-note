@@ -20,6 +20,7 @@
 #include <KisViewManager.h>
 
 #include <kis_coordinates_converter.h>
+#include <kis_file_layer.h>
 #include <kis_group_layer.h>
 #include <kis_image.h>
 #include <kis_node_manager.h>
@@ -96,6 +97,7 @@ private Q_SLOTS:
     void testLockingTheFoldersIsWhatMakesTheStrokeRefusable();
     void testStaleActivationRefusesRatherThanMisdirects();
     void testAPageFolderWithSeveralLayersComesBackFlattened();
+    void testAnInsertedImageLayerReachesThePageArtifact();
     void testRestoringTheLayerStackCostsAFullKraLoad();
 
 private:
@@ -958,6 +960,61 @@ void PdfStripCursorTest::testAPageFolderWithSeveralLayersComesBackFlattened()
           "bands. Entries: %s",
           layerBytes, layerEntries, mergedBytes, flat.width(), flat.height(), loaderMs,
           qPrintable(entryNames.join(QStringLiteral(" "))));
+}
+
+/**
+ * Question: an image inserted into a page -- File > Insert Image..., which is a FILE layer -- has to
+ * reach the page's artifact like any other layer. copyPageLayers() skipped everything that was not a
+ * paint layer, so the inserted image lived only in the editor: not in the .kra, not in the exported
+ * PDF, and nothing said so. The file layer's projection is rasterised into a paint layer with the
+ * same name, and a file layer whose source is gone is skipped rather than failing the save.
+ */
+void PdfStripCursorTest::testAnInsertedImageLayerReachesThePageArtifact()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QString inserted = dir.filePath(QStringLiteral("inserted.png"));
+    QImage picture(64, 64, QImage::Format_ARGB32_Premultiplied);
+    picture.fill(Qt::red);
+    QVERIFY(picture.save(inserted));
+
+    KisDocument *document = KisPart::instance()->createDocument();
+    PageFolders folders = buildBandedPage(document, 300, 300);
+    QVERIFY(folders.image);
+
+    auto *fileLayer = new KisFileLayer(folders.image, dir.path(), QStringLiteral("inserted.png"),
+                                       KisFileLayer::None, QString(),
+                                       QStringLiteral("Inserted image"), OPACITY_OPAQUE_U8);
+    QVERIFY(folders.image->addNode(fileLayer, folders.image->rootLayer()));
+
+    /// And one whose source is gone, which must be skipped with a log rather than fail the save.
+    auto *goneLayer = new KisFileLayer(folders.image, dir.path(), QStringLiteral("not-there.png"),
+                                       KisFileLayer::None, QString(),
+                                       QStringLiteral("Missing image"), OPACITY_OPAQUE_U8);
+    QVERIFY(folders.image->addNode(goneLayer, folders.image->rootLayer()));
+
+    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(folders.image, nullptr);
+    QVERIFY2(pageDocument, "a file layer whose source is gone must not fail the whole save");
+
+    bool carried = false;
+    bool missingCarried = false;
+    KisNodeSP root = pageDocument->image()->root();
+    for (quint32 i = 0; i < root->childCount(); ++i) {
+        const QString name = root->at(i)->name();
+        if (name == QStringLiteral("Inserted image")) {
+            carried = true;
+        }
+        if (name == QStringLiteral("Missing image")) {
+            missingCarried = true;
+        }
+    }
+    qInfo("layers in the page artifact: %d, inserted image carried: %d, missing-source layer "
+          "carried: %d",
+          int(root->childCount()), int(carried), int(missingCarried));
+    QVERIFY2(carried, "the inserted image layer did not reach the page artifact");
+    QVERIFY2(!missingCarried, "a file layer whose source is gone must be skipped, not carried");
+    KisPart::instance()->removeDocument(pageDocument, true);
 }
 
 /**
