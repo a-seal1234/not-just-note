@@ -121,7 +121,6 @@ private Q_SLOTS:
     void testDuplicatingAPageCopiesItsArtifacts();
     void testAnOperationThatCannotCommitChangesNothing();
     void testUndoUndoesTheLastChangeOnly();
-    void testTheExportGuardRefusesAPageListThatIsNotTheSourcesOrder();
 
     /// Inserting pages from a PDF: it becomes a source of the notebook (copied into the project
     /// once, reused after that), every inserted page gets its own artifact number, and nothing is
@@ -912,76 +911,6 @@ void PdfSessionTest::testUndoUndoesTheLastChangeOnly()
     QCOMPARE(PdfSession::openProject(project, &why).toJson(), afterMove.toJson());
     QVERIFY(!PdfNotebookOps::canUndo(project));
     QCOMPARE(PdfSession::openProject(project, &why).pages.size(), 3);
-}
-
-/**
- * The export guard: ink is placed by list position, so the export is only correct while the
- * notebook's page N is the PDF's page N. Everything else is refused, with the reason.
- *
- * This is what keeps "move a page, then export" from writing a PDF whose marks are on the wrong
- * sheets -- a file that looks right and is not. Stage G's page-tree rebuild is what will replace it.
- */
-void PdfSessionTest::testTheExportGuardRefusesAPageListThatIsNotTheSourcesOrder()
-{
-    QTemporaryDir dir;
-    QVERIFY(dir.isValid());
-    const QString project = dir.filePath(QStringLiteral("project"));
-
-    PopplerRenderBackend backend;
-    const PdfSessionManifest untouched =
-        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
-    QVERIFY(untouched.isValid());
-
-    QString why;
-    QVERIFY2(PdfNotebookOps::exportIsOrderPreserving(untouched, &why), qPrintable(why));
-
-    /// A move: notebook page 1 now holds PDF page 3.
-    PdfSessionManifest moved = untouched;
-    moved.pages.move(0, 2);
-    why.clear();
-    QVERIFY2(!PdfNotebookOps::exportIsOrderPreserving(moved, &why),
-             "a moved notebook was allowed to export");
-    QVERIFY2(why.contains(QStringLiteral("wrong page")), qPrintable(why));
-    /// [P2, P3, P1] after the move, so notebook page 1 now holds PDF page 2 -- and the message says
-    /// which page of the PDF it holds, so the user can see what would have happened.
-    QVERIFY2(why.contains(QStringLiteral("notebook page 1")) && why.contains(QStringLiteral("page 2 of the PDF")),
-             qPrintable(why));
-
-    /// A delete out of the middle: the pages after it are no longer at their own positions.
-    PdfSessionManifest deleted = untouched;
-    deleted.pages.removeAt(1);
-    why.clear();
-    QVERIFY(!PdfNotebookOps::exportIsOrderPreserving(deleted, &why));
-    QVERIFY2(why.contains(QStringLiteral("notebook page 2")), qPrintable(why));
-
-    /// A duplicate: two notebook pages would name one PDF page.
-    PdfSessionManifest duplicated = untouched;
-    duplicated.pages.insert(1, duplicated.pages.at(0));
-    QVERIFY(!PdfNotebookOps::exportIsOrderPreserving(duplicated, &why));
-
-    /// A page from another PDF.
-    PdfSessionManifest twoSources = untouched;
-    PdfSourceRecord first;
-    first.file = twoSources.sourceFile;
-    first.sha256 = twoSources.sourceSha256;
-    first.byteSize = twoSources.sourceByteSize;
-    PdfSourceRecord second;
-    second.file = QStringLiteral("sources/other.pdf");
-    second.sha256 = QByteArrayLiteral("cafebabe");
-    second.byteSize = 1;
-    twoSources.sources.clear();
-    twoSources.sources << first << second;
-    twoSources.pages[0].source = 1;
-    why.clear();
-    QVERIFY(!PdfNotebookOps::exportIsOrderPreserving(twoSources, &why));
-    QVERIFY2(why.contains(QStringLiteral("PDFs")), qPrintable(why));
-
-    /// A notebook that is the source's first pages, in order, is still exportable: an untouched
-    /// page is copied through, which is what the export has always done.
-    PdfSessionManifest shorter = untouched;
-    shorter.pages.removeLast();
-    why.clear();
-    QVERIFY2(PdfNotebookOps::exportIsOrderPreserving(shorter, &why), qPrintable(why));
 }
 
 /**

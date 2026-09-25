@@ -2035,10 +2035,14 @@ void PdfIoPlugin::slotExportPdf()
     /// artifacts, so exporting does not have to open a document per page.
     QHash<int, QImage> ink;
     const QDir project(navigator->projectDir());
-    for (const PdfPageRecord &page : navigator->manifest().pages) {
-        const QImage pageInk = PdfInkLoader::loadInk(project.filePath(page.kraFile), nullptr);
+    const QList<PdfPageRecord> pages = navigator->manifest().pages;
+    for (int i = 0; i < pages.size(); ++i) {
+        const QImage pageInk = PdfInkLoader::loadInk(project.filePath(pages.at(i).kraFile), nullptr);
         if (!pageInk.isNull()) {
-            ink.insert(page.index, pageInk);
+            /// Keyed by the page's place in the NOTEBOOK, which is what the export walks: the ink of
+            /// notebook page i belongs on the i-th page of the exported file, whatever page of the
+            /// source PDF that page came from and whatever order the notebook is in.
+            ink.insert(i, pageInk);
         }
     }
 

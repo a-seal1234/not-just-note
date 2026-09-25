@@ -1240,31 +1240,4 @@ PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
     return outcome;
 }
 
-bool PdfNotebookOps::exportIsOrderPreserving(const PdfSessionManifest &manifest, QString *why)
-{
-    if (!manifest.isValid(why)) {
-        return false;
-    }
 
-    if (manifest.sourceCount() > 1) {
-        fail(why, QStringLiteral("this notebook draws its pages from %1 PDFs, and the export overlays "
-                                 "each page's ink on that page of one PDF. Export a range, or keep a "
-                                 "notebook's pages in one PDF")
-                      .arg(manifest.sourceCount()));
-        return false;
-    }
-
-    for (int i = 0; i < manifest.pages.size(); ++i) {
-        const PdfPageRecord &page = manifest.pages.at(i);
-        if (page.source != 0 || page.index != i) {
-            fail(why, QStringLiteral("notebook page %1 holds page %2 of the PDF, and an export writes "
-                                     "each page's ink on the PDF page at the same position; it would "
-                                     "put the ink on the wrong page. The notebook's pages are no longer "
-                                     "the PDF's own pages, in their own order")
-                          .arg(i + 1).arg(page.index + 1));
-            return false;
-        }
-    }
-
-    return true;
-}

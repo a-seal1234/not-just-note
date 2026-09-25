@@ -207,18 +207,6 @@ public:
      */
     static Outcome undoLast(const QString &projectDir);
 
-    /**
-     * Whether the notebook's page list is still the source PDF's own pages, in their own order.
-     *
-     * The PDF export overlays ink on the source's existing pages, and it finds the page to write on
-     * by the notebook's list position. So it is only correct while the notebook's page N is the
-     * PDF's page N. A move, a delete, a duplicate, an insert or a page from another PDF breaks
-     * that, and the export then has exactly one safe answer: refuse, with the reason, rather than
-     * write a PDF whose ink is on the wrong pages. This is the guard until the writer can rebuild
-     * the page tree in notebook order (stage G of docs/PDFIO-NOTEBOOK-OPS.md).
-     */
-    static bool exportIsOrderPreserving(const PdfSessionManifest &manifest, QString *why = nullptr);
-
     /// The directory the journal of the last operation lives in, inside the project.
     static QString journalDir(const QString &projectDir);
 

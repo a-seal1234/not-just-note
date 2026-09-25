@@ -6,8 +6,6 @@
 
 #include "PdfExporter.h"
 
-#include "session/PdfNotebookOps.h"
-
 #include <QDebug>
 
 #include <QFile>
@@ -1900,6 +1898,130 @@ bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int c
     return true;
 }
 
+/**
+ * The body of a NEW page object for \a page, ready for the new page tree.
+ *
+ * With an \a imageNumber this is preparePage(): the page's own dictionary, its /Contents extended
+ * by the save and ink streams, and its /Resources carrying the overlay's XObject.
+ *
+ * With no overlay (\a imageNumber < 0) the page is copied as it stands.
+ *
+ * Either way, what the page inherited from the OLD page tree is written into it. The new tree does
+ * not have the old one's ancestors: a page whose /MediaBox, /Resources or /Rotate lived on a
+ * /Pages node would otherwise come out with no size, no fonts, or the wrong way up.
+ */
+bool copyPageObject(PdfDocument *doc, const PageEntry &page, const QSizeF &recordedSizePt,
+                    int imageNumber, int contentNumber, int saveContentNumber, int *nextObject,
+                    QList<WrittenObject> *appended, QByteArray *newBody, int *originalContents,
+                    QString *why)
+{
+    int unusedContents = 0;
+    int *contents = originalContents ? originalContents : &unusedContents;
+
+    QByteArray body;
+    if (imageNumber < 0) {
+        if (!objectByNumber(doc, page.number, &body, why)) {
+            return false;
+        }
+        *contents = 0;
+    } else if (!preparePage(doc, page, imageNumber, contentNumber, saveContentNumber, nextObject,
+                            appended, &body, contents, why)) {
+        return false;
+    }
+
+    const auto insertIfAbsent = [&body](const char *key, const QByteArray &value) {
+        const int start = skipWhite(body, 0);
+        const int end = dictEndIndex(body, start);
+        if (end < 0 || dictValueAt(body, start, end, key) >= 0) {
+            return;
+        }
+        body = body.left(end - 2) + " /" + key + " " + value + " " + body.mid(end - 2);
+    };
+
+    /// /Resources first: the page's own content needs its fonts and its images whatever else
+    /// happens. preparePage() has already written them when there is an overlay; a plain copy has
+    /// to do it here, or a page that inherited its resources draws its text with nothing to draw
+    /// it with.
+    if (imageNumber < 0) {
+        ResourcesSlice resources;
+        if (!findResources(doc, page, body, &resources, why)) {
+            return false;
+        }
+        if (!resources.inlineInPage) {
+            const int number = (*nextObject)++;
+            appended->append(WrittenObject{number, 0, resources.dict});
+            insertIfAbsent("Resources", QByteArray::number(number) + " 0 R");
+        }
+    }
+
+    /// The turn comes first: it is what the recorded size has to be undone by when the page's own
+    /// box cannot be read, exactly as the ink placement does it.
+    int rotation = 0;
+    if (!effectiveRotation(doc, page, why, &rotation)) {
+        return false;
+    }
+
+    /// /MediaBox: the page's own, or the one it inherited. A page whose box cannot be read at all
+    /// falls back to the size the notebook recorded when it was made -- the same fallback the
+    /// overlay placement uses, and the reason a notebook made from a file with an unreadable box
+    /// still exports. A new page object cannot inherit a box from a tree this one did not keep, so
+    /// the box has to be written in either way; without one the page has no size.
+    {
+        double x0 = 0;
+        double y0 = 0;
+        double x1 = 0;
+        double y1 = 0;
+        QString rectWhy;
+        if (!effectiveRect(doc, page, &rectWhy, &x0, &y0, &x1, &y1)) {
+            if (recordedSizePt.isEmpty()) {
+                fail(why, QStringLiteral("page %1: %2, and the notebook has no recorded size for it "
+                                         "either")
+                              .arg(page.number).arg(rectWhy));
+                return false;
+            }
+            const bool quarterTurn = rotation == 90 || rotation == 270;
+            x0 = 0;
+            y0 = 0;
+            x1 = quarterTurn ? recordedSizePt.height() : recordedSizePt.width();
+            y1 = quarterTurn ? recordedSizePt.width() : recordedSizePt.height();
+            qWarning("[pdfio] page %d: %s; using the notebook's own %.2fx%.2f points%s",
+                     page.number, qPrintable(rectWhy), recordedSizePt.width(),
+                     recordedSizePt.height(),
+                     quarterTurn ? ", turned back into page space for the /Rotate" : "");
+        }
+        insertIfAbsent("MediaBox", "[ " + QByteArray::number(x0, 'f', 4) + " "
+                                       + QByteArray::number(y0, 'f', 4) + " "
+                                       + QByteArray::number(x1, 'f', 4) + " "
+                                       + QByteArray::number(y1, 'f', 4) + " ]");
+    }
+
+    /// /CropBox: what the reader actually shows, when the page or an ancestor has one. Written as
+    /// it was read, because its numbers are the writer's and this code has no reason to touch them.
+    {
+        QByteArray owner;
+        int start = 0;
+        int end = 0;
+        int valueAt = 0;
+        if (inheritedValue(doc, page, "CropBox", &owner, &start, &end, &valueAt, nullptr)) {
+            const int begin = skipWhite(owner, valueAt);
+            const int close =
+                begin < owner.size() && owner.at(begin) == '[' ? int(owner.indexOf(']', begin)) : -1;
+            if (close < 0) {
+                fail(why, QStringLiteral("page %1 has an unreadable /CropBox").arg(page.number));
+                return false;
+            }
+            insertIfAbsent("CropBox", owner.mid(begin, close - begin + 1));
+        }
+    }
+
+    if (rotation != 0) {
+        insertIfAbsent("Rotate", QByteArray::number(rotation));
+    }
+
+    *newBody = body;
+    return true;
+}
+
 } // namespace
 
 QList<int> PdfExporter::pageObjectNumbers(const QByteArray &pdf, QString *why)
@@ -1927,16 +2049,6 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                                 QString *why)
 {
     if (!manifest.isValid(why)) {
-        return false;
-    }
-
-    /// F3's guard, and it is the whole reason it is here rather than in the menu. The overlay below
-    /// is attached to the PDF page at the SAME POSITION as the notebook page, so it is only correct
-    /// while the notebook's page N is the PDF's page N. A move, a delete, a duplicate, an insert or
-    /// a page from another PDF breaks that, and the file that would come out has every mark on the
-    /// wrong sheet -- with nothing to show for it but a PDF that looks fine. Refusing with the
-    /// reason is the only safe answer until the writer can rebuild the page tree in notebook order.
-    if (!PdfNotebookOps::exportIsOrderPreserving(manifest, why)) {
         return false;
     }
 
@@ -1969,26 +2081,54 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
 
     QList<WrittenObject> replacements;
     QList<WrittenObject> appended;
-    QSet<int> rewritten;
     int inkedPages = 0;
 
     qWarning("[pdfio] export: source %s (%d bytes), %d PDF page(s), %d notebook page(s)",
              qPrintable(sourcePdf), int(pdf.size()), int(pages.size()),
              int(manifest.pages.size()));
 
-    for (int i = 0; i < pages.size() && i < manifest.pages.size(); ++i) {
-        const PageEntry &page = pages.at(i);
-        QHash<int, QImage>::const_iterator found = ink.constFind(i);
-        if (found == ink.constEnd() || found->isNull()) {
-            continue;
-        }
-        if (rewritten.contains(page.number)) {
-            fail(why, QStringLiteral("notebook pages %1 and %2 both point at PDF page object %3, "
-                                     "so an overlay cannot be attached to each separately")
-                          .arg(i).arg(i + 1).arg(page.number));
+    /// The page tree is rebuilt from ONE source. A notebook that draws pages from several PDFs
+    /// would need the objects of the second file merged into the output with every reference inside
+    /// them renumbered, which is a writer of its own -- so it is refused with the reason, rather
+    /// than exported with those pages' backgrounds missing.
+    if (manifest.sourceCount() > 1) {
+        fail(why, QStringLiteral("this notebook draws its pages from %1 PDFs, and the export rebuilds "
+                                 "the page tree of one. Extract the pages that come from the other "
+                                 "PDF as a notebook of their own and export that")
+                      .arg(manifest.sourceCount()));
+        return false;
+    }
+
+    /// One new page object per notebook page, in the notebook's order. The ink of notebook page i is
+    /// the ink at key i, and the page it is drawn on is the source page the RECORD names -- not the
+    /// page at the same position, which is what put a reordered or duplicated notebook's marks on
+    /// the wrong sheets when the export worked by list position.
+    QList<int> exportedPages;
+    for (int i = 0; i < manifest.pages.size(); ++i) {
+        const PdfPageRecord &record = manifest.pages.at(i);
+        if (record.source != 0 || record.index < 0 || record.index >= pages.size()) {
+            fail(why, QStringLiteral("notebook page %1 names page %2 of another PDF, which this "
+                                     "export cannot rebuild")
+                          .arg(i + 1).arg(record.index + 1));
             return false;
         }
-        rewritten.insert(page.number);
+        const PageEntry &page = pages.at(record.index);
+
+        QHash<int, QImage>::const_iterator found = ink.constFind(i);
+        const bool hasInk = found != ink.constEnd() && !found->isNull();
+        if (!hasInk) {
+            /// A page with no ink is still a page of the notebook: copied into the export untouched,
+            /// in its place. Skipping it would silently shorten the notebook.
+            QByteArray plain;
+            if (!copyPageObject(&doc, page, record.sizePt, -1, -1, -1, &nextObject, &appended,
+                                &plain, nullptr, why)) {
+                return false;
+            }
+            const int number = nextObject++;
+            appended.append(WrittenObject{number, 0, plain});
+            exportedPages.append(number);
+            continue;
+        }
         ++inkedPages;
 
         /// The rotation comes first: the fallback below has to know it, because the notebook's
@@ -2100,11 +2240,14 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
 
         QByteArray newBody;
         int originalContents = 0;
-        if (!preparePage(&doc, page, imageNumber, contentNumber, saveContentNumber, &nextObject,
-                         &appended, &newBody, &originalContents, why)) {
+        if (!copyPageObject(&doc, page, record.sizePt, imageNumber, contentNumber,
+                            saveContentNumber, &nextObject, &appended, &newBody, &originalContents,
+                            why)) {
             return false;
         }
-        replacements.append(WrittenObject{page.number, page.generation, newBody});
+        const int exportedNumber = nextObject++;
+        appended.append(WrittenObject{exportedNumber, 0, newBody});
+        exportedPages.append(exportedNumber);
 
         /// One line per inked page, so a log from a device that cannot be inspected directly says
         /// what the file was built from: which box placed the ink, whether that box came from the
@@ -2119,10 +2262,47 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                  found->hasAlphaChannel() ? "with alpha" : "NO ALPHA", originalContents);
     }
 
-    qWarning("[pdfio] export: %d of %d notebook page(s) inked, %d page object(s) rewritten, "
-             "%d object(s) appended",
-             inkedPages, int(qMin(pages.size(), manifest.pages.size())), int(replacements.size()),
-             int(appended.size()));
+    /// The new page tree: one page object per notebook page, in the notebook's order. Every
+    /// original object is left in the file untouched -- a page's own content, its fonts and its
+    /// images stay exactly where they were, which is what keeps text selectable and the pages that
+    /// were not edited as they were -- and only the catalog is redefined to point at the new tree.
+    if (exportedPages.isEmpty()) {
+        fail(why, QStringLiteral("the notebook has no pages to export"));
+        return false;
+    }
+    QByteArray kids = "[ ";
+    for (int number : exportedPages) {
+        kids += QByteArray::number(number) + " 0 R ";
+    }
+    kids += "]";
+    const int pagesNumber = nextObject++;
+    appended.append(WrittenObject{pagesNumber, 0,
+                                  "<< /Type /Pages /Kids " + kids + " /Count "
+                                      + QByteArray::number(exportedPages.size()) + " >>"});
+
+    QByteArray catalog;
+    if (!objectByNumber(&doc, doc.rootNumber, &catalog, why)) {
+        return false;
+    }
+    const int catalogStart = skipWhite(catalog, 0);
+    const int catalogEnd = dictEndIndex(catalog, catalogStart);
+    const int catalogPages =
+        catalogEnd < 0 ? -1 : dictValueAt(catalog, catalogStart, catalogEnd, "Pages");
+    if (catalogPages < 0) {
+        fail(why, QStringLiteral("the catalog has no /Pages to point at the new page tree"));
+        return false;
+    }
+    QByteArray newCatalog;
+    if (!replaceRef(catalog, catalogPages, QByteArray::number(pagesNumber) + " 0 R", &newCatalog,
+                    why)) {
+        return false;
+    }
+    replacements.append(WrittenObject{doc.rootNumber, doc.rootGeneration, newCatalog});
+
+    qWarning("[pdfio] export: %d of %d notebook page(s) inked, %d page(s) in the new tree, "
+             "%d object(s) rewritten, %d object(s) appended",
+             inkedPages, int(manifest.pages.size()), int(exportedPages.size()),
+             int(replacements.size()), int(appended.size()));
 
     if (replacements.isEmpty() && appended.isEmpty()) {
         /// Nothing to add: the honest answer is a clean copy, not an incremental update with an

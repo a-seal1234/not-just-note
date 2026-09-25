@@ -51,7 +51,9 @@ private Q_SLOTS:
 
     /// The guard that makes a notebook whose pages are no longer the PDF's own order refuse to
     /// export, rather than write a file whose ink is on the wrong pages.
-    void testAMovedPageIsRefusedRatherThanExportedWrongly();
+    void testAMovedNotebookExportsInNotebookOrder();
+    void testADuplicatedPageExportsTwiceWithItsOwnInk();
+    void testAMultiSourceNotebookIsRefusedWithTheReason();
 
 private:
     QString fixturePath(const QString &name) const
@@ -716,53 +718,154 @@ void PdfExporterTest::testRefusesInkWithoutAlpha()
 }
 
 /**
- * A notebook whose pages are not the PDF's own pages, in their own order, is refused.
+ * A notebook whose page list is not the PDF's own order exports in the NOTEBOOK's order.
  *
- * The export finds the page to overlay by the notebook's LIST POSITION: the ink is keyed by
- * position and the page object written is the one at the same index. So a moved page would have its
- * ink attached to a different sheet -- silently, in a file that opens perfectly, which is exactly
- * the failure mode this project keeps having to design against. The guard refuses with the reason
- * until the writer can rebuild the page tree in notebook order (stage G of the Notebook ops plan).
- *
- * It lives in this function rather than in the menu because this is what writes the file: a menu
- * check a future caller forgets cannot then produce a wrong PDF.
+ * The page written at position i is the source page the i-th RECORD names, and the ink at key i goes
+ * with it. That is what makes reorder, delete, duplicate and insert exportable at all: the old code
+ * wrote the overlay onto the PDF page at the same position, which is correct only while the notebook
+ * happens to be the source's own pages in their own order.
  */
-void PdfExporterTest::testAMovedPageIsRefusedRatherThanExportedWrongly()
+void PdfExporterTest::testAMovedNotebookExportsInNotebookOrder()
 {
     PopplerRenderBackend backend;
-    QVERIFY(backend.open(fixturePath(QStringLiteral("text-fixture.pdf"))));
-    QCOMPARE(backend.pageCount(), 3);
+    const QString source = fixturePath(QStringLiteral("ex-mediabox-cases.pdf"));
+    QVERIFY(backend.open(source));
+    QCOMPARE(backend.pageCount(), 5);
 
+    /// The notebook's order is [5, 1, 2, 3, 4] (one-based): the PDF's last page first.
+    PdfSessionManifest moved = manifestFor(backend);
+    moved.pages.move(4, 0);
+
+    /// Ink on notebook pages 1 and 3, which are PDF pages 5 and 2 -- and would be PDF pages 1 and 3
+    /// if the export still worked by position.
     QHash<int, QImage> ink;
-    ink.insert(0, inkWithMark(QSize(595, 842)));
+    ink.insert(0, inkWithMark(backend.pageInfo(4).sizePt.toSize()));
+    ink.insert(2, inkWithMark(backend.pageInfo(1).sizePt.toSize()));
 
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
-    const QString source = fixturePath(QStringLiteral("text-fixture.pdf"));
-
-    /// The notebook as it was made: the source's own pages in their own order, and it exports.
+    const QString withInk = dir.filePath(QStringLiteral("moved.pdf"));
+    const QString withoutInk = dir.filePath(QStringLiteral("moved-clean.pdf"));
     QString why;
-    const QString good = dir.filePath(QStringLiteral("good.pdf"));
-    QVERIFY2(PdfExporter::exportWithInk(source, manifestFor(backend), ink, good, &why), qPrintable(why));
-
-    /// The same notebook with page 1 moved to the end: the ink that was on PDF page 1 would be
-    /// written onto PDF page 3, and PDF page 1 would keep the original art with no ink at all.
-    PdfSessionManifest moved = manifestFor(backend);
-    moved.pages.move(0, 2);
-
-    const QString wrong = dir.filePath(QStringLiteral("wrong.pdf"));
-    why.clear();
-    QVERIFY2(!PdfExporter::exportWithInk(source, moved, ink, wrong, &why),
-             "a notebook whose pages are not the PDF's own order was exported anyway");
-    QVERIFY2(why.contains(QStringLiteral("wrong page")), qPrintable(why));
-    /// [P2, P3, P1] after the move, so notebook page 1 now holds PDF page 2: the ink that was on
-    /// PDF page 1 would be written onto PDF page 2, and the message names both.
-    QVERIFY2(why.contains(QStringLiteral("notebook page 1")) && why.contains(QStringLiteral("page 2 of the PDF")),
+    QVERIFY2(PdfExporter::exportWithInk(source, moved, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, moved, QHash<int, QImage>(), withoutInk, &why),
              qPrintable(why));
 
-    /// Nothing was written: a refusal that left a file behind would be worse than useless, and the
-    /// destination is the thing a user would hand on.
-    QVERIFY(!QFileInfo::exists(wrong));
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    QCOMPARE(exported.pageCount(), 5);
+
+    /// Each exported page is the source page its record names, in the notebook's own order.
+    const QStringList headings = { QStringLiteral("Missing media box"),
+                                   QStringLiteral("Direct media box"),
+                                   QStringLiteral("Indirect media box"),
+                                   QStringLiteral("Rotated direct box"),
+                                   QStringLiteral("Rotated indirect box") };
+    for (int i = 0; i < headings.size(); ++i) {
+        QVERIFY2(exported.pageText(i).contains(headings.at(i)),
+                 qPrintable(QStringLiteral("exported page %1: expected \"%2\", got \"%3\"")
+                                .arg(i + 1).arg(headings.at(i)).arg(exported.pageText(i))));
+    }
+
+    /// And the ink is where the notebook says: on the pages that have ink, and not on the pages the
+    /// positional export would have marked instead. Compared against the same notebook exported with
+    /// no ink at all, so "not marked" is a statement about the pixels.
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(withoutInk));
+    for (int i = 0; i < exported.pageCount(); ++i) {
+        const QImage marked = exported.renderPage(i, 72.0);
+        const QImage plain = clean.renderPage(i, 72.0);
+        QVERIFY2(!marked.isNull() && !plain.isNull(), "a page of the export did not render");
+        const bool inked = i == 0 || i == 2;
+        QVERIFY2((marked == plain) != inked,
+                 qPrintable(QStringLiteral("exported page %1: ink present=%2, expected=%3")
+                                .arg(i + 1).arg(marked == plain ? "no" : "yes")
+                                .arg(inked ? "yes" : "no")));
+    }
+}
+
+/**
+ * A duplicated page exports twice, and each copy carries its own ink.
+ *
+ * Two notebook pages naming one source page used to be a refusal: the overlay was attached to the
+ * page OBJECT, so the two would have shared one. A new page object per notebook page is what makes
+ * the duplicate a page of its own in the file, exactly as it is in the notebook.
+ */
+void PdfExporterTest::testADuplicatedPageExportsTwiceWithItsOwnInk()
+{
+    PopplerRenderBackend backend;
+    const QString source = fixturePath(QStringLiteral("ex-mediabox-cases.pdf"));
+    QVERIFY(backend.open(source));
+
+    /// The first source page twice in a row: six pages, two of them the same PDF page.
+    PdfSessionManifest manifest = manifestFor(backend);
+    manifest.pages.insert(1, manifest.pages.at(0));
+    QCOMPARE(manifest.pages.size(), 6);
+
+    /// Ink on the COPY only, so the two exported pages of that one source page have to differ.
+    QHash<int, QImage> ink;
+    ink.insert(1, inkWithMark(backend.pageInfo(0).sizePt.toSize()));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString withInk = dir.filePath(QStringLiteral("duplicated.pdf"));
+    const QString withoutInk = dir.filePath(QStringLiteral("duplicated-clean.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), withoutInk, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    QCOMPARE(exported.pageCount(), 6);
+    QVERIFY2(exported.pageText(0).contains(QStringLiteral("Direct media box")),
+             qPrintable(exported.pageText(0)));
+    QVERIFY2(exported.pageText(1).contains(QStringLiteral("Direct media box")),
+             qPrintable(exported.pageText(1)));
+
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(withoutInk));
+    QVERIFY2(exported.renderPage(0, 72.0) == clean.renderPage(0, 72.0),
+             "the page that was not duplicated with ink came back marked");
+    QVERIFY2(exported.renderPage(1, 72.0) != clean.renderPage(1, 72.0),
+             "the duplicate did not carry its own ink");
+}
+
+/**
+ * A notebook that draws its pages from more than one PDF is still refused, with the reason.
+ *
+ * Rebuilding the page tree of one PDF is what this export does. Merging the objects of a second one
+ * into the output means renumbering every reference inside them, which is a writer of its own; until
+ * that exists, saying so is better than writing a file whose pages from the other PDF have lost
+ * their backgrounds.
+ */
+void PdfExporterTest::testAMultiSourceNotebookIsRefusedWithTheReason()
+{
+    PopplerRenderBackend backend;
+    const QString source = fixturePath(QStringLiteral("text-fixture.pdf"));
+    QVERIFY(backend.open(source));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    PdfSourceRecord first;
+    first.file = manifest.sourceFile;
+    first.sha256 = manifest.sourceSha256;
+    first.byteSize = manifest.sourceByteSize;
+    PdfSourceRecord second;
+    second.file = QStringLiteral("sources/other.pdf");
+    second.sha256 = QByteArrayLiteral("cafebabe");
+    second.byteSize = 1;
+    manifest.sources.clear();
+    manifest.sources << first << second;
+    manifest.pages[1].source = 1;
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString out = dir.filePath(QStringLiteral("multi.pdf"));
+    QString why;
+    QVERIFY2(!PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), out, &why),
+             "a notebook that draws on two PDFs was exported as if it drew on one");
+    QVERIFY2(why.contains(QStringLiteral("PDFs")), qPrintable(why));
+    QVERIFY(!QFileInfo::exists(out));
 }
 
 void PdfExporterTest::testMediaBoxCases()
