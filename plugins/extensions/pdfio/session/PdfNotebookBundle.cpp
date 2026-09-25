@@ -807,6 +807,16 @@ bool PdfNotebookBundle::save(const QString &projectDir, const QString &outPath, 
         }
     }
 
+    /// The notebook's own assets/ -- the images an "Insert image..." went into -- travel beside
+    /// pages/ and thumbs/. They are referenced by a page's content layer rather than by the
+    /// manifest, so nothing above would offer them, and a bundle without them restores with the
+    /// pictures missing while the original notebook still shows them.
+    const QDir assetsDir(QDir(projectDir).filePath(QStringLiteral("assets")));
+    const QStringList assetNames = assetsDir.entryList(QDir::Files, QDir::Name);
+    for (const QString &asset : assetNames) {
+        offer(QStringLiteral("assets/") + asset);
+    }
+
     /// Beside the destination, then renamed onto it: an interrupted save leaves the file that was
     /// already there, not a half-written archive that looks like a notebook.
     const QString temporary = QStringLiteral("%1.part-%2").arg(outPath).arg(QCoreApplication::applicationPid());
@@ -934,6 +944,22 @@ bool PdfNotebookBundle::extract(const QString &bundlePath,
             if (!copyEntryTo(file, stagedArtifact, why)) {
                 return false;
             }
+        }
+    }
+
+    /// And every asset the bundle carries, written to the same place it was packed from. These
+    /// are not named by the manifest: a page's content layer points at them, so they are copied by
+    /// their archive path and nothing else decides whether they are wanted.
+    for (const ArchiveEntry &entry : analysis.files) {
+        if (!entry.path.startsWith(QStringLiteral("assets/"))) {
+            continue;
+        }
+        QString stagedAsset;
+        if (!destinationInside(stagingPath, entry.path, &stagedAsset, why)) {
+            return false;
+        }
+        if (!copyEntryTo(entry.file, stagedAsset, why)) {
+            return false;
         }
     }
 

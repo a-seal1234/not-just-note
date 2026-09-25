@@ -33,6 +33,20 @@
        <statusTip></statusTip>
      </Action>
 
+     <Action name="pdfio_insert_image">
+       <icon></icon>
+       <text>Insert image...</text>
+       <whatsThis></whatsThis>
+       <toolTip></toolTip>
+       <iconText></iconText>
+       <!-- 10000 is binary ACTIVE_DEVICE: an image goes onto the page that is open, so this entry is
+            greyed with nothing open, exactly like the document block below it. -->
+       <activationFlags>10000</activationFlags>
+       <activationConditions>0</activationConditions>
+       <shortcut></shortcut>
+       <isCheckable>false</isCheckable>
+     </Action>
+
      <Action name="pdfio_save_page">
        <icon></icon>
        <text>Save the page notes</text>

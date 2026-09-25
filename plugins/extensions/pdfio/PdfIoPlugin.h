@@ -39,6 +39,11 @@ public:
 
 private Q_SLOTS:
     void slotOpenNotebook();
+
+    /// Picks an image and puts it on the page that is open as a content layer. Named "Insert
+    /// image..." and enabled with a page open, like the document entries around it.
+    void slotInsertImage();
+
     void slotSavePage();
     void slotNextPage();
     void slotPreviousPage();
@@ -63,6 +68,10 @@ private Q_SLOTS:
     void slotToggleStripMode();
 
 private:
+    /// Turns a picked image into a content layer on the page that is open; defined beside the other
+    /// page helpers in the .cpp.
+    void placeInsertedImage(const QString &picked, const QString &why, const QString &projectDir);
+
     void registerActions();
 
     /// How many times a missing main window has been waited for while putting the menu up. The

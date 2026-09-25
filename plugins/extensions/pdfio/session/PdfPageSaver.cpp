@@ -46,7 +46,7 @@ void fail(QString *why, const QString &message)
 /// \a target by value, not by const reference: KisSharedPtr hands back a const KisImage through a
 /// const smart pointer, and addNode() is not a const method.
 void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRect &area,
-                    KisNodeSP parent)
+                    KisNodeSP parent, int &rasterisedCount)
 {
     /// By value, not by const reference: qobject_cast refuses to cast away constness, and a shared
     /// pointer copy costs nothing.
@@ -67,7 +67,7 @@ void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRe
             for (quint32 i = 0; i < group->childCount(); ++i) {
                 children.append(group->at(i));
             }
-            copyPageLayers(target, children, area, parent);
+            copyPageLayers(target, children, area, parent, rasterisedCount);
             continue;
         }
 
@@ -88,6 +88,13 @@ void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRe
                 continue;
             }
 
+            /// Named and counted in the log: a successful rasterise used to be silent, so a
+            /// device log could show a save with an image missing and nothing to say whether this
+            /// branch ran at all.
+            qWarning() << "pdfio: rasterised a" << child->metaObject()->className() << child->name()
+                       << "into the page artifact";
+
+            ++rasterisedCount;
             KisPaintLayerSP copy = new KisPaintLayer(target, child->name(), child->opacity());
             copy->paintDevice()->makeCloneFrom(projection, area);
             copy->setX(-area.x());
@@ -190,7 +197,10 @@ KisDocument *PdfPageSaver::createPageLayersDocument(const KisImageSP &source,
     sourceImage->refreshGraphAsync(sourceImage->root(), { area }, area);
     sourceImage->waitForDone();
 
-    copyPageLayers(page, layers, area, page->rootLayer());
+    int rasterisedCount = 0;
+    copyPageLayers(page, layers, area, page->rootLayer(), rasterisedCount);
+    qWarning() << "pdfio: the page artifact holds" << rasterisedCount
+               << "rasterised non-paint layer(s)";
     document->setCurrentImage(page, false);
 
     /// The merged image the save writes comes from the image's projection, and a document built and

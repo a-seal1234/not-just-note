@@ -56,6 +56,12 @@
 
 #include <KoColor.h>
 
+#include <QDateTime>
+#include <QFileDialog>
+#include <QStandardPaths>
+
+#include <kis_group_layer.h>
+
 #include <KisDocument.h>
 #include <KisMainWindow.h>
 #include <KisPart.h>
@@ -648,6 +654,103 @@ void addRecentNotebooksMenu(QMenu *menu)
 
 } // namespace
 
+void PdfIoPlugin::slotInsertImage()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    KisDocument *document = navigator->currentDocument();
+    if (!document || !document->image()) {
+        say(QStringLiteral("open a notebook and a page before inserting an image"));
+        return;
+    }
+    const QString projectDir = navigator->projectDir();
+    if (projectDir.isEmpty()) {
+        say(QStringLiteral("this page is not part of a notebook, so there is nowhere to put the image"));
+        return;
+    }
+
+#if defined(Q_OS_ANDROID)
+    /// The same picker the PDF and bundle paths use, told to filter images. The copy happens in the
+    /// activity callback and nothing else does: loading, placing and saving all run on the event
+    /// loop afterwards, which is the rule the crash taught us.
+    auto *picker = new AndroidDocumentPicker(this);
+    picker->pickFile(QStringLiteral("image/*"), QStringLiteral("pdfio-picked-image.png"),
+                     [this, projectDir](const QString &localPath, const QString &why) {
+                         QTimer::singleShot(0, this, [this, localPath, why, projectDir]() {
+                             placeInsertedImage(localPath, why, projectDir);
+                         });
+                     });
+#else
+    const QString picked = QFileDialog::getOpenFileName(
+        nullptr, i18n("Insert image"),
+        QStandardPaths::writableLocation(QStandardPaths::PicturesLocation),
+        i18n("Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"));
+    placeInsertedImage(picked, QString(), projectDir);
+#endif
+}
+
+/// Puts the picked image on the page that is open as a raster layer of its own.
+///
+/// A paint layer, not a file layer. A KisFileLayer built over the navigator's page image crashes in
+/// ctor" and then SIGSEGV, with the image already read and the page open -- and the raster copy is
+/// the more robust shape anyway: the pixels live in the artifact, so nothing depends on an outside
+/// file staying where it was, and the notebook needs no second copy to keep in sync.
+///
+/// An abandoned pick leaves nothing behind: a cancelled dialog, an unreadable file, or a page that
+/// went away while the picker was up all end here.
+void PdfIoPlugin::placeInsertedImage(const QString &picked, const QString &why,
+                                     const QString &projectDir)
+{
+    Q_UNUSED(projectDir);
+
+    if (picked.isEmpty()) {
+        say(QStringLiteral("no image was inserted%1")
+                .arg(why.isEmpty() ? QString() : QStringLiteral(": ") + why));
+        return;
+    }
+
+    QImage picture(picked);
+    /// The picker's cache copy is only ever the way in; it goes whether or not this works out.
+    QFile::remove(picked);
+    if (picture.isNull()) {
+        say(QStringLiteral("that file could not be read as an image; nothing was inserted"));
+        return;
+    }
+
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    KisDocument *document = navigator->currentDocument();
+    if (!document || !document->image()) {
+        say(QStringLiteral("the page was closed while the picker was open; nothing was inserted"));
+        return;
+    }
+    KisImageSP page = document->image();
+
+    /// Scaled to sit comfortably on the page and centred on it.
+    const int side = qMax(1, qMin(page->width(), page->height()) * 3 / 5);
+    const QSize wanted = picture.size().scaled(side, side, Qt::KeepAspectRatio);
+    const QImage scaled = picture.scaled(wanted, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+    auto *layer = new KisPaintLayer(page, QStringLiteral("Inserted image"), OPACITY_OPAQUE_U8);
+    layer->paintDevice()->convertFromQImage(scaled, nullptr, 0, 0);
+    layer->setX((page->width() - wanted.width()) / 2);
+    layer->setY((page->height() - wanted.height()) / 2);
+    if (!page->addNode(layer, page->rootLayer())) {
+        say(QStringLiteral("the image layer could not be added to the page"));
+        return;
+    }
+
+    page->refreshGraphAsync(page->root(), { page->bounds() }, page->bounds());
+    page->waitForDone();
+
+    say(QStringLiteral("inserted a %1x%2 image onto page %3 as a content layer")
+            .arg(wanted.width()).arg(wanted.height()).arg(navigator->currentIndex() + 1));
+
+    /// And written into the page's artifact straight away, so the notebook carries it whether or not
+    /// the user saves again.
+    slotSavePage();
+}
+
+
+
 PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
     : KisActionPlugin(parent)
 {
@@ -686,10 +789,6 @@ PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
 
     PdfIoProbe::runIfRequested();
 
-    /// Deferred on purpose. Opening a document touches the main window, and from the plugin
-    /// constructor during startup that window is still being built: the welcome screen and the
-    /// toolbar handler are not ready. The real action is triggered long after startup, so queueing
-    /// the probe the same way is both the fix and a faithful stand-in.
     QTimer::singleShot(0, this, [this, probePath]() {
         /// Android is driven by the menu action. The unattended route that opened a file from the
         /// cache at startup is gone: it existed to reproduce the open path crash, and it found it.
@@ -788,6 +887,9 @@ void PdfIoPlugin::registerActions()
     const Entry entries[] = {
         { "pdfio_open_notebook", &PdfIoPlugin::slotOpenNotebook },
         { "pdfio_open_bundle", &PdfIoPlugin::slotOpenNotebookBundle },
+        /// The image goes onto the page that is open, so it leads the document block rather than
+        /// sitting with the two that create a notebook.
+        { "pdfio_insert_image", &PdfIoPlugin::slotInsertImage },
         { "pdfio_save_page", &PdfIoPlugin::slotSavePage },
         { "pdfio_next_page", &PdfIoPlugin::slotNextPage },
         { "pdfio_previous_page", &PdfIoPlugin::slotPreviousPage },
