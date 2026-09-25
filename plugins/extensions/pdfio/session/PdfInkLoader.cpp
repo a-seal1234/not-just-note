@@ -139,23 +139,27 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
         return false;
     }
 
-    KraConverter converter(document);
+    KraConverter *converter = new KraConverter(document);
     QFile file(kraPath);
     if (!file.open(QIODevice::ReadOnly)) {
         fail(why, QStringLiteral("cannot read %1").arg(kraPath));
+        delete converter;
+        converter = nullptr;
         KisPart::instance()->removeDocument(document, true);
         return false;
     }
 
-    const KisImportExportErrorCode code = converter.buildImage(&file);
+    const KisImportExportErrorCode code = converter->buildImage(&file);
     file.close();
     if (!code.isOk()) {
         fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
+        delete converter;
+        converter = nullptr;
         KisPart::instance()->removeDocument(document, true);
         return false;
     }
 
-    const KisImageSP loaded = converter.image();
+    const KisImageSP loaded = converter->image();
     QList<KisNodeSP> layers;
     if (loaded && loaded->root()) {
         for (quint32 i = 0; i < loaded->root()->childCount(); ++i) {
@@ -165,6 +169,8 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
 
     if (layers.isEmpty()) {
         fail(why, QStringLiteral("%1 holds no layers").arg(kraPath));
+        delete converter;
+        converter = nullptr;
         KisPart::instance()->removeDocument(document, true);
         return false;
     }
@@ -181,6 +187,8 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
     }
 
     copyRestoredLayers(page, layers, parent);
+    delete converter;
+    converter = nullptr;
     KisPart::instance()->removeDocument(document, true);
     return true;
 }
@@ -238,23 +246,27 @@ QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath
         return layers;
     }
 
-    KraConverter converter(document);
+    KraConverter *converter = new KraConverter(document);
     QFile file(kraPath);
     if (!file.open(QIODevice::ReadOnly)) {
         fail(why, QStringLiteral("cannot read %1").arg(kraPath));
+        delete converter;
+        converter = nullptr;
         KisPart::instance()->removeDocument(document, true);
         return layers;
     }
 
-    const KisImportExportErrorCode code = converter.buildImage(&file);
+    const KisImportExportErrorCode code = converter->buildImage(&file);
     file.close();
     if (!code.isOk()) {
         fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
+        delete converter;
+        converter = nullptr;
         KisPart::instance()->removeDocument(document, true);
         return layers;
     }
 
-    const KisImageSP loaded = converter.image();
+    const KisImageSP loaded = converter->image();
     if (loaded && loaded->root()) {
         const QRect area = loaded->bounds();
         for (quint32 i = 0; i < loaded->root()->childCount(); ++i) {
@@ -269,6 +281,8 @@ QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath
         }
     }
 
+    delete converter;
+    converter = nullptr;
     KisPart::instance()->removeDocument(document, true);
     return layers;
 }

@@ -786,6 +786,25 @@ bool PdfNotebookBundle::save(const QString &projectDir, const QString &outPath, 
     for (const PdfPageRecord &page : manifest.pages) {
         offer(page.kraFile);
         offer(page.thumbFile);
+
+        /// The layer sidecar travels with the page. Without it, a notebook that is exported and
+        /// opened somewhere else reads its layers by opening a document per page again -- the read
+        /// that ends in a tombstone on a tablet during a window move. It is small: one PNG per
+        /// layer and a line of text each.
+        const QString sidecar = page.kraFile + QStringLiteral(".layers");
+        const QString sidecarIndex = sidecar + QStringLiteral(".txt");
+
+        /// Only what is actually there. Offering a file that was never written would put it on the
+        /// bundle's list of things it withheld, which is a statement about the notebook -- and it
+        /// changed how many entries a bundle of a notebook with no sidecars reports.
+        if (QFileInfo(QDir(projectDir).filePath(sidecarIndex)).exists()) {
+            offer(sidecarIndex);
+        }
+        const QDir sidecarDir(QDir(projectDir).filePath(sidecar));
+        const QStringList images = sidecarDir.entryList(QDir::Files, QDir::Name);
+        for (const QString &image : images) {
+            offer(sidecar + QLatin1Char('/') + image);
+        }
     }
 
     /// Beside the destination, then renamed onto it: an interrupted save leaves the file that was
