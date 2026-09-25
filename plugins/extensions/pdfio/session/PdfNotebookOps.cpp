@@ -55,9 +55,12 @@ struct Plan {
     QList<QPair<QString, QString>> copyDirs;
     /// relative source -> relative destination, single files. Copied before the manifest.
     QList<QPair<QString, QString>> copyFiles;
-    /// absolute source outside the project -> relative destination inside it: a PDF being inserted.
-    /// Copied before the manifest, like everything else that manifest is about to name.
+    /// absolute source outside the project -> relative destination inside it: a PDF being inserted,
+    /// or the files of a notebook being merged in. Copied before the manifest, like everything else
+    /// that manifest is about to name.
     QList<QPair<QString, QString>> copyExternal;
+    /// The same, for whole trees: the sidecar directory of a page arriving from another notebook.
+    QList<QPair<QString, QString>> copyExternalDirs;
     /// relative paths the journal takes over after the manifest is committed.
     QStringList removeAfter;
     /// relative paths this operation creates, for the rollback and for an undo.
@@ -243,7 +246,21 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
             return false;
         }
     }
+    for (const QPair<QString, QString> &pair : plan.copyExternalDirs) {
+        if (!copyDirectory(pair.first, project.filePath(pair.second))) {
+            fail(why, QStringLiteral("cannot copy %1 into the notebook").arg(pair.first));
+            undoCreatedFiles(projectDir, plan);
+            QDir(journal).removeRecursively();
+            return false;
+        }
+    }
     for (const QPair<QString, QString> &pair : plan.copyExternal) {
+        /// A file that is not there is not a failure: a page that was never drawn on has no
+        /// artifact, and a page whose preview was never made has none either. The manifest records
+        /// the name; the absence is the notebook's normal shape.
+        if (!QFileInfo::exists(pair.first)) {
+            continue;
+        }
         const QString destination = project.filePath(pair.second);
         if (!QDir().mkpath(QFileInfo(destination).absolutePath())
             || !QFile::copy(pair.first, destination)) {
@@ -419,10 +436,41 @@ QString sourceRelativeName(const QByteArray &sha256, const QString &base, int or
     return QStringLiteral("sources/%1.pdf").arg(stem);
 }
 
+/// A name inside the target for a file arriving from another notebook: the name it already had,
+/// with an ordinal when the target has a file of that name holding something else. A merge never
+/// writes over a file the target already owns.
+QString freeRelativeName(const QString &projectDir, const QString &incoming, const QByteArray &sha256)
+{
+    const QFileInfo info(incoming);
+    const QString directory =
+        info.path() == QLatin1String(".") ? QString() : info.path() + QLatin1Char('/');
+    QString candidate = incoming;
+    int ordinal = 1;
+    while (QFileInfo::exists(QDir(projectDir).filePath(candidate))
+           && PdfSessionManifest::sha256OfFile(QDir(projectDir).filePath(candidate)) != sha256) {
+        candidate = QStringLiteral("%1%2-%3.%4")
+                        .arg(directory, info.completeBaseName())
+                        .arg(++ordinal)
+                        .arg(info.suffix());
+    }
+    return candidate;
+}
+
 bool loadManifest(const QString &projectDir, PdfSessionManifest *manifest, QString *why)
 {
     *manifest = PdfSession::openProject(projectDir, why);
-    return manifest->isValid(why);
+    if (manifest->isValid()) {
+        return true;
+    }
+
+    /// openProject() has already said what was wrong -- "the source file X changed since the
+    /// project was created" is the answer a caller needs. Asking the empty manifest it returned
+    /// again would replace that with "no source file recorded", which says nothing about the
+    /// notebook the caller actually has. Only a why that is still empty is filled in here.
+    if (why && why->isEmpty()) {
+        manifest->isValid(why);
+    }
+    return false;
 }
 
 PdfNotebookOps::Outcome refused(const QString &why)
@@ -921,6 +969,134 @@ PdfNotebookOps::Outcome PdfNotebookOps::rotatePages(const QString &projectDir, i
     /// Turning a page moves nothing and changes no position: the reader stays where they were.
     outcome.ok = true;
     outcome.anchorPage = currentPage;
+    outcome.summary = plan.summary;
+    return outcome;
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::mergeNotebook(const QString &projectDir, int at,
+                                                       const QString &sourceDir, int currentPage)
+{
+    PdfSessionManifest target;
+    QString why;
+    if (!loadManifest(projectDir, &target, &why)) {
+        return refused(why);
+    }
+
+    const QString source = QFileInfo(sourceDir).absoluteFilePath();
+    if (source.isEmpty() || !QFileInfo::exists(PdfSession::manifestPath(source))) {
+        return refused(QStringLiteral("%1 does not hold a notebook").arg(sourceDir));
+    }
+    if (source == QFileInfo(projectDir).absoluteFilePath()) {
+        return refused(QStringLiteral("a notebook cannot be merged into itself"));
+    }
+
+    PdfSessionManifest incoming;
+    if (!loadManifest(source, &incoming, &why)) {
+        return refused(why);
+    }
+
+    const int pages = target.pages.size();
+    if (at < 0 || at > pages) {
+        return refused(QStringLiteral("pages cannot be merged in at position %1: the notebook has "
+                                      "%2 page(s)")
+                           .arg(at + 1).arg(pages));
+    }
+    if (currentPage < 0 || currentPage >= pages) {
+        currentPage = at > 0 ? at - 1 : 0;
+    }
+
+    Plan plan;
+    plan.after = target;
+    plan.opName = "merge";
+
+    /// The list has to be there before anything can be appended to it: an empty one means "one
+    /// source: the fields beside it", which is what a manifest built in code looks like.
+    if (plan.after.sources.isEmpty()) {
+        PdfSourceRecord existing;
+        existing.file = plan.after.sourceFile;
+        existing.sha256 = plan.after.sourceSha256;
+        existing.byteSize = plan.after.sourceByteSize;
+        plan.after.sources.append(existing);
+    }
+
+    const QDir from(source);
+    for (int i = 0; i < incoming.pages.size(); ++i) {
+        const PdfPageRecord &page = incoming.pages.at(i);
+        const PdfSourceRecord incomingSource = incoming.sourceForPage(page);
+
+        /// The PDF travels once. A target that already has this content draws those pages from the
+        /// entry it has; otherwise the file is copied in, under its own name unless that name is
+        /// taken in the target by something else.
+        int sourceIndex = plan.after.sourceIndexForSha(incomingSource.sha256);
+        if (sourceIndex < 0) {
+            const QString relative = freeRelativeName(projectDir, incomingSource.file,
+                                                      incomingSource.sha256);
+            plan.copyExternal.append(qMakePair(from.filePath(incomingSource.file), relative));
+            plan.added.append(relative);
+
+            PdfSourceRecord record = incomingSource;
+            record.file = relative;
+            sourceIndex = plan.after.sources.size();
+            plan.after.sources.append(record);
+        }
+
+        /// The page keeps its place in its source and its geometry, and gets a name nothing in the
+        /// target uses: artifact numbers belong to the notebook's own allocator, so a merge cannot
+        /// land on top of a page that is already there.
+        PdfPageRecord copy = page;
+        copy.source = sourceIndex;
+        copy.generation = 0;
+        const int number = plan.after.allocatePageNumber();
+        copy.kraFile = PdfSession::pageFileNameForNumber(number);
+        copy.thumbFile = PdfSession::thumbFileNameForNumber(number);
+        plan.after.pages.insert(at + i, copy);
+
+        plan.copyExternal.append(qMakePair(from.filePath(page.kraFile), copy.kraFile));
+        plan.added.append(copy.kraFile);
+        if (!page.thumbFile.isEmpty()) {
+            plan.copyExternal.append(qMakePair(from.filePath(page.thumbFile), copy.thumbFile));
+            plan.added.append(copy.thumbFile);
+        }
+        plan.copyExternalDirs.append(
+            qMakePair(from.filePath(sidecarDirOf(page.kraFile)), sidecarDirOf(copy.kraFile)));
+        plan.added.append(sidecarDirOf(copy.kraFile));
+    }
+
+    /// Whatever the incoming notebook kept in assets/ comes too, because a page's content layer
+    /// points at it rather than at the manifest. A file the target already has with the same bytes
+    /// is not copied twice; one it has with other bytes gets an ordinal name, so neither is lost.
+    const QDir incomingAssets(from.filePath(QStringLiteral("assets")));
+    for (const QString &name : incomingAssets.entryList(QDir::Files, QDir::Name)) {
+        const QString inTarget = QStringLiteral("assets/") + name;
+        const QString existing = QDir(projectDir).filePath(inTarget);
+        if (QFileInfo::exists(existing)
+            && PdfSessionManifest::sha256OfFile(existing)
+                   == PdfSessionManifest::sha256OfFile(incomingAssets.filePath(name))) {
+            continue;
+        }
+        const QString relative = freeRelativeName(projectDir, inTarget, QByteArray());
+        plan.copyExternal.append(qMakePair(incomingAssets.filePath(name), relative));
+        plan.added.append(relative);
+    }
+
+    plan.anchorBefore = currentPage;
+    plan.summary = QStringLiteral("merged %1 page(s) from \"%2\"")
+                       .arg(incoming.pages.size())
+                       .arg(incoming.displayName());
+
+    Outcome outcome;
+    if (!applyPlan(projectDir, plan, ArtifactRotator(), &why)) {
+        outcome.why = why;
+        return outcome;
+    }
+
+    /// The reader keeps the page they were reading: what arrived was placed before it or after it,
+    /// and either way that page moved by the number that arrived before it.
+    const int arrived = incoming.pages.size();
+    outcome.ok = true;
+    outcome.anchorPage =
+        qBound(0, at <= currentPage ? currentPage + arrived : currentPage,
+               plan.after.pages.size() - 1);
     outcome.summary = plan.summary;
     return outcome;
 }

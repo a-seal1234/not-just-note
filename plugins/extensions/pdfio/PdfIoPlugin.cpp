@@ -870,6 +870,84 @@ void extractPageRange()
                        [destination]() { openProjectDirReplacing(destination, 6); });
 }
 
+/// Merges every page of the notebook at \a sourceDir in, after the page that is open.
+///
+/// Through the same runner as the other operations, so the open pages are written first and the
+/// notebook is reloaded afterwards. What arrives goes AFTER the page the reader is on, so that page
+/// does not move -- the outcome's anchor, which the runner opens, says so.
+void mergeNotebookFrom(const QString &sourceDir)
+{
+    applyNotebookOperation(i18n("Merge a notebook in"),
+                           [sourceDir](const QString &dir, int page) {
+                               return PdfNotebookOps::mergeNotebook(dir, page + 1, sourceDir, page);
+                           });
+}
+
+/// Picks a notebook FILE and merges what is inside it in.
+void mergeNotebookFile()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Merge a notebook in"),
+                                 i18n("No notebook is open."));
+        return;
+    }
+
+    const QString picked = QFileDialog::getOpenFileName(
+        nullptr, i18n("Merge a notebook in"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        PdfNotebookBundle::fileFilter());
+    if (picked.isEmpty()) {
+        return;
+    }
+
+    /// Read before anything is written: inspect() says what the file holds and refuses what is not
+    /// a notebook, without unpacking a byte.
+    QString why;
+    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(picked, &why);
+    if (!info.isValid()) {
+        say(QStringLiteral("that file cannot be merged in: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+        return;
+    }
+
+    /// Unpacked into a directory of its own under the notebook folder, because the merge works on a
+    /// notebook directory -- the .pnb is the transport form. The copy is removed afterwards whether
+    /// or not the merge worked: by then the pages it carried are in the notebook's own files.
+    const QString unpacked =
+        QDir(QDir(PdfSession::projectRoot())
+                 .filePath(QStringLiteral(".merging-%1").arg(QCoreApplication::applicationPid())))
+            .filePath(PdfNotebookBundle::extractDirName(info.manifest));
+    QDir(unpacked).removeRecursively();
+    if (!PdfNotebookBundle::extract(picked, unpacked, &why)) {
+        say(QStringLiteral("the notebook file could not be unpacked: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+        return;
+    }
+
+    mergeNotebookFrom(unpacked);
+    QDir(unpacked).removeRecursively();
+}
+
+/// Picks a notebook FOLDER on this device and merges it in.
+void mergeNotebookFolder()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Merge a notebook folder"),
+                                 i18n("No notebook is open."));
+        return;
+    }
+
+    const QString picked = QFileDialog::getExistingDirectory(
+        nullptr, i18n("Merge a notebook folder"), PdfSession::projectRoot());
+    if (picked.isEmpty()) {
+        return;
+    }
+
+    mergeNotebookFrom(picked);
+}
+
 /// Runs one notebook-level operation the way its invariants require: write the open pages first,
 /// change the notebook, then reload it and open the page the operation answers with.
 ///
@@ -944,6 +1022,8 @@ void updateNotebookOpsActions(QMenu *ops)
     /// A notebook keeps at least one page, and the engine refuses to delete the last one.
     set("pdfio_ops_delete", pages > 1);
     set("pdfio_ops_extract_range", pages >= 1);
+    set("pdfio_ops_merge", pages >= 1);
+    set("pdfio_ops_merge_folder", pages >= 1);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
 }
 
@@ -1082,6 +1162,17 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QAction *extract = ops->addAction(i18n("Extract a page range..."));
     extract->setObjectName(QStringLiteral("pdfio_ops_extract_range"));
     QObject::connect(extract, &QAction::triggered, ops, []() { extractPageRange(); });
+
+    /// Merging is extraction's other direction: pages arrive from another notebook instead of
+    /// leaving for one. The file form is the one to reach for; the folder form is for a notebook
+    /// already on this device.
+    QAction *merge = ops->addAction(i18n("Merge a notebook in..."));
+    merge->setObjectName(QStringLiteral("pdfio_ops_merge"));
+    QObject::connect(merge, &QAction::triggered, ops, []() { mergeNotebookFile(); });
+
+    QAction *mergeFolder = ops->addAction(i18n("Merge a notebook folder..."));
+    mergeFolder->setObjectName(QStringLiteral("pdfio_ops_merge_folder"));
+    QObject::connect(mergeFolder, &QAction::triggered, ops, []() { mergeNotebookFolder(); });
 
     ops->addSeparator();
 

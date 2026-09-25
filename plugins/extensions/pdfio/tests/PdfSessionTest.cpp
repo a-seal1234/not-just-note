@@ -143,6 +143,12 @@ private Q_SLOTS:
     void testExtractingARangeThatSpansTwoSourcesKeepsBoth();
     void testExtractingRefusesADestinationOrARangeThatCannotBeMade();
 
+    /// Merging a notebook in: its pages and files arrive under fresh numbers, its PDF is copied once
+    /// (or drawn from, when the target already has it), and neither notebook is otherwise changed.
+    void testMergingANotebookIn();
+    void testMergingANotebookThatSharesTheTargetsSource();
+    void testMergingRefusesWhatItCannotDo();
+
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
     void testRejectsEscapingManifestPaths();
@@ -1487,6 +1493,179 @@ void PdfSessionTest::testExtractingRefusesADestinationOrARangeThatCannotBeMade()
     QVERIFY(!QFileInfo::exists(QDir(taken).filePath(QStringLiteral("keep.txt"))));
     QString why;
     QVERIFY2(PdfSession::openProject(taken, &why).isValid(&why), qPrintable(why));
+}
+
+/**
+ * Merging another notebook in: its pages arrive at the end, under fresh artifact numbers, with
+ * their files and the PDF they are drawn from -- and neither notebook is changed by the other.
+ */
+void PdfSessionTest::testMergingANotebookIn()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+    const QString other = dir.filePath(QStringLiteral("other"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest target =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(target.isValid());
+    QCOMPARE(target.pages.size(), 3);
+
+    /// A second notebook from a different PDF, with an artifact, a sidecar, a preview and an asset
+    /// on its first page: something of every kind for the merge to carry.
+    PopplerRenderBackend otherBackend;
+    const PdfSessionManifest incoming =
+        PdfSession::createProject(other, fixturePath(QStringLiteral("ex-rotations.pdf")), otherBackend);
+    QVERIFY(incoming.isValid());
+    QVERIFY(incoming.pages.size() >= 2);
+
+    const PdfPageRecord incomingFirst = incoming.pages.at(0);
+    writeBytes(QDir(other).filePath(incomingFirst.kraFile),
+               QByteArrayLiteral("ink of the incoming page"));
+    writeBytes(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers/Inserted image.png")),
+               QByteArrayLiteral("a layer"));
+    writeBytes(QDir(other).filePath(incomingFirst.thumbFile), QByteArrayLiteral("a preview"));
+    writeBytes(QDir(other).filePath(QStringLiteral("assets/picture.png")), QByteArrayLiteral("an asset"));
+    const QByteArray incomingManifestBefore = readBytes(PdfSession::manifestPath(other));
+    const QString incomingSourceBefore = readBytes(QDir(other).filePath(incoming.sourceFile));
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::mergeNotebook(project, 3, other, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    QString why;
+    const PdfSessionManifest merged = PdfSession::openProject(project, &why);
+    QVERIFY2(merged.isValid(&why), qPrintable(why));
+    QCOMPARE(merged.pages.size(), 3 + incoming.pages.size());
+    QCOMPARE(merged.sourceCount(), 2);
+
+    /// The incoming pages are at the end, in their own order, drawn from the copied PDF.
+    for (int i = 0; i < incoming.pages.size(); ++i) {
+        const PdfPageRecord page = merged.pages.at(3 + i);
+        QCOMPARE(page.source, 1);
+        QCOMPARE(page.index, incoming.pages.at(i).index);
+        QCOMPARE(page.sizePt, incoming.pages.at(i).sizePt);
+    }
+    QVERIFY(QFileInfo::exists(QDir(project).filePath(merged.sourceAt(1).file)));
+    QCOMPARE(PdfSessionManifest::sha256OfFile(QDir(project).filePath(merged.sourceAt(1).file)),
+             PdfSessionManifest::sha256OfFile(QDir(other).filePath(incoming.sourceFile)));
+
+    /// Fresh artifact numbers -- nothing lands on a name the target already uses -- and the files
+    /// came with the records: the ink, its sidecar and the preview.
+    const PdfPageRecord arrived = merged.pages.at(3);
+    QVERIFY(arrived.kraFile != incomingFirst.kraFile);
+    QCOMPARE(arrived.kraFile, PdfSession::pageFileNameForNumber(4));
+    QCOMPARE(readBytes(QDir(project).filePath(arrived.kraFile)),
+             QByteArrayLiteral("ink of the incoming page"));
+    QCOMPARE(readBytes(QDir(project).filePath(arrived.thumbFile)), QByteArrayLiteral("a preview"));
+    QCOMPARE(readBytes(QDir(project).filePath(arrived.kraFile
+                                               + QStringLiteral(".layers/Inserted image.png"))),
+             QByteArrayLiteral("a layer"));
+
+    /// A page of the incoming notebook that was never drawn on arrives without an artifact, and its
+    /// asset came across.
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(merged.pages.at(4).kraFile)));
+    QCOMPARE(readBytes(QDir(project).filePath(QStringLiteral("assets/picture.png"))),
+             QByteArrayLiteral("an asset"));
+
+    /// The notebook that was merged in is exactly as it was: a merge reads it.
+    QCOMPARE(readBytes(PdfSession::manifestPath(other)), incomingManifestBefore);
+    QCOMPARE(readBytes(QDir(other).filePath(incoming.sourceFile)), incomingSourceBefore);
+    QCOMPARE(readBytes(QDir(other).filePath(incomingFirst.kraFile)),
+             QByteArrayLiteral("ink of the incoming page"));
+
+    /// And the merge can be undone whole: the pages, the copied PDF and the asset all go.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), target.toJson());
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(arrived.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("assets/picture.png"))));
+}
+
+/**
+ * A notebook that draws on the same PDF as the target brings no second copy of it, and its pages
+ * still get names of their own.
+ */
+void PdfSessionTest::testMergingANotebookThatSharesTheTargetsSource()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+    const QString range = dir.filePath(QStringLiteral("range"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest target =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(target.isValid());
+
+    /// A range extracted from the target itself: two pages, the same source PDF.
+    QVERIFY2(PdfNotebookOps::extractRange(project, 0, 2, range).ok,
+             "the range this test needs could not be extracted");
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::mergeNotebook(project, 0, range, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    QString why;
+    const PdfSessionManifest merged = PdfSession::openProject(project, &why);
+    QVERIFY2(merged.isValid(&why), qPrintable(why));
+    QCOMPARE(merged.pages.size(), 5);
+    /// One source, not two: the same bytes are already in this notebook.
+    QCOMPARE(merged.sourceCount(), 1);
+    QVERIFY2(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("sources"))),
+             "a second copy of a PDF the notebook already has");
+
+    /// The pages that arrived are the target's first two pages again -- and their artifacts are
+    /// files of their own, not the ones the target's own pages use.
+    QCOMPARE(merged.pages.at(0).index, target.pages.at(0).index);
+    QVERIFY(merged.pages.at(0).kraFile != target.pages.at(0).kraFile);
+    QCOMPARE(merged.pages.at(0).kraFile, PdfSession::pageFileNameForNumber(4));
+    QCOMPARE(merged.pages.at(1).kraFile, PdfSession::pageFileNameForNumber(5));
+}
+
+void PdfSessionTest::testMergingRefusesWhatItCannotDo()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+    const QString other = dir.filePath(QStringLiteral("other"));
+
+    PopplerRenderBackend backend;
+    QVERIFY(PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend).isValid());
+    PopplerRenderBackend otherBackend;
+    QVERIFY(PdfSession::createProject(other, fixturePath(QStringLiteral("ex-rotations.pdf")), otherBackend).isValid());
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    QString why;
+
+    /// Itself: reading a notebook while writing it is not a merge.
+    const PdfNotebookOps::Outcome itself = PdfNotebookOps::mergeNotebook(project, 0, project);
+    QVERIFY(!itself.ok);
+    QVERIFY2(itself.why.contains(QStringLiteral("itself")), qPrintable(itself.why));
+
+    /// A directory that is not a notebook at all.
+    const QString empty = dir.filePath(QStringLiteral("not-a-notebook"));
+    QVERIFY(QDir().mkpath(empty));
+    QVERIFY(!PdfNotebookOps::mergeNotebook(project, 0, empty).ok);
+
+    /// A position outside the notebook.
+    QVERIFY(!PdfNotebookOps::mergeNotebook(project, 99, other).ok);
+
+    /// Nothing was written and nothing was journalled by any of those.
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+
+    /// And the notebook being merged in is read through the same door as the target: one whose
+    /// source changed under it is refused rather than half copied.
+    {
+        QFile file(QDir(other).filePath(QStringLiteral("ex-rotations.pdf")));
+        QVERIFY(file.open(QIODevice::Append));
+        file.write(" ");
+    }
+    why.clear();
+    const PdfNotebookOps::Outcome changed = PdfNotebookOps::mergeNotebook(project, 0, other);
+    QVERIFY(!changed.ok);
+    QVERIFY2(changed.why.contains(QStringLiteral("changed")), qPrintable(changed.why));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
 }
 
 /**

@@ -85,6 +85,7 @@ private Q_SLOTS:
     void testADeletedPageLeavesTheReaderOnTheNextOne();
     void testRotatingAPageTurnsTheInkWithThePaper();
     void testAnExtractedRangeOpensAsItsOwnNotebook();
+    void testMergingANotebookInAddsItsPagesAndKeepsTheReader();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1443,6 +1444,66 @@ void PdfNavigatorIntegrationTest::testAnExtractedRangeOpensAsItsOwnNotebook()
     QCOMPARE(PdfSession::openProject(original, &why).pages.size(), 3);
 
     /// The tab is closed, the way the other tests that leave a page open close theirs.
+    navigator()->currentDocument()->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+}
+
+/**
+ * Merging a notebook in grows the open notebook, and the reader stays on the page they were on.
+ *
+ * The engine's own test covers what a merge copies. This one covers the reload: the notebook the
+ * reader is holding gains pages under it, and after reloadNotebook() the page that is open is the
+ * same page -- not the same index into a longer list, and not a page of the notebook merged in.
+ */
+void PdfNavigatorIntegrationTest::testMergingANotebookInAddsItsPagesAndKeepsTheReader()
+{
+    QVERIFY(useNotebook(QStringLiteral("ops-merge")));
+    QCOMPARE(navigator()->currentIndex(), 0);
+    const int before = navigator()->pageCount();
+    QVERIFY(before >= 2);
+
+    /// A second notebook of its own, made from another fixture, so the pages that arrive are
+    /// visibly not the ones the reader already had.
+    QTemporaryDir other;
+    QVERIFY(other.isValid());
+    const QString otherDir = other.filePath(QStringLiteral("incoming"));
+    PopplerRenderBackend backend;
+    const QString incomingPdf = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-rotations.pdf");
+    QVERIFY(backend.open(incomingPdf));
+    const PdfSessionManifest incoming = PdfSession::createProject(otherDir, incomingPdf, backend);
+    QVERIFY2(incoming.isValid(), "the notebook this test wants to merge in could not be made");
+    QVERIFY(incoming.pages.size() >= 2);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+
+    /// Appended: the page the reader is on is not pushed anywhere, which the anchor says.
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::mergeNotebook(navigator()->projectDir(), before, otherDir, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, 0);
+
+    QVERIFY2(navigator()->reloadNotebook(outcome.anchorPage, &why), qPrintable(why));
+    QElapsedTimer clock;
+    clock.start();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload never finished");
+
+    QCOMPARE(navigator()->pageCount(), before + incoming.pages.size());
+    QCOMPARE(navigator()->currentIndex(), 0);
+    /// The page that is open is still one of the notebook that was open; the pages that arrived are
+    /// behind it and say which source they came from.
+    QCOMPARE(navigator()->manifest().pages.at(0).source, 0);
+    QCOMPARE(navigator()->manifest().pages.at(before).source, 1);
+
+    /// The tab is closed, like the other tests that leave a page open.
     navigator()->currentDocument()->setModified(false);
     if (KisView *view = navigator()->currentView()) {
         view->closeView();

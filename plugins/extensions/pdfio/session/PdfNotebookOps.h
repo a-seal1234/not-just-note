@@ -176,6 +176,24 @@ public:
     static Outcome extractRange(const QString &projectDir, int first, int count,
                                 const QString &destinationDir);
 
+    /**
+     * Merges every page of the notebook at \a sourceDir into \a projectDir, at position \a at.
+     *
+     * The pages keep their order and their own files: each one is copied under a fresh artifact
+     * number, so nothing collides with what the target already holds, and the PDF it is drawn from
+     * is copied in unless the target already has one with the same content -- in which case those
+     * pages are drawn from that entry and no second copy of the bytes is made.
+     *
+     * The target's own pages, and the notebook being merged in, are both left alone; the merge goes
+     * through the same journal and commit protocol as every other operation, so it can be undone
+     * and a failure leaves nothing half-done.
+     *
+     * The two directories have to be different: reading a notebook while writing it is not a merge,
+     * and it is how half a notebook ends up in the journal.
+     */
+    static Outcome mergeNotebook(const QString &projectDir, int at, const QString &sourceDir,
+                                 int currentPage = -1);
+
     /// Whether there is a change that can be undone.
     static bool canUndo(const QString &projectDir);
 
