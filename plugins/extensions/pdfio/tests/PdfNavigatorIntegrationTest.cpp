@@ -84,6 +84,7 @@ private Q_SLOTS:
     void testAMovedPageKeepsTheReaderAndTheirInk();
     void testADeletedPageLeavesTheReaderOnTheNextOne();
     void testRotatingAPageTurnsTheInkWithThePaper();
+    void testAnExtractedRangeOpensAsItsOwnNotebook();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1378,6 +1379,70 @@ void PdfNavigatorIntegrationTest::testRotatingAPageTurnsTheInkWithThePaper()
 
     /// The tab is closed, the way the other tests that leave a page open close theirs: the document
     /// is marked clean first -- its ink is on disk -- so closing asks nothing.
+    navigator()->currentDocument()->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+}
+
+/**
+ * A range extracted from the open notebook opens as a notebook of its own -- by directory.
+ *
+ * This is F5 of the design: the extracted notebook draws on the SAME source PDF as the notebook it
+ * came from, and a project is normally keyed by the source's own hash. Opening it by source would
+ * find the original, so the extraction opens it by directory instead -- which is also what Recent
+ * notebooks and the Start screen remember.
+ */
+void PdfNavigatorIntegrationTest::testAnExtractedRangeOpensAsItsOwnNotebook()
+{
+    QVERIFY(useNotebook(QStringLiteral("ops-extract")));
+    QCOMPARE(navigator()->currentIndex(), 0);
+    QVERIFY(navigator()->pageCount() >= 3);
+
+    /// Ink on a page that is going to be extracted, so "the new notebook is the range" is about
+    /// pixels and not only about a page count.
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+
+    const QString original = navigator()->projectDir();
+    const QString destination = QDir(original).absolutePath() + QStringLiteral("-range");
+    QDir(destination).removeRecursively();
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::extractRange(original, 0, 2, destination);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// The notebook that is open has to be gone before the new one is built: the same close-first
+    /// rule every open follows.
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+
+    /// By directory: the source path is the same file for both notebooks.
+    QVERIFY2(navigator()->openNotebookDir(destination, &why), qPrintable(why));
+    QCOMPARE(QFileInfo(navigator()->projectDir()).absoluteFilePath(),
+             QFileInfo(destination).absoluteFilePath());
+    QCOMPARE(navigator()->pageCount(), 2);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    /// And it is the range: the page that was drawn on came with its ink.
+    QVERIFY2(inkMarkPresent(navigator()->currentDocument()->image()),
+             "the extracted notebook lost the ink of the page it carries");
+
+    /// The notebook it came from is still itself, read straight from disk: extracting is a
+    /// read-only operation on it, and this test does not need a third view to say so.
+    QCOMPARE(PdfSession::openProject(original, &why).pages.size(), 3);
+
+    /// The tab is closed, the way the other tests that leave a page open close theirs.
     navigator()->currentDocument()->setModified(false);
     if (KisView *view = navigator()->currentView()) {
         view->closeView();

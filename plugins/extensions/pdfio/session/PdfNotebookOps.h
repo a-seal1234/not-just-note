@@ -141,6 +141,41 @@ public:
      */
     static Outcome deletePages(const QString &projectDir, int first, int count, int currentPage = -1);
 
+    /// What extractRange() may do about a directory that is already there.
+    struct ExtractOptions {
+        /**
+         * Write over a notebook that is already at the destination.
+         *
+         * Off by default: two notebooks made from the same pages is a decision for a person, and the
+         * one already there may be the one they are working in.
+         */
+        bool replaceExisting = false;
+    };
+
+    /**
+     * Writes \a count pages of \a projectDir, starting at \a first, as a notebook of their own at
+     * \a destinationDir.
+     *
+     * The new notebook is the range and nothing else: the sources those pages draw from are copied
+     * into it (in the order they are first needed, one of them becoming its own source), the pages'
+     * artifacts and previews travel with them, and \a projectDir is not touched at all. A range that
+     * spans two PDFs therefore produces a notebook that carries both.
+     *
+     * It is built whole in a directory beside the destination and renamed into place only once it
+     * has been read back and opened: a failure leaves nothing behind, and never takes the notebook
+     * that is already there with it. The new notebook's name is the destination directory's own.
+     *
+     * The open notebook afterwards is the caller's business -- see
+     * PdfPageNavigator::openNotebookDir(), because two notebooks can share one source PDF and the
+     * source path cannot tell them apart.
+     */
+    static Outcome extractRange(const QString &projectDir, int first, int count,
+                                const QString &destinationDir, const ExtractOptions &options);
+
+    /// The same, leaving a notebook that is already at the destination alone.
+    static Outcome extractRange(const QString &projectDir, int first, int count,
+                                const QString &destinationDir);
+
     /// Whether there is a change that can be undone.
     static bool canUndo(const QString &projectDir);
 

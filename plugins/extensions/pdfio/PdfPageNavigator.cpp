@@ -780,6 +780,31 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
 
     say(QStringLiteral("project ready: %1 pages at %2").arg(manifest.pages.size()).arg(projectDir));
 
+    return adoptNotebook(projectDir, manifest, 0, base, why);
+}
+
+bool PdfPageNavigator::openNotebookDir(const QString &projectDir, QString *why)
+{
+    if (projectDir.isEmpty() || !QFileInfo::exists(PdfSession::manifestPath(projectDir))) {
+        fail(why, QStringLiteral("%1 does not hold a notebook").arg(projectDir));
+        return false;
+    }
+
+    /// Read the way every notebook is read, so a directory that cannot be opened says why rather
+    /// than showing an empty notebook.
+    const PdfSessionManifest manifest = PdfSession::openProject(projectDir, why);
+    if (!manifest.isValid(why)) {
+        return false;
+    }
+
+    say(QStringLiteral("project ready: %1 pages at %2").arg(manifest.pages.size()).arg(projectDir));
+    /// The notebook's own name, the same one the docker, the tab and Recent show.
+    return adoptNotebook(projectDir, manifest, 0, manifest.displayName(), why);
+}
+
+bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSessionManifest &manifest,
+                                     int anchorPage, const QString &label, QString *why)
+{
     /// A page of a notebook that is being replaced is written before the new manifest takes over:
     /// after the assignment below, its index and its file name would be read out of the new file.
     /// Through the queue and waited for -- an unwaited write here would be carrying ink across
@@ -801,11 +826,11 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
     m_window.clear();
 
     /// And the strip of the notebook being replaced goes with it -- its slots, cells and paper
-    /// layers, and the slot bookkeeping. Without this, showPage(0) below finds page 0 already
-    /// inside the OLD strip and only unlocks that slot: the tab changes to the new notebook while
-    /// the previous notebook's pages stay on the canvas, which is what switching with Recent
-    /// notebooks looked like. The plugin closes the old view first, but a path that forgets to
-    /// cannot be allowed to leave the old strip behind.
+    /// layers, and the slot bookkeeping. Without this, showPage() below finds the page it is asked
+    /// for already inside the OLD strip and only unlocks that slot: the tab changes to the new
+    /// notebook while the previous notebook's pages stay on the canvas, which is what switching
+    /// with Recent notebooks looked like. The plugin closes the old view first, but a path that
+    /// forgets to cannot be allowed to leave the old strip behind.
     m_stripPages.clear();
     m_stripRects.clear();
     m_stripCells.clear();
@@ -824,8 +849,9 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
 
     m_projectDir = projectDir;
     m_manifest = manifest;
-    const bool shown = showPage(0, why);
-    Q_EMIT pageChanged(m_index, pageCount(), base);
+    const int anchor = qBound(0, anchorPage, manifest.pages.size() - 1);
+    const bool shown = showPage(anchor, why);
+    Q_EMIT pageChanged(m_index, pageCount(), label);
 
     /// Watched on a timer rather than from the canvas: panning arrives as wheel or touch events
     /// depending on the device, and where the page ended up afterwards is the same question either

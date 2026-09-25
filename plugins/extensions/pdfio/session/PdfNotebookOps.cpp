@@ -16,6 +16,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QTemporaryDir>
 
 namespace {
 
@@ -675,6 +676,171 @@ PdfNotebookOps::Outcome PdfNotebookOps::insertPages(const QString &projectDir, i
     outcome.anchorPage =
         qBound(0, at <= currentPage ? currentPage + count : currentPage, plan.after.pages.size() - 1);
     outcome.summary = plan.summary;
+    return outcome;
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::extractRange(const QString &projectDir, int first, int count,
+                                                     const QString &destinationDir)
+{
+    return extractRange(projectDir, first, count, destinationDir, ExtractOptions());
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::extractRange(const QString &projectDir, int first, int count,
+                                                     const QString &destinationDir,
+                                                     const ExtractOptions &options)
+{
+    PdfSessionManifest source;
+    QString why;
+    if (!loadManifest(projectDir, &source, &why)) {
+        return refused(why);
+    }
+
+    const int pages = source.pages.size();
+    if (count < 1) {
+        return refused(QStringLiteral("there is no page to extract"));
+    }
+    if (first < 0 || first + count > pages) {
+        return refused(QStringLiteral("pages %1..%2 are not part of the notebook: it has %3 page(s)")
+                           .arg(first + 1).arg(first + count).arg(pages));
+    }
+    if (destinationDir.isEmpty()) {
+        return refused(QStringLiteral("no destination was given for the new notebook"));
+    }
+
+    const QString destination = QFileInfo(destinationDir).absoluteFilePath();
+    if (QFileInfo::exists(destination) && !options.replaceExisting) {
+        return refused(QStringLiteral("%1 is already there; choose another name for the new notebook")
+                           .arg(destination));
+    }
+    const QString parent = QFileInfo(destination).absolutePath();
+    if (!QDir().mkpath(parent)) {
+        return refused(QStringLiteral("cannot create %1").arg(parent));
+    }
+
+    /// Built whole beside where it will be, and renamed into place only once it has been read back
+    /// and opened: a failure leaves nothing behind and never takes the notebook that is already
+    /// there with it.
+    QTemporaryDir staging(QDir(parent).filePath(
+        QStringLiteral(".%1-extracting-XXXXXX").arg(QFileInfo(destination).fileName())));
+    if (!staging.isValid()) {
+        return refused(QStringLiteral("cannot create a temporary directory beside %1").arg(destination));
+    }
+    const QString stagingPath = staging.path();
+
+    /// The sources the range draws from, in the order they are first needed, each copied under the
+    /// name it already had inside the notebook it came from. The first of them becomes the new
+    /// notebook's own source, because a manifest records one source beside the list.
+    PdfSessionManifest after;
+    after.schema = PdfSessionManifest::CurrentSchema;
+    after.name = QFileInfo(destination).fileName();
+    QList<int> sourceMap;
+    for (int i = first; i < first + count; ++i) {
+        const PdfPageRecord &page = source.pages.at(i);
+        int mapped = sourceMap.indexOf(page.source);
+        if (mapped < 0) {
+            const PdfSourceRecord record = source.sourceAt(page.source);
+            const QString from = QDir(projectDir).filePath(record.file);
+            const QString to = QDir(stagingPath).filePath(record.file);
+            if (!QFileInfo::exists(from)
+                || !QDir().mkpath(QFileInfo(to).absolutePath())
+                || !QFile::copy(from, to)) {
+                return refused(QStringLiteral("cannot copy the source %1 into the new notebook")
+                                   .arg(record.file));
+            }
+            mapped = sourceMap.size();
+            sourceMap.append(page.source);
+            after.sources.append(record);
+        }
+
+        PdfPageRecord copy = page;
+        copy.source = mapped;
+        after.pages.append(copy);
+    }
+    after.sourceFile = after.sources.first().file;
+    after.sourceSha256 = after.sources.first().sha256;
+    after.sourceByteSize = after.sources.first().byteSize;
+
+    /// The pages' own files: the artifact, its sidecar (what the strip reads a page's layers out of)
+    /// and the preview. A page that was never drawn on has no artifact and one never shown has no
+    /// preview, and neither is a hole -- exactly as in the notebook they came from.
+    const auto copyIfThere = [&projectDir, &stagingPath](const QString &relative) {
+        const QString from = QDir(projectDir).filePath(relative);
+        if (!QFileInfo::exists(from)) {
+            return true;
+        }
+        const QString to = QDir(stagingPath).filePath(relative);
+        return QDir().mkpath(QFileInfo(to).absolutePath()) && QFile::copy(from, to);
+    };
+
+    for (const PdfPageRecord &page : after.pages) {
+        /// The sidecar is a directory, so it is copied whole; the artifact and the preview are
+        /// files.
+        if (!copyIfThere(page.kraFile) || !copyIfThere(page.thumbFile)) {
+            return refused(QStringLiteral("cannot copy the files of the page %1").arg(page.kraFile));
+        }
+        if (!copyDirectory(QDir(projectDir).filePath(sidecarDirOf(page.kraFile)),
+                           QDir(stagingPath).filePath(sidecarDirOf(page.kraFile)))) {
+            return refused(QStringLiteral("cannot copy the sidecar of %1").arg(page.kraFile));
+        }
+    }
+
+    /// And the notebook's assets/, which a page's content layer points at rather than the manifest:
+    /// a notebook carried without them opens with its pictures missing.
+    if (!copyDirectory(QDir(projectDir).filePath(QStringLiteral("assets")),
+                       QDir(stagingPath).filePath(QStringLiteral("assets")))) {
+        return refused(QStringLiteral("cannot copy the notebook's assets"));
+    }
+
+    /// One page per number and the counter past them, so the new notebook allocates names that are
+    /// free in IT rather than names its own pages already use.
+    after.refreshNextPageNumber();
+    if (!after.writeTo(QDir(stagingPath).filePath(QStringLiteral("manifest.json")), &why)) {
+        return refused(why);
+    }
+
+    /// Read back through the same door the notebook will be opened with: it checks that every
+    /// source is there and hashes to what the manifest recorded, so a copy that did not arrive
+    /// intact is caught here rather than by whoever opens the new notebook.
+    if (!PdfSession::openProject(stagingPath, &why).isValid(&why)) {
+        return refused(QStringLiteral("the new notebook does not read back: %1").arg(why));
+    }
+
+    /// Renamed, not copied: from here the directory is either the notebook or removed by hand, and
+    /// QTemporaryDir must not delete it on the way out.
+    staging.setAutoRemove(false);
+
+    QString movedAside;
+    if (QFileInfo::exists(destination)) {
+        movedAside = destination + QStringLiteral(".replaced");
+        removePath(movedAside);
+        if (!QDir().rename(destination, movedAside)) {
+            removePath(stagingPath);
+            return refused(QStringLiteral("cannot move the notebook already at %1 out of the way")
+                               .arg(destination));
+        }
+    }
+
+    if (!QDir().rename(stagingPath, destination)) {
+        if (!movedAside.isEmpty()) {
+            QDir().rename(movedAside, destination);
+        }
+        removePath(stagingPath);
+        return refused(QStringLiteral("cannot move the new notebook into %1").arg(destination));
+    }
+
+    if (!movedAside.isEmpty()) {
+        removePath(movedAside);
+    }
+
+    Outcome outcome;
+    outcome.ok = true;
+    outcome.anchorPage = 0;
+    outcome.summary = count == 1
+        ? QStringLiteral("extracted page %1 as \"%2\"").arg(first + 1).arg(after.name)
+        : QStringLiteral("extracted pages %1..%2 as \"%3\"")
+              .arg(first + 1)
+              .arg(first + count)
+              .arg(after.name);
     return outcome;
 }
 

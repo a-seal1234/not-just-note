@@ -49,6 +49,17 @@ public:
     /// Wraps \a pdfPath into a project if needed and shows its first page.
     bool openNotebook(const QString &pdfPath, QString *why = nullptr);
 
+    /**
+     * Opens a notebook from its DIRECTORY, rather than from the PDF it was made from.
+     *
+     * Two notebooks can draw on one PDF -- a range extracted from a notebook carries the same
+     * source as the notebook it came from -- and a source path cannot tell them apart: openNotebook()
+     * keys a project by the source's own hash, so it would find the notebook that already exists
+     * rather than the one just made. Everything that remembers a notebook (Recent notebooks, the
+     * Start screen) stores the directory, and this is the door that opens what it stored.
+     */
+    bool openNotebookDir(const QString &projectDir, QString *why = nullptr);
+
     bool showPage(int index, QString *why = nullptr);
     bool next(QString *why = nullptr);
     bool previous(QString *why = nullptr);
@@ -188,6 +199,11 @@ private:
 
     /// Closes the page that is open, freeing its document and its view.
     void closeCurrentPage();
+
+    /// The tail every notebook open shares: write the page being replaced, clear the window, the
+    /// strip and the slot bookkeeping, adopt the manifest, and show \a anchorPage.
+    bool adoptNotebook(const QString &projectDir, const PdfSessionManifest &manifest, int anchorPage,
+                       const QString &label, QString *why);
 
     /**
      * Writes the ink of the page that is open, if one is.

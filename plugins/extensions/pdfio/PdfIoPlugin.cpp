@@ -16,8 +16,14 @@
 #include <unistd.h>
 
 #include <QDebug>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QSpinBox>
+#include <QVBoxLayout>
 #include <QFileInfo>
 #include <QInputDialog>
 #include <QLineEdit>
@@ -349,6 +355,69 @@ void adoptProviderName(const QString &contentUri)
 }
 #endif
 
+/**
+ * The one range dialog: from page and to page, inside the pages that are available.
+ *
+ * Both entries that need a range use it -- inserting pages asks within the PDF being inserted,
+ * extracting asks within the notebook -- so the two cannot drift into two UIs with two different
+ * ideas of what a range is.
+ *
+ * \a first comes back zero-based, the way the operations count pages, and \a count is how many.
+ */
+bool askForPageRange(const QString &title, const QString &label, int available, int *first, int *count)
+{
+    if (available < 1 || !first || !count) {
+        return false;
+    }
+
+    QDialog dialog(nullptr);
+    dialog.setWindowTitle(title);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *question = new QLabel(label, &dialog);
+    question->setWordWrap(true);
+    layout->addWidget(question);
+
+    auto *from = new QSpinBox(&dialog);
+    from->setRange(1, available);
+    from->setValue(1);
+    auto *to = new QSpinBox(&dialog);
+    to->setRange(1, available);
+    to->setValue(available);
+
+    auto *row = new QHBoxLayout;
+    row->addWidget(new QLabel(i18n("From page"), &dialog));
+    row->addWidget(from);
+    row->addWidget(new QLabel(i18n("to"), &dialog));
+    row->addWidget(to);
+    layout->addLayout(row);
+
+    /// Two boxes describe one range, so they are kept consistent: moving one past the other takes
+    /// the other with it rather than leaving a range that reads backwards.
+    QObject::connect(from, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [from, to](int value) {
+        if (to->value() < value) {
+            to->setValue(value);
+        }
+    });
+    QObject::connect(to, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [from](int value) {
+        if (from->value() > value) {
+            from->setValue(value);
+        }
+    });
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return false;
+    }
+
+    *first = from->value() - 1;
+    *count = to->value() - from->value() + 1;
+    return true;
+}
+
 /// Opens \a pdfPath, replacing whatever notebook is open.
 ///
 /// A page that is already open is closed first and the open is deferred until that close has
@@ -416,6 +485,58 @@ void openNotebookReplacing(const QString &pdfPath,
     }
 }
 
+/// Opens the notebook that lives at \a projectDir, replacing whatever notebook is open.
+///
+/// By DIRECTORY, not by source: a range extracted from a notebook carries the same PDF as the
+/// notebook it came from, and openNotebook() keys a project by the source's own hash -- so a source
+/// path would find the notebook that already exists instead of the one that was just made. Every
+/// path that remembers a notebook (Recent notebooks, the Start screen, an extraction) stores the
+/// directory, and this is the door that opens what it stored.
+///
+/// The close and the deferral are openNotebookReplacing()'s, for the same reason.
+void openProjectDirReplacing(const QString &projectDir, int attemptsLeft,
+                              std::function<void()> then = nullptr)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+
+    if (!KisPart::instance()->currentMainwindow() && attemptsLeft > 0) {
+        say(QStringLiteral("no main window yet; opening the notebook when one arrives"));
+        QTimer::singleShot(500, navigator, [projectDir, attemptsLeft, then]() {
+            openProjectDirReplacing(projectDir, attemptsLeft - 1, then);
+        });
+        return;
+    }
+
+    if (navigator->currentDocument() && attemptsLeft > 0) {
+        if (KisDocument *document = navigator->currentDocument()) {
+            /// Its ink was written by whoever asked for this open; leaving it modified would have
+            /// Krita ask whether to save it while the close is already under way.
+            document->setModified(false);
+        }
+        if (KisView *view = navigator->currentView()) {
+            view->closeView();
+        }
+        QTimer::singleShot(700, navigator, [projectDir, attemptsLeft, then]() {
+            openProjectDirReplacing(projectDir, attemptsLeft - 1, then);
+        });
+        return;
+    }
+
+    QString why;
+    if (!navigator->openNotebookDir(projectDir, &why)) {
+        say(QStringLiteral("could not open the notebook at %1: %2").arg(projectDir, why));
+        QMessageBox::warning(nullptr, i18n("Open a notebook"),
+                             i18n("%1 could not be opened as a notebook: %2", projectDir, why));
+        return;
+    }
+
+    /// The same bookkeeping every open does: name it if it has none, remember it, title the docker.
+    notebookOpened();
+    if (then) {
+        then();
+    }
+}
+
 /// Puts the notebook's name on the open document's tab as well, so the tab agrees with the
 /// docker, the Recent entry and the export suggestion the moment a name is adopted or changed.
 void applyNotebookNameToTab()
@@ -474,9 +595,10 @@ void refreshWelcomePageEntries()
                 say(QStringLiteral("that recent notebook can no longer be read: %1").arg(why));
                 return;
             }
-            /// The same close-first path the Recent notebooks menu uses.
-            openNotebookReplacing(PdfSession::sourcePath(projectDir, manifest.sourceFile),
-                                  QString(), 6);
+            /// The same close-first path the Recent notebooks menu uses -- and by DIRECTORY, so a
+            /// notebook made by extracting a range opens as itself rather than as the notebook it
+            /// was extracted from.
+            openProjectDirReplacing(projectDir, 6);
         });
 }
 
@@ -545,8 +667,11 @@ void renameNotebook()
     }
 }
 
-/// Opens a notebook that is no longer in the menu's list under its own source, which is how the
-/// navigator finds the project directory it was unpacked into.
+/// Opens a notebook from the list, by the directory the list remembered.
+///
+/// Not by source: two notebooks can draw on one PDF -- a range extracted from a notebook carries
+/// the same source as the notebook it came from -- and a source path can only find the one that was
+/// made first. The directory is what tells them apart, and it is what Recent has always stored.
 void openRecentNotebook(const QString &projectDir)
 {
     QString why;
@@ -557,15 +682,13 @@ void openRecentNotebook(const QString &projectDir)
         return;
     }
 
-    const QString source = PdfSession::sourcePath(projectDir, manifest.sourceFile);
-
     /// Deferred out of the menu action, and close-first like every other open: opening the new
     /// notebook while the old document and its strip are still alive leaves the OLD strip on
     /// screen, because showPage() then finds the page it is asked for already inside the strip it
     /// is holding and unlocks that slot instead of building the new one. That is the "the tab
     /// changes but the strip does not" seen when switching notebooks with Recent notebooks.
-    QTimer::singleShot(0, PdfPageNavigator::instance(), [source]() {
-        openNotebookReplacing(source, QString(), 6);
+    QTimer::singleShot(0, PdfPageNavigator::instance(), [projectDir]() {
+        openProjectDirReplacing(projectDir, 6);
     });
 }
 
@@ -622,11 +745,11 @@ void addMenuSeparator(QMenu *menu, const QString &objectName)
 bool applyNotebookOperation(const QString &title,
                             const std::function<PdfNotebookOps::Outcome(const QString &, int)> &operation);
 
-/// Inserts every page of \a picked after the page that is open.
+/// Inserts a range of \a picked after the page that is open.
 ///
 /// After, not before: the page the reader is on does not move, which is what makes the result
-/// predictable. The whole file is inserted; choosing a range is the dialog the extract-range entry
-/// will bring with it, and the operation already takes one.
+/// predictable. Which pages is asked with the one range dialog, the same one the extract entry
+/// uses, so "a range" means the same thing in both.
 void insertPickedPdf(const QString &picked, const QString &why)
 {
     if (picked.isEmpty()) {
@@ -636,6 +759,7 @@ void insertPickedPdf(const QString &picked, const QString &why)
         return;
     }
 
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
     QScopedPointer<PdfRenderBackend> backend(PdfRenderBackend::create());
     if (!backend || !backend->open(picked)) {
         say(QStringLiteral("%1 could not be opened as a PDF; nothing was inserted").arg(picked));
@@ -644,11 +768,106 @@ void insertPickedPdf(const QString &picked, const QString &why)
         return;
     }
 
+    int first = 0;
+    int count = 0;
+    if (!askForPageRange(i18n("Insert pages from a PDF"),
+                         i18n("%1 has %2 page(s). Which of them should go after page %3 of this "
+                              "notebook?",
+                              QFileInfo(picked).fileName(), backend->pageCount(),
+                              navigator->currentIndex() + 1),
+                         backend->pageCount(), &first, &count)) {
+        return;
+    }
+
     PdfRenderBackend *renderer = backend.data();
     applyNotebookOperation(i18n("Insert pages from a PDF"),
-                           [picked, renderer](const QString &dir, int page) {
-                               return PdfNotebookOps::insertPages(dir, page + 1, picked, *renderer);
+                           [picked, renderer, first, count](const QString &dir, int page) {
+                               return PdfNotebookOps::insertPages(dir, page + 1, picked, *renderer,
+                                                                  first, count, page);
                            });
+}
+
+/// Writes a range of the open notebook out as a notebook of its own, beside it, and opens it.
+///
+/// The new notebook is opened BY DIRECTORY: it may share its source PDF with the notebook it came
+/// from, and the source path cannot tell the two apart.
+void extractPageRange()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Extract a page range"),
+                                 i18n("No notebook is open."));
+        return;
+    }
+
+    int first = 0;
+    int count = 0;
+    if (!askForPageRange(
+            i18n("Extract a page range"),
+            i18n("Notebook \"%1\" has %2 page(s). Which of them should the new notebook hold?",
+                 notebookNameFromDisk(navigator->projectDir()), navigator->pageCount()),
+            navigator->pageCount(), &first, &count)) {
+        return;
+    }
+
+    bool accepted = false;
+    const QString entered = QInputDialog::getText(
+        nullptr, i18n("Extract a page range"), i18n("Name for the new notebook:"), QLineEdit::Normal,
+        QStringLiteral("%1 - pages %2-%3")
+            .arg(notebookNameFromDisk(navigator->projectDir()))
+            .arg(first + 1)
+            .arg(first + count),
+        &accepted);
+    if (!accepted) {
+        return;
+    }
+
+    const QString name = nameForFile(entered);
+    if (name.isEmpty()) {
+        QMessageBox::warning(nullptr, i18n("Extract a page range"),
+                             i18n("That name has no printable characters, so no notebook was made."));
+        return;
+    }
+
+    /// The directory is the new notebook's identity -- it is what Recent and the Start screen
+    /// remember -- so the name the user typed is the name it is stored under, inside the one
+    /// notebook folder.
+    const QString destination = QDir(PdfSession::projectRoot()).filePath(name);
+    PdfNotebookOps::ExtractOptions options;
+    if (QFileInfo::exists(destination)) {
+        /// Two notebooks made from the same pages is a decision for a person, and the one already
+        /// there may be the one they are working in.
+        if (QMessageBox::question(
+                nullptr, i18n("Extract a page range"),
+                i18n("A notebook called \"%1\" is already there. Replace it?", name))
+            != QMessageBox::Yes) {
+            return;
+        }
+        options.replaceExisting = true;
+    }
+
+    /// The open pages are written first, exactly as every other operation does, so the range that
+    /// is read off the manifest is the one that is on screen.
+    QString why;
+    if (!navigator->prepareForNotebookChange(&why)) {
+        QMessageBox::warning(nullptr, i18n("Extract a page range"),
+                             i18n("The notebook could not be written, so nothing was extracted: %1",
+                                  why));
+        return;
+    }
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::extractRange(
+        navigator->projectDir(), first, count, destination, options);
+    if (!outcome.ok) {
+        say(QStringLiteral("extract refused: %1").arg(outcome.why));
+        QMessageBox::warning(nullptr, i18n("Extract a page range"), outcome.why);
+        return;
+    }
+
+    say(outcome.summary);
+    /// Deferred, and close-first: the notebook that is open has to go before the new one is built.
+    QTimer::singleShot(0, PdfPageNavigator::instance(),
+                       [destination]() { openProjectDirReplacing(destination, 6); });
 }
 
 /// Runs one notebook-level operation the way its invariants require: write the open pages first,
@@ -724,6 +943,7 @@ void updateNotebookOpsActions(QMenu *ops)
     set("pdfio_ops_rotate_left", pages >= 1);
     /// A notebook keeps at least one page, and the engine refuses to delete the last one.
     set("pdfio_ops_delete", pages > 1);
+    set("pdfio_ops_extract_range", pages >= 1);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
 }
 
@@ -856,6 +1076,12 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
             return PdfNotebookOps::deletePages(dir, page, 1, page);
         });
     });
+
+    /// Extracting takes pages OUT of the notebook and into a new one, so it sits with the page
+    /// operations rather than with the whole-notebook ones below the separator.
+    QAction *extract = ops->addAction(i18n("Extract a page range..."));
+    extract->setObjectName(QStringLiteral("pdfio_ops_extract_range"));
+    QObject::connect(extract, &QAction::triggered, ops, []() { extractPageRange(); });
 
     ops->addSeparator();
 

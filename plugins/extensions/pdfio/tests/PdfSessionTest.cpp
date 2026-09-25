@@ -137,6 +137,12 @@ private Q_SLOTS:
     void testRotatingPagesWithoutArtifactsIsManifestOnly();
     void testARotationThatFailsChangesNothing();
 
+    /// Extracting a range: a notebook of its own beside the one it came from, carrying the sources
+    /// and the files its pages need, with the original untouched.
+    void testExtractingARangeMakesANotebook();
+    void testExtractingARangeThatSpansTwoSourcesKeepsBoth();
+    void testExtractingRefusesADestinationOrARangeThatCannotBeMade();
+
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
     void testRejectsEscapingManifestPaths();
@@ -1309,6 +1315,178 @@ void PdfSessionTest::testARotationThatFailsChangesNothing()
     /// And the half-written turn is gone.
     QVERIFY(!QFileInfo::exists(artifact + QStringLiteral(".rotating")));
     QVERIFY(!QFileInfo::exists(artifact + QStringLiteral(".rotating.layers.txt")));
+}
+
+/**
+ * Extracting a range writes a notebook of its own: the pages, the sources they are drawn from and
+ * the files they need, and nothing else. The notebook it came from is not touched.
+ */
+void PdfSessionTest::testExtractingARangeMakesANotebook()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    /// Files for the two pages that will be taken -- an artifact with known bytes, a sidecar layer
+    /// and a preview -- and for the page that stays behind, so "untouched" is about more than the
+    /// manifest.
+    const PdfPageRecord first = before.pages.at(0);
+    const PdfPageRecord second = before.pages.at(1);
+    const PdfPageRecord left = before.pages.at(2);
+    writeBytes(QDir(project).filePath(first.kraFile), QByteArrayLiteral("ink of page 1"));
+    writeBytes(QDir(project).filePath(first.kraFile + QStringLiteral(".layers/Inserted image.png")),
+               QByteArrayLiteral("a layer"));
+    writeBytes(QDir(project).filePath(first.thumbFile), QByteArrayLiteral("preview of page 1"));
+    /// Page 2 is left WITHOUT an artifact on purpose: a page that was never drawn on has none, and
+    /// the extracted notebook has to carry that hole rather than invent a file for it.
+    writeBytes(QDir(project).filePath(left.kraFile), QByteArrayLiteral("ink of page 3"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    const QString destination = dir.filePath(QStringLiteral("range-notebook"));
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::extractRange(project, 0, 2, destination);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// A notebook of its own, that opens.
+    QString why;
+    const PdfSessionManifest extracted = PdfSession::openProject(destination, &why);
+    QVERIFY2(extracted.isValid(&why), qPrintable(why));
+    QCOMPARE(extracted.pages.size(), 2);
+    QCOMPARE(extracted.sourceCount(), 1);
+    QCOMPARE(extracted.name, QStringLiteral("range-notebook"));
+    QCOMPARE(extracted.pages.at(0).kraFile, first.kraFile);
+    QCOMPARE(extracted.pages.at(1).kraFile, second.kraFile);
+
+    /// The files came with it, byte for byte, and so did the source they are drawn against.
+    QCOMPARE(readBytes(QDir(destination).filePath(first.kraFile)), QByteArrayLiteral("ink of page 1"));
+    QCOMPARE(readBytes(QDir(destination).filePath(first.thumbFile)),
+             QByteArrayLiteral("preview of page 1"));
+    QCOMPARE(readBytes(QDir(destination).filePath(first.kraFile
+                                                  + QStringLiteral(".layers/Inserted image.png"))),
+             QByteArrayLiteral("a layer"));
+    QVERIFY(QFileInfo::exists(QDir(destination).filePath(extracted.sourceFile)));
+    /// And the page that was never drawn on came across as a page with no artifact, not as one
+    /// with a file nothing wrote.
+    QVERIFY(!QFileInfo::exists(QDir(destination).filePath(second.kraFile)));
+
+    /// The page that was not extracted did not travel, and nothing where it was changed.
+    QVERIFY(!QFileInfo::exists(QDir(destination).filePath(left.kraFile)));
+    QCOMPARE(readBytes(QDir(project).filePath(left.kraFile)), QByteArrayLiteral("ink of page 3"));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+
+    /// Nothing was left beside the new notebook: it was built in a directory of its own and moved
+    /// into place, not assembled where it now is.
+    const QStringList leftovers =
+        QDir(dir.path()).entryList(QStringList() << QStringLiteral(".range-notebook-extracting-*"));
+    QVERIFY2(leftovers.isEmpty(), qPrintable(leftovers.join(QStringLiteral(", "))));
+
+    /// A page that was never drawn on has no artifact, and a range that holds it is no less valid
+    /// for that: the new notebook is exactly the pages that were asked for.
+    const QString lone = dir.filePath(QStringLiteral("lone-page"));
+    QVERIFY2(PdfNotebookOps::extractRange(project, 1, 1, lone).ok,
+             "one page of a three page notebook could not be extracted");
+    const PdfSessionManifest single = PdfSession::openProject(lone, &why);
+    QVERIFY2(single.isValid(&why), qPrintable(why));
+    QCOMPARE(single.pages.size(), 1);
+    QVERIFY(!QFileInfo::exists(QDir(lone).filePath(single.pages.at(0).kraFile)));
+}
+
+/**
+ * A range that spans two PDFs produces a notebook that carries both, and its pages say which one
+ * they come from -- the first page of the range decides which source is the new notebook's own.
+ */
+void PdfSessionTest::testExtractingARangeThatSpansTwoSourcesKeepsBoth()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend own;
+    QVERIFY(PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), own).isValid());
+
+    /// A page from another PDF, in the middle, so the range below spans both sources and starts
+    /// with the inserted one.
+    const QString otherPath = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend other;
+    QVERIFY(other.open(otherPath));
+    const PdfNotebookOps::Outcome inserted =
+        PdfNotebookOps::insertPages(project, 1, otherPath, other, 0, 1, 0);
+    QVERIFY2(inserted.ok, qPrintable(inserted.why));
+
+    QString why;
+    const PdfSessionManifest withTwo = PdfSession::openProject(project, &why);
+    QVERIFY2(withTwo.isValid(&why), qPrintable(why));
+    QCOMPARE(withTwo.sourceCount(), 2);
+    QCOMPARE(withTwo.pages.size(), 4);
+
+    const QString destination = dir.filePath(QStringLiteral("span"));
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::extractRange(project, 1, 3, destination);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    const PdfSessionManifest extracted = PdfSession::openProject(destination, &why);
+    QVERIFY2(extracted.isValid(&why), qPrintable(why));
+    QCOMPARE(extracted.pages.size(), 3);
+    QCOMPARE(extracted.sourceCount(), 2);
+
+    /// The first page of the range came from the second source, so that one is the new notebook's
+    /// own source, and the other page's record was remapped to follow it.
+    QCOMPARE(extracted.sourceFile, withTwo.sourceAt(1).file);
+    QCOMPARE(extracted.pages.at(0).source, 0);
+    QCOMPARE(extracted.pages.at(0).index, withTwo.pages.at(1).index);
+    QCOMPARE(extracted.pages.at(1).source, 1);
+    QCOMPARE(extracted.pages.at(1).index, withTwo.pages.at(2).index);
+
+    /// Both PDFs are inside the new notebook, at the names the manifest records: opening it checks
+    /// every one of them, which is what makes a copy that did not arrive intact impossible to miss.
+    QVERIFY(QFileInfo::exists(QDir(destination).filePath(extracted.sourceFile)));
+    QVERIFY(QFileInfo::exists(QDir(destination).filePath(extracted.sourceAt(1).file)));
+}
+
+/**
+ * A range that is not in the notebook, and a destination that is already someone's notebook, are
+ * both refused -- and the second one is refused without a byte written into it.
+ */
+void PdfSessionTest::testExtractingRefusesADestinationOrARangeThatCannotBeMade()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    QVERIFY(PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend).isValid());
+
+    QVERIFY(!PdfNotebookOps::extractRange(project, 2, 5, dir.filePath(QStringLiteral("outside"))).ok);
+    QVERIFY(!PdfNotebookOps::extractRange(project, 0, 0, dir.filePath(QStringLiteral("nothing"))).ok);
+    QVERIFY(!PdfNotebookOps::extractRange(project, 0, 1, QString()).ok);
+
+    /// A destination that already holds something is a decision for a person: refused, and left
+    /// exactly as it was.
+    const QString taken = dir.filePath(QStringLiteral("taken"));
+    QVERIFY(QDir().mkpath(taken));
+    writeBytes(QDir(taken).filePath(QStringLiteral("keep.txt")), QByteArrayLiteral("do not touch"));
+
+    const PdfNotebookOps::Outcome refused = PdfNotebookOps::extractRange(project, 0, 1, taken);
+    QVERIFY(!refused.ok);
+    QVERIFY2(refused.why.contains(QStringLiteral("already there")), qPrintable(refused.why));
+    QCOMPARE(readBytes(QDir(taken).filePath(QStringLiteral("keep.txt"))), QByteArrayLiteral("do not touch"));
+    QVERIFY(!QFileInfo::exists(QDir(taken).filePath(QStringLiteral("manifest.json"))));
+
+    /// With the decision made explicit, the same destination is replaced -- and what was there is
+    /// gone, which is what "replace" means.
+    PdfNotebookOps::ExtractOptions options;
+    options.replaceExisting = true;
+    const PdfNotebookOps::Outcome replaced =
+        PdfNotebookOps::extractRange(project, 0, 1, taken, options);
+    QVERIFY2(replaced.ok, qPrintable(replaced.why));
+    QVERIFY(QFileInfo::exists(QDir(taken).filePath(QStringLiteral("manifest.json"))));
+    QVERIFY(!QFileInfo::exists(QDir(taken).filePath(QStringLiteral("keep.txt"))));
+    QString why;
+    QVERIFY2(PdfSession::openProject(taken, &why).isValid(&why), qPrintable(why));
 }
 
 /**
