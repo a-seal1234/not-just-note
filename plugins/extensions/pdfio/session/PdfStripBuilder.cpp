@@ -141,6 +141,14 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
     /// went on landing on the first page whatever was done. A single layer cannot go wrong that
     /// way: whatever is drawn lands in it, and the page it belongs to is decided when the page is
     /// saved, by cropping the region that page occupies.
+    /// The layer now sits inside a group called Ink, which is the shape a single page has and the
+    /// one that was asked for: everything the notebook draws lives in the Ink group, and a layer
+    /// that ends up outside it is moved in rather than left floating beside the notebook.
+    ///
+    /// The layer keeps the name "Ink" as well, so every search for the paint layer called Ink still
+    /// finds it -- what changed is its parent, not its name.
+    KisGroupLayerSP inkGroup = new KisGroupLayer(strip.image, QStringLiteral("Ink"),
+                                                 OPACITY_OPAQUE_U8, strip.image->colorSpace());
     KisPaintLayerSP ink = new KisPaintLayer(strip.image, QStringLiteral("Ink"), OPACITY_OPAQUE_U8);
 
     /// Every page's saved ink goes back into that one layer, at its own place in the strip.
