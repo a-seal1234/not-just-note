@@ -6,6 +6,8 @@
 
 #include "AndroidDocumentPicker.h"
 
+#include <QTimer>
+
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -40,6 +42,65 @@ void reportJniException(const char *where)
     env->ExceptionDescribe();
     env->ExceptionClear();
     qWarning() << "[pdfio] JNI exception at" << where;
+}
+
+/// The name the file has where the user chose it, from the provider's _display_name column.
+///
+/// Without this, the copy a notebook is made from is called after the cache name it is written
+/// under -- "pdfio-picked" -- and everything derived from it follows: the notebook's folder, its
+/// name in a recent list, and the export suggestion ("pdfio-picked-notes.pdf"). Measured on the
+/// tablet as exactly that.
+///
+/// Every answer here is optional: an empty string means "no name", and the caller keeps the cache
+/// name it already had.
+QString displayNameForUri(const QString &uri)
+{
+    QJniObject activity = QJniObject::callStaticObjectMethod("org/qtproject/qt5/android/QtNative",
+                                                             "activity",
+                                                             "()Landroid/app/Activity;");
+    reportJniException("activity()");
+    if (!activity.isValid()) {
+        return QString();
+    }
+
+    QJniObject contentResolver = activity.callObjectMethod("getContentResolver",
+                                                           "()Landroid/content/ContentResolver;");
+    reportJniException("getContentResolver");
+    QJniObject juri = QJniObject::callStaticObjectMethod("android/net/Uri", "parse",
+                                                         "(Ljava/lang/String;)Landroid/net/Uri;",
+                                                         QJniObject::fromString(uri).object<jstring>());
+    reportJniException("Uri.parse");
+    if (!contentResolver.isValid() || !juri.isValid()) {
+        return QString();
+    }
+
+    QJniObject nothing;
+    QJniObject cursor = contentResolver.callObjectMethod(
+        "query",
+        "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)"
+        "Landroid/database/Cursor;",
+        juri.object(), nothing.object(), nothing.object(), nothing.object(), nothing.object());
+    reportJniException("ContentResolver.query");
+    if (!cursor.isValid()) {
+        return QString();
+    }
+
+    const jint column = cursor.callMethod<jint>(
+        "getColumnIndex", "(Ljava/lang/String;)I",
+        QJniObject::fromString(QStringLiteral("_display_name")).object<jstring>());
+    reportJniException("Cursor.getColumnIndex");
+
+    QString name;
+    if (column >= 0) {
+        QJniObject value = cursor.callObjectMethod("getString", "(I)Ljava/lang/String;", column);
+        if (value.isValid()) {
+            name = value.toString();
+        }
+    }
+    cursor.callMethod<void>("close", "()V");
+
+    /// Whatever the provider sent, only its last component is a file name.
+    return QFileInfo(name).fileName();
 }
 
 /// Copies what a content:// URI offers into a real file, and returns that path.
@@ -237,15 +298,27 @@ struct AndroidDocumentPicker::Private
         QJniObject text = uri.callObjectMethod("toString", "()Ljava/lang/String;");
         qWarning("[pdfio] picked uri: %s", qPrintable(text.toString()));
 
-        const QString local = copyContentToCache(text.toString(), pendingCacheName);
-        qWarning("[pdfio] copied to %s (%lld bytes)", qPrintable(local),
-                 qint64(local.isEmpty() ? 0 : QFileInfo(local).size()));
-        if (local.isEmpty()) {
-            done(QString(), QStringLiteral("the chosen file could not be copied"));
-            return;
-        }
+        /// The copy, and the question of what the file is called, happen one turn later rather
+        /// than inside this activity-result callback. Asking a provider for _display_name from in
+        /// here was tried before and the application went down on the way back from the picker;
+        /// after the callback has returned it is an ordinary JNI call. The name it gives is the one
+        /// the notebook, its folder and its export are named after.
+        const QString uriText = text.toString();
+        const QString fallbackName = pendingCacheName;
+        QTimer::singleShot(0, [this, uriText, fallbackName, done]() {
+            const QString displayName = displayNameForUri(uriText);
+            const QString local = copyContentToCache(
+                uriText, displayName.isEmpty() ? fallbackName : displayName);
+            qWarning("[pdfio] copied to %s (%lld bytes) [name %s]", qPrintable(local),
+                     qint64(local.isEmpty() ? 0 : QFileInfo(local).size()),
+                     qPrintable(displayName));
+            if (local.isEmpty()) {
+                done(QString(), QStringLiteral("the chosen file could not be copied"));
+                return;
+            }
 
-        done(local, QString());
+            done(local, QString());
+        });
     }
 };
 #endif
