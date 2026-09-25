@@ -20,6 +20,7 @@
 #include <QPixmap>
 #include <QResizeEvent>
 #include <QScrollBar>
+#include <QShowEvent>
 #include <QListWidget>
 #include <QPushButton>
 #include <QVBoxLayout>
@@ -71,7 +72,11 @@ PdfIoDocker::PdfIoDocker()
     m_pages->setResizeMode(QListView::Adjust);
     m_pages->setMovement(QListView::Static);
     m_pages->setWordWrap(true);
-    m_pages->setUniformItemSizes(true);
+    /// Not uniform: the cells are set explicitly from gridSize in refitCards(). With the uniform
+    /// cache on, the view takes every item's size from the first one it measured -- which is a
+    /// text-only item while the notebook is being filled -- and the cards stayed tiny on the tablet
+    /// however the icon and grid sizes were set.
+    m_pages->setUniformItemSizes(false);
     m_pages->setSpacing(4);
     /// The cards follow the list's own viewport, so the refit is driven from it rather than only
     /// from the docker: see eventFilter().
@@ -119,22 +124,25 @@ void PdfIoDocker::refitCards()
     /// One card per row is the shape a page selector wants: a page is recognised as a page, as
     /// large as the panel allows. Two only when the panel is genuinely wide enough for two
     /// comfortable cards, and never more than two -- a narrower panel must not turn the page into
-    /// a small strip beside another one. That is what the first attempt at this got wrong.
+    /// a small strip beside another one.
+    static constexpr int MinCardWidth = 140;
     static constexpr int MinComfortableCardWidth = 190;
     static constexpr int CardMargin = 24;
     static constexpr int MaxCardWidth = 320;
-    static constexpr int MinCardHeight = 96;
-    static constexpr int MaxCardHeight = 320;
     static constexpr qreal CardAspect = 1.414; // a portrait page: height / width
     static constexpr int CardSpacing = 12;
 
     const int viewportWidth = m_pages->viewport()->width();
     const int columns = viewportWidth >= 2 * MinComfortableCardWidth + CardMargin ? 2 : 1;
-    const int cardWidth = qMin(MaxCardWidth, qMax(1, (viewportWidth - CardMargin) / columns));
 
-    /// The card is the page's own shape. The height is bounded so a very wide panel does not
-    /// produce a card taller than any page.
-    const int cardHeight = qBound(MinCardHeight, qRound(cardWidth * CardAspect), MaxCardHeight);
+    /// The floor is the point: a card too small to read is not a preview. When the panel is
+    /// narrower than the floor the card keeps the floor and the list scrolls, rather than the page
+    /// being shrunk to a sliver -- which is what the user was looking at on the tablet.
+    const int cardWidth = qBound(MinCardWidth, (viewportWidth - CardMargin) / columns, MaxCardWidth);
+
+    /// The card is the page's own shape, so the whole page fits with no cropping; a thumbnail of a
+    /// different shape is letterboxed by the list's KeepAspectRatio scaling, never cut.
+    const int cardHeight = qRound(cardWidth * CardAspect);
     const QSize iconSize(cardWidth, cardHeight);
     const QSize gridSize(cardWidth + CardSpacing, cardHeight + CardSpacing);
 
@@ -144,6 +152,18 @@ void PdfIoDocker::refitCards()
 
     m_pages->setIconSize(iconSize);
     m_pages->setGridSize(gridSize);
+
+    /// Each cell is also given to the items explicitly, so a cell size can never be left over from
+    /// the size an item had before its thumbnail arrived.
+    for (int i = 0; i < m_pages->count(); ++i) {
+        if (QListWidgetItem *item = m_pages->item(i)) {
+            item->setSizeHint(gridSize);
+        }
+    }
+
+    /// One line per change, so the device log says what was computed for the room it had.
+    qWarning() << "pdfio: cards refit for a" << viewportWidth << "px viewport ->" << columns
+               << "column(s), icon" << iconSize << "grid" << gridSize;
 
     /// The thumbnails already on screen were scaled for the size the cards had a moment ago;
     /// re-reading them is what keeps a resize from leaving the old-sized icons behind.
@@ -168,6 +188,18 @@ bool PdfIoDocker::eventFilter(QObject *watched, QEvent *event)
         refitCards();
     }
     return QDockWidget::eventFilter(watched, event);
+}
+
+void PdfIoDocker::showEvent(QShowEvent *event)
+{
+    QDockWidget::showEvent(event);
+
+    /// The first layout gives the docker the width it will really have, after the constructor has
+    /// already sized the cards for a placeholder; the queued call is for the layout that lands
+    /// after this event. Both are needed: on the tablet neither the docker's resizeEvent nor the
+    /// viewport's was reached with the final width, and the cards stayed at the construction size.
+    refitCards();
+    QTimer::singleShot(0, this, &PdfIoDocker::refitCards);
 }
 
 QString PdfIoDocker::notebookName()
@@ -224,7 +256,11 @@ void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
         const QSignalBlocker blocker(m_pages);
         m_pages->clear();
         for (int i = 0; i < pageCount; ++i) {
-            m_pages->addItem(new QListWidgetItem(pageLabel(i)));
+            auto *item = new QListWidgetItem(pageLabel(i));
+            if (m_pages->gridSize().isValid()) {
+                item->setSizeHint(m_pages->gridSize());
+            }
+            m_pages->addItem(item);
         }
     }
 
@@ -253,6 +289,7 @@ void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
 
     m_previous->setEnabled(index > 0);
     m_next->setEnabled(index >= 0 && index + 1 < pageCount);
+
 }
 
 void PdfIoDocker::queueThumbnails()
@@ -289,6 +326,8 @@ void PdfIoDocker::updateThumbnail(int index)
         return;
     }
 
+    /// KeepAspectRatio, never a crop: a thumbnail of a different shape is letterboxed inside the
+    /// card so the whole page is always visible.
     m_pages->item(index)->setIcon(QIcon(pixmap.scaled(m_pages->iconSize(),
                                                       Qt::KeepAspectRatio,
                                                       Qt::SmoothTransformation)));

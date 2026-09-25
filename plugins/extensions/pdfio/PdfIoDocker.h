@@ -58,6 +58,11 @@ protected:
     /// changed. Without this the cards keep the width they were given at construction.
     bool eventFilter(QObject *watched, QEvent *event) override;
 
+    /// On the first show the docker is given its real width after construction, and on the tablet
+    /// no later resize reached the cards: the refit is run here and once more on the event loop,
+    /// so the size the first layout computes is the size that is painted.
+    void showEvent(QShowEvent *event) override;
+
 private:
     /// Recomputes the card size for the room the list has now.
     void refitCards();
