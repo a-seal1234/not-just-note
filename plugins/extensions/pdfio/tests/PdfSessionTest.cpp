@@ -82,6 +82,14 @@ private Q_SLOTS:
     void testUndoUndoesTheLastChangeOnly();
     void testTheExportGuardRefusesAPageListThatIsNotTheSourcesOrder();
 
+    /// Inserting pages from a PDF: it becomes a source of the notebook (copied into the project
+    /// once, reused after that), every inserted page gets its own artifact number, and nothing is
+    /// written for a page until it is drawn on.
+    void testInsertingPagesFromAnotherPdf();
+    void testUndoingAnInsertTakesTheCopiedPdfWithIt();
+    void testInsertingFromTheNotebooksOwnPdfReusesItsSource();
+    void testInsertingRefusesAPageRangeThePdfDoesNotHave();
+
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
     void testRejectsEscapingManifestPaths();
@@ -915,6 +923,189 @@ void PdfSessionTest::testTheExportGuardRefusesAPageListThatIsNotTheSourcesOrder(
     shorter.pages.removeLast();
     why.clear();
     QVERIFY2(PdfNotebookOps::exportIsOrderPreserving(shorter, &why), qPrintable(why));
+}
+
+/**
+ * Inserting pages from another PDF copies that PDF into the notebook once, records where each page
+ * came from, and gives every inserted page its own artifact number.
+ *
+ * This is what makes a notebook more than one PDF's pages: a page names the source its background
+ * is rendered from, so the file has to travel with the notebook, and the same PDF inserted a second
+ * time must not put a second copy of its bytes in the project.
+ */
+void PdfSessionTest::testInsertingPagesFromAnotherPdf()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend own;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), own);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+    QCOMPARE(before.sourceCount(), 1);
+
+    const QString otherPath = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend other;
+    QVERIFY(other.open(otherPath));
+    QVERIFY(other.pageCount() >= 2);
+
+    /// Two pages of it, at position 1: after the first page of the notebook.
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::insertPages(project, 1, otherPath, other, 0, 2, 1);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    /// The reader was on page 2, two pages arrived before it, so that page is now page 4.
+    QCOMPARE(outcome.anchorPage, 3);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 5);
+    QCOMPARE(after.sourceCount(), 2);
+
+    /// The PDF is inside the project, with the bytes and the checksum the manifest records.
+    const PdfSourceRecord source = after.sourceAt(1);
+    QVERIFY2(source.file.startsWith(QStringLiteral("sources/")), qPrintable(source.file));
+    QVERIFY(QFileInfo::exists(QDir(project).filePath(source.file)));
+    QCOMPARE(PdfSessionManifest::sha256OfFile(QDir(project).filePath(source.file)),
+             PdfSessionManifest::sha256OfFile(otherPath));
+
+    /// Each inserted page says which source it is from and which page of it it is, with the
+    /// geometry the renderer reports -- which is what puts the background back under the ink.
+    for (int i = 0; i < 2; ++i) {
+        const PdfPageRecord page = after.pages.at(1 + i);
+        QCOMPARE(page.source, 1);
+        QCOMPARE(page.index, i);
+        QCOMPARE(page.sizePt, other.pageInfo(i).sizePt);
+        QCOMPARE(page.rotation, other.pageInfo(i).rotation);
+    }
+
+    /// Its own number from the allocator, and no artifact yet: a page that was never drawn on has
+    /// none, which is what keeps a notebook proportional to what was written on it.
+    QCOMPARE(after.pages.at(1).kraFile, PdfSession::pageFileNameForNumber(4));
+    QCOMPARE(after.pages.at(2).kraFile, PdfSession::pageFileNameForNumber(5));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(after.pages.at(1).kraFile)));
+
+    /// The same PDF inserted again: one source, not two, and one copy of its bytes.
+    const PdfNotebookOps::Outcome again =
+        PdfNotebookOps::insertPages(project, 5, otherPath, other, 0, 1, 0);
+    QVERIFY2(again.ok, qPrintable(again.why));
+    const PdfSessionManifest twice = PdfSession::openProject(project, &why);
+    QCOMPARE(twice.sourceCount(), 2);
+    QCOMPARE(twice.pages.size(), 6);
+    QCOMPARE(twice.pages.at(5).source, 1);
+    QCOMPARE(twice.pages.at(5).index, 0);
+
+    /// Undo is one change deep, so this undoes the SECOND insert and leaves the first: five pages
+    /// again, and the copied PDF still there, because the pages that came with it still draw on it.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    const PdfSessionManifest back = PdfSession::openProject(project, &why);
+    QVERIFY2(back.isValid(&why), qPrintable(why));
+    QCOMPARE(back.pages.size(), 5);
+    QCOMPARE(back.sourceCount(), 2);
+    QVERIFY2(QFileInfo::exists(QDir(project).filePath(source.file)),
+             "an undo took a copied source away while pages still draw on it");
+}
+
+/**
+ * Undoing the insert that brought a PDF in takes the copied PDF away with it: the copy was that
+ * change's, so nothing else in the notebook references it afterwards.
+ */
+void PdfSessionTest::testUndoingAnInsertTakesTheCopiedPdfWithIt()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend own;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), own);
+    QVERIFY(before.isValid());
+
+    const QString otherPath = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend other;
+    QVERIFY(other.open(otherPath));
+
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::insertPages(project, 0, otherPath, other, 0, 2, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    QString why;
+    const PdfSourceRecord source = PdfSession::openProject(project, &why).sourceAt(1);
+    QVERIFY(QFileInfo::exists(QDir(project).filePath(source.file)));
+
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+    QVERIFY2(!QFileInfo::exists(QDir(project).filePath(source.file)),
+             "the copied PDF stayed behind after the insert that brought it in was undone");
+}
+
+/**
+ * Inserting pages of the notebook's own PDF adds no source and copies nothing.
+ */
+void PdfSessionTest::testInsertingFromTheNotebooksOwnPdfReusesItsSource()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    /// The copy inside the project, which is the file whose pages the notebook draws from today.
+    const QString copied = PdfSession::sourcePath(project, before.sourceFile);
+    PopplerRenderBackend own;
+    QVERIFY(own.open(copied));
+
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::insertPages(project, 3, copied, own, 0, 1, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 4);
+    QCOMPARE(after.sourceCount(), 1);
+    QCOMPARE(after.pages.at(3).source, 0);
+    QCOMPARE(after.pages.at(3).index, 0);
+
+    /// Nothing was copied: the same content already has a home in this project.
+    QVERIFY2(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("sources"))),
+             "a copy was made of a PDF the notebook already has");
+}
+
+void PdfSessionTest::testInsertingRefusesAPageRangeThePdfDoesNotHave()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend own;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), own);
+    QVERIFY(before.isValid());
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    const QString otherPath = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend other;
+    QVERIFY(other.open(otherPath));
+    QVERIFY(other.pageCount() >= 2);
+
+    /// More pages than the file has: refused whole, with nothing copied and nothing journalled.
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::insertPages(project, 0, otherPath, other, 1, 100, 0);
+    QVERIFY(!outcome.ok);
+    QVERIFY2(outcome.why.contains(QStringLiteral("page")), qPrintable(outcome.why));
+
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("sources"))));
+    QVERIFY(!PdfNotebookOps::canUndo(project));
 }
 
 /**

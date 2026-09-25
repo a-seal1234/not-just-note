@@ -12,6 +12,8 @@
 #include <QString>
 #include <QStringList>
 
+class PdfRenderBackend;
+
 /**
  * The notebook-level operations, as changes to the files on disk.
  *
@@ -72,6 +74,35 @@ public:
      * the other.
      */
     static Outcome duplicatePage(const QString &projectDir, int page, int currentPage = -1);
+
+    /**
+     * Inserts \a count pages of \a pdfPath, starting at its page \a firstPage, at the notebook
+     * position \a at (0 is before every page, the page count is after all of them).
+     *
+     * The PDF becomes one of the notebook's sources. When a source with the same content is already
+     * one of them -- the notebook's own PDF, or a PDF inserted before -- its pages are drawn from
+     * that entry and nothing is copied. Otherwise the file is copied into the project under
+     * sources/<sha8>-<name>.pdf, and every page that comes from it names that entry. The name is
+     * relative and inside the project, like every other name the manifest carries.
+     *
+     * Each inserted page takes its own artifact number from the allocator, so the same PDF page can
+     * be inserted twice and the two copies stay independent. Nothing is written for a page until it
+     * is drawn on: a page with no ink has no artifact, which is what keeps a notebook proportional
+     * to what was written on it rather than to how many pages it has.
+     *
+     * \a backend has to be open on \a pdfPath: the page geometry comes from the renderer, and what
+     * is recorded is what puts the background back under the ink. \a count of -1 means "to the end
+     * of the file".
+     */
+    static Outcome insertPages(const QString &projectDir, int at, const QString &pdfPath,
+                               PdfRenderBackend &backend, int firstPage = 0, int count = -1,
+                               int currentPage = -1);
+
+    /**
+     * Where a copy of \a pdfPath would live inside a project: sources/<sha8>-<name>.pdf. Exposed
+     * for the log, and for a caller that wants to say where the pages are about to come from.
+     */
+    static QString sourceFileNameFor(const QString &pdfPath);
 
     /**
      * Deletes \a count pages starting at \a first.

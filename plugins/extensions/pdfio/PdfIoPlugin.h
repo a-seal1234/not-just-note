@@ -37,6 +37,16 @@ public:
      */
     bool openNotebook(const QString &pdfPath);
 
+    /**
+     * Picks a PDF and inserts its pages into the notebook after the page that is open.
+     *
+     * Deliberately not private, like openNotebook() above: the "Notebook ops" submenu is built by a
+     * helper in this file rather than by a member, and a helper cannot take the address of a private
+     * slot. The picker is platform-specific -- a file dialog on the desktop, the system document
+     * picker on Android -- which is what makes it a slot rather than a lambda in the menu.
+     */
+    void slotInsertPages();
+
 private Q_SLOTS:
     void slotOpenNotebook();
 

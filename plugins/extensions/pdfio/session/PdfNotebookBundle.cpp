@@ -450,15 +450,6 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
     }
     const PdfSessionManifest &manifest = analysis->info.manifest;
 
-    /// The same rule on the way in: a manifest naming more than one source describes a notebook
-    /// this format cannot rebuild, because the archive carries exactly one PDF. Refused here rather
-    /// than extracted into a notebook whose other pages would render blank.
-    if (manifest.sourceCount() > 1) {
-        fail(why, QStringLiteral("the bundle's notebook draws pages from %1 PDFs; this format "
-                                 "carries one").arg(manifest.sourceCount()));
-        return false;
-    }
-
     /// Every file the manifest names, before one of them is joined onto a destination. The archive
     /// is not the only place a path comes from, and this is the check that keeps a hostile
     /// manifest from choosing where the source is written.
@@ -466,30 +457,46 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
         return false;
     }
 
-    /// The source. Normally at the name the manifest records; a bundle written by hand may simply
-    /// have called it source.pdf, which is the same thing under the name the format documents.
-    QString sourceEntry = manifest.sourceFile;
-    if (!findEntry(analysis->files, sourceEntry)) {
-        if (findEntry(analysis->files, QStringLiteral("source.pdf"))) {
-            sourceEntry = QStringLiteral("source.pdf");
-        } else {
-            fail(why, QStringLiteral("the bundle does not carry the source %1").arg(manifest.sourceFile));
+    /// Every source the notebook draws pages from. The first is normally at the name the manifest
+    /// records, and a bundle written by hand may simply have called it source.pdf; every other one
+    /// has to be where the manifest says, because that name is what its pages resolve against.
+    QHash<QString, PdfNotebookBundle::Entry> verifiedSources;
+    for (int i = 0; i < manifest.sourceCount(); ++i) {
+        const PdfSourceRecord source = manifest.sourceAt(i);
+        QString entry = source.file;
+        if (!findEntry(analysis->files, entry)) {
+            if (i == 0 && findEntry(analysis->files, QStringLiteral("source.pdf"))) {
+                entry = QStringLiteral("source.pdf");
+            } else {
+                fail(why, i == 0
+                              ? QStringLiteral("the bundle does not carry the source %1").arg(source.file)
+                              : QStringLiteral("the bundle does not carry the source %1, which the "
+                                               "notebook's pages draw their background from")
+                                    .arg(source.file));
+                return false;
+            }
+        }
+        analysis->info.sourceEntries.append(entry);
+
+        QByteArray sha;
+        qint64 bytes = 0;
+        if (!hashEntry(findEntry(analysis->files, entry), &sha, &bytes, why)) {
             return false;
         }
-    }
-    analysis->info.sourceEntry = sourceEntry;
+        if (sha != source.sha256 || (source.byteSize > 0 && bytes != source.byteSize)) {
+            fail(why, QStringLiteral("the source %1 inside the bundle does not match the checksum the "
+                                     "manifest records for it: it was changed or the bundle was edited")
+                          .arg(source.file));
+            return false;
+        }
 
-    QByteArray sourceSha;
-    qint64 sourceBytes = 0;
-    if (!hashEntry(findEntry(analysis->files, sourceEntry), &sourceSha, &sourceBytes, why)) {
-        return false;
+        PdfNotebookBundle::Entry verified;
+        verified.path = entry;
+        verified.bytes = bytes;
+        verified.sha256 = sha;
+        verifiedSources.insert(entry, verified);
     }
-    if (sourceSha != manifest.sourceSha256
-        || (manifest.sourceByteSize > 0 && sourceBytes != manifest.sourceByteSize)) {
-        fail(why, QStringLiteral("the source inside the bundle does not match the checksum the manifest "
-                                 "records for it: it was changed or the bundle was edited"));
-        return false;
-    }
+    analysis->info.sourceEntry = analysis->info.sourceEntries.value(0);
 
     if (const KArchiveFile *indexFile = findEntry(analysis->files, QLatin1String(BundleIndexName))) {
         if (!readIndex(indexFile, analysis, why)) {
@@ -502,9 +509,11 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
     const auto carry = [&](const QString &path, const KArchiveFile *file) {
         PdfNotebookBundle::Entry entry;
         entry.path = path;
-        if (path == sourceEntry) {
-            entry.bytes = sourceBytes;
-            entry.sha256 = sourceSha;
+        /// A source was hashed while it was verified above; every other file is hashed here.
+        const PdfNotebookBundle::Entry verified = verifiedSources.value(path);
+        if (!verified.sha256.isEmpty()) {
+            entry.bytes = verified.bytes;
+            entry.sha256 = verified.sha256;
         } else if (!hashEntry(file, &entry.sha256, &entry.bytes, why)) {
             return false;
         }
@@ -515,8 +524,10 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
     if (!carry(QLatin1String(ManifestName), manifestFile)) {
         return false;
     }
-    if (!carry(sourceEntry, findEntry(analysis->files, sourceEntry))) {
-        return false;
+    for (const QString &sourceEntry : analysis->info.sourceEntries) {
+        if (!carry(sourceEntry, findEntry(analysis->files, sourceEntry))) {
+            return false;
+        }
     }
 
     for (const PdfPageRecord &page : manifest.pages) {
@@ -576,7 +587,9 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
     QSet<QString> known;
     known.insert(QLatin1String(ManifestName));
     known.insert(QLatin1String(BundleIndexName));
-    known.insert(sourceEntry);
+    for (const QString &sourceEntry : analysis->info.sourceEntries) {
+        known.insert(sourceEntry);
+    }
     for (const PdfNotebookBundle::Entry &entry : carried) {
         known.insert(entry.path);
     }
@@ -592,7 +605,7 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
 /// Writes the archive at \a path: the carried files first, then the index that describes them.
 bool writeBundleFile(const QString &path,
                      const QList<QPair<QString, QString>> &carried,
-                     const QString &sourceEntry,
+                     const QStringList &sourceEntries,
                      const QStringList &withheld,
                      QString *why)
 {
@@ -653,7 +666,12 @@ bool writeBundleFile(const QString &path,
 
     QJsonObject index;
     index.insert(QStringLiteral("bundle"), BundleIndexSchema);
-    index.insert(QStringLiteral("source"), sourceEntry);
+    index.insert(QStringLiteral("source"), sourceEntries.value(0));
+    if (sourceEntries.size() > 1) {
+        /// Informational, like "source": the manifest is what decides where each file goes on the
+        /// way back in. It is here so a reader can see what the archive was supposed to carry.
+        index.insert(QStringLiteral("sources"), QJsonArray::fromStringList(sourceEntries));
+    }
     index.insert(QStringLiteral("entries"), entryArray);
     if (!withheld.isEmpty()) {
         index.insert(QStringLiteral("withheld"), QJsonArray::fromStringList(withheld));
@@ -751,35 +769,35 @@ bool PdfNotebookBundle::save(const QString &projectDir, const QString &outPath, 
         return false;
     }
 
-    /// One source is what this format carries, and it verifies that one. A notebook that was given
-    /// pages from another PDF has more than one, and writing it out here would silently leave those
-    /// pages' backgrounds behind: the bundle would unpack into a notebook that renders blank paper
-    /// where those pages are, with nothing said at either end.
-    if (manifest.sourceCount() > 1) {
-        fail(why, QStringLiteral("this notebook draws pages from %1 PDFs and the one-file form "
-                                 "carries only one, so the pages that come from %2 would lose "
-                                 "their background")
-                      .arg(manifest.sourceCount())
-                      .arg(manifest.sourceAt(1).file));
-        return false;
-    }
-
     /// A project whose manifest names a file outside itself would have that file read into the
     /// bundle: the same rule as on the way in, for the same reason.
     if (!validateManifestPaths(manifest, why)) {
         return false;
     }
 
-    const QString source = PdfSession::sourcePath(projectDir, manifest.sourceFile);
-    if (!QFileInfo::exists(source)) {
-        fail(why, QStringLiteral("the notebook has no source at %1").arg(source));
-        return false;
-    }
-    /// The bundle is only worth as much as the identity it carries: a source that no longer
-    /// matches the manifest would produce a file that its own reader refuses.
-    if (PdfSessionManifest::sha256OfFile(source) != manifest.sourceSha256) {
-        fail(why, QStringLiteral("the source %1 changed since the notebook was created").arg(manifest.sourceFile));
-        return false;
+    /// Every source travels, and every one is checked. A notebook whose pages were inserted from
+    /// another PDF draws those pages' backgrounds from that file, so a bundle carrying only the
+    /// first would unpack into a notebook that renders blank paper there, with nothing said at
+    /// either end.
+    QStringList sourceEntries;
+    for (int i = 0; i < manifest.sourceCount(); ++i) {
+        const PdfSourceRecord source = manifest.sourceAt(i);
+        const QString local = PdfSession::sourcePath(projectDir, source.file);
+        if (!QFileInfo::exists(local)) {
+            fail(why, i == 0
+                          ? QStringLiteral("the notebook has no source at %1").arg(local)
+                          : QStringLiteral("the notebook's source %1, which its pages draw their "
+                                           "background from, is not there").arg(source.file));
+            return false;
+        }
+        /// The bundle is only worth as much as the identity it carries: a source that no longer
+        /// matches the manifest would produce a file that its own reader refuses.
+        if (PdfSessionManifest::sha256OfFile(local) != source.sha256) {
+            fail(why, QStringLiteral("the source %1 changed since the notebook was created")
+                          .arg(source.file));
+            return false;
+        }
+        sourceEntries.append(source.file);
     }
 
     QList<QPair<QString, QString>> carried;
@@ -793,7 +811,9 @@ bool PdfNotebookBundle::save(const QString &projectDir, const QString &outPath, 
     };
 
     carry(QLatin1String(ManifestName), PdfSession::manifestPath(projectDir));
-    carry(manifest.sourceFile, source);
+    for (const QString &sourceEntry : sourceEntries) {
+        carry(sourceEntry, PdfSession::sourcePath(projectDir, sourceEntry));
+    }
 
     /// A page that was never drawn on has no ink file and most pages have no thumbnail, so
     /// whatever is not there is declared withheld rather than left to be discovered as a hole.
@@ -848,7 +868,7 @@ bool PdfNotebookBundle::save(const QString &projectDir, const QString &outPath, 
     const QString temporary = QStringLiteral("%1.part-%2").arg(outPath).arg(QCoreApplication::applicationPid());
     QFile::remove(temporary);
 
-    if (!writeBundleFile(temporary, carried, manifest.sourceFile, withheld, why)) {
+    if (!writeBundleFile(temporary, carried, sourceEntries, withheld, why)) {
         QFile::remove(temporary);
         return false;
     }
@@ -943,16 +963,21 @@ bool PdfNotebookBundle::extract(const QString &bundlePath,
         return false;
     }
 
-    /// The source goes to the name the manifest records, which is not necessarily the name the
-    /// entry was stored under: a bundle may call it source.pdf, and the project cannot. That name
-    /// was checked by validateManifestPaths() and is checked again here against the staging root,
-    /// because it is the manifest's string that decides where this write goes.
-    QString stagedSource;
-    if (!destinationInside(stagingPath, manifest.sourceFile, &stagedSource, why)) {
-        return false;
-    }
-    if (!copyEntryTo(findEntry(analysis.files, analysis.info.sourceEntry), stagedSource, why)) {
-        return false;
+    /// Every source goes to the name the manifest records, which is not necessarily the name the
+    /// entry was stored under: a bundle may call the first one source.pdf, and the project cannot.
+    /// Those names were checked by validateManifestPaths() and are checked again here against the
+    /// staging root, because it is the manifest's string that decides where each write goes.
+    QStringList stagedSources;
+    for (int i = 0; i < manifest.sourceCount(); ++i) {
+        QString stagedSource;
+        if (!destinationInside(stagingPath, manifest.sourceAt(i).file, &stagedSource, why)) {
+            return false;
+        }
+        const QString entry = analysis.info.sourceEntries.value(i);
+        if (!copyEntryTo(findEntry(analysis.files, entry), stagedSource, why)) {
+            return false;
+        }
+        stagedSources.append(stagedSource);
     }
 
     for (const PdfPageRecord &page : manifest.pages) {
@@ -1000,9 +1025,12 @@ bool PdfNotebookBundle::extract(const QString &bundlePath,
         fail(why, QStringLiteral("the manifest written out of the bundle does not match the one it carried"));
         return false;
     }
-    if (PdfSessionManifest::sha256OfFile(stagedSource) != manifest.sourceSha256) {
-        fail(why, QStringLiteral("the source written out of the bundle does not match the manifest"));
-        return false;
+    for (int i = 0; i < manifest.sourceCount(); ++i) {
+        if (PdfSessionManifest::sha256OfFile(stagedSources.value(i)) != manifest.sourceAt(i).sha256) {
+            fail(why, QStringLiteral("the source %1 written out of the bundle does not match the "
+                                     "manifest").arg(manifest.sourceAt(i).file));
+            return false;
+        }
     }
 
     if (ignoredEntries) {

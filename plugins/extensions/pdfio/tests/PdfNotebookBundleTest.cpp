@@ -253,7 +253,7 @@ private Q_SLOTS:
     void testRefusesANewerSchema();
     void testRefusesAnOlderSchema();
     void testReadsABundleWrittenBeforeSourcesExisted();
-    void testSaveRefusesANotebookWithTwoSources();
+    void testCarriesNotebooksWithMoreThanOneSource();
     void testRefusesZipSlip();
     void testRefusesAChangedSource();
     void testRefusesAReferencedArtifactTheArchiveLacks();
@@ -621,26 +621,28 @@ void PdfNotebookBundleTest::testReadsABundleWrittenBeforeSourcesExisted()
 }
 
 /**
- * A notebook whose pages come from two PDFs is refused by the one-file form, rather than written
- * without its second source.
+ * A notebook whose pages come from more than one PDF is carried whole.
  *
- * The archive carries exactly one PDF and verifies that one. Writing this notebook out would
- * produce a file that unpacks into a notebook whose pages from the other PDF render blank, with
- * nothing said at either end -- so it is refused until the format carries sources[].
+ * Insert pages from another PDF leaves a notebook with two sources and pages drawn from each, and
+ * the one-file form is how a notebook leaves the device: carrying only the first would unpack into
+ * a notebook whose inserted pages render blank, with nothing said at either end. Both PDFs travel,
+ * both are verified on the way in and on the way out, and the extracted notebook opens with the
+ * page list it was packed with.
+ *
+ * This was the refusal until Notebook ops stage C made the format carry every source.
  */
-void PdfNotebookBundleTest::testSaveRefusesANotebookWithTwoSources()
+void PdfNotebookBundleTest::testCarriesNotebooksWithMoreThanOneSource()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
-
     const QString project = dir.filePath(QStringLiteral("project"));
     PdfSessionManifest manifest = makeProject(project, 2, 2, 2);
 
-    /// A second source inside the project, and a page that draws from it.
+    /// A second source beside the first, as an insert leaves it, and a page that draws from it.
     QVERIFY(QDir().mkpath(QDir(project).filePath(QStringLiteral("sources"))));
     const QString extra = QStringLiteral("sources/9f3a1c02-handout.pdf");
-    QVERIFY(QFile::copy(QDir(project).filePath(QStringLiteral("source.pdf")),
-                        QDir(project).filePath(extra)));
+    const QByteArray extraBytes = filler(QStringLiteral("handout"), 4096);
+    writeBytes(QDir(project).filePath(extra), extraBytes);
 
     PdfSourceRecord first;
     first.file = manifest.sourceFile;
@@ -649,7 +651,7 @@ void PdfNotebookBundleTest::testSaveRefusesANotebookWithTwoSources()
     PdfSourceRecord second;
     second.file = extra;
     second.sha256 = PdfSessionManifest::sha256OfFile(QDir(project).filePath(extra));
-    second.byteSize = QFileInfo(QDir(project).filePath(extra)).size();
+    second.byteSize = extraBytes.size();
     manifest.sources.clear();
     manifest.sources << first << second;
     manifest.pages[1].source = 1;
@@ -659,11 +661,40 @@ void PdfNotebookBundleTest::testSaveRefusesANotebookWithTwoSources()
              qPrintable(why));
 
     const QString bundle = dir.filePath(QStringLiteral("two-sources.pnb"));
+    QVERIFY2(PdfNotebookBundle::save(project, bundle, &why), qPrintable(why));
+
+    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(bundle, &why);
+    QVERIFY2(info.isValid(), qPrintable(why));
+    QCOMPARE(info.manifest.sourceCount(), 2);
+    QCOMPARE(info.sourceEntries.size(), 2);
+    QCOMPARE(info.sourceEntries.at(0), manifest.sourceFile);
+    QVERIFY2(info.sourceEntries.contains(extra),
+             qPrintable(info.sourceEntries.join(QStringLiteral(", "))));
+
+    const QString dest = dir.filePath(QStringLiteral("unpacked"));
+    QVERIFY2(PdfNotebookBundle::extract(bundle, dest, &why), qPrintable(why));
+
+    /// Both PDFs came out, byte for byte, and the notebook opens with the page list it carried.
+    QCOMPARE(readBytes(QDir(dest).filePath(manifest.sourceFile)),
+             readBytes(QDir(project).filePath(manifest.sourceFile)));
+    QCOMPARE(readBytes(QDir(dest).filePath(extra)), extraBytes);
+
+    const PdfSessionManifest back = PdfSession::openProject(dest, &why);
+    QVERIFY2(back.isValid(&why), qPrintable(why));
+    QCOMPARE(back.sourceCount(), 2);
+    QCOMPARE(back.pages.at(1).source, 1);
+
+    /// And the second source is still checked: one that changed under the notebook is refused on
+    /// the way out rather than packed as if it were the file the pages were drawn from.
+    {
+        QFile file(QDir(project).filePath(extra));
+        QVERIFY(file.open(QIODevice::Append));
+        file.write(" ");
+    }
     why.clear();
-    QVERIFY2(!PdfNotebookBundle::save(project, bundle, &why),
-             "the notebook was written out without its second source");
-    QVERIFY2(why.contains(QStringLiteral("draws pages from 2 PDFs")), qPrintable(why));
-    QVERIFY(!QFileInfo::exists(bundle));
+    QVERIFY2(!PdfNotebookBundle::save(project, dir.filePath(QStringLiteral("changed.pnb")), &why),
+             "a notebook whose second source changed was packed anyway");
+    QVERIFY2(why.contains(extra), qPrintable(why));
 }
 
 void PdfNotebookBundleTest::testRefusesZipSlip()

@@ -6,6 +6,7 @@
 
 #include "session/PdfNotebookOps.h"
 
+#include "backend/PdfRenderBackend.h"
 #include "session/PdfSession.h"
 
 #include <QDir>
@@ -53,6 +54,9 @@ struct Plan {
     QList<QPair<QString, QString>> copyDirs;
     /// relative source -> relative destination, single files. Copied before the manifest.
     QList<QPair<QString, QString>> copyFiles;
+    /// absolute source outside the project -> relative destination inside it: a PDF being inserted.
+    /// Copied before the manifest, like everything else that manifest is about to name.
+    QList<QPair<QString, QString>> copyExternal;
     /// relative paths the journal takes over after the manifest is committed.
     QStringList removeAfter;
     /// relative paths this operation creates, for the rollback and for an undo.
@@ -220,6 +224,16 @@ bool applyPlan(const QString &projectDir, const Plan &plan, QString *why)
             return false;
         }
     }
+    for (const QPair<QString, QString> &pair : plan.copyExternal) {
+        const QString destination = project.filePath(pair.second);
+        if (!QDir().mkpath(QFileInfo(destination).absolutePath())
+            || !QFile::copy(pair.first, destination)) {
+            fail(why, QStringLiteral("cannot copy %1 into the notebook").arg(pair.first));
+            undoCreatedFiles(projectDir, plan);
+            QDir(journal).removeRecursively();
+            return false;
+        }
+    }
     for (const QPair<QString, QString> &pair : plan.copyFiles) {
         if (!QFileInfo::exists(project.filePath(pair.first))) {
             continue;
@@ -280,6 +294,34 @@ int remapAfterDelete(int page, int first, int count)
         return page - count;
     }
     return -1;
+}
+
+/// A file name that is safe to put under sources/: printable, with no separator in it. A backslash
+/// is refused because the manifest's own path rule refuses it, and this name is going into the
+/// manifest.
+QString safeSourceBase(const QString &pdfPath)
+{
+    QString clean;
+    for (const QChar character : QFileInfo(pdfPath).completeBaseName()) {
+        if (character.isPrint() && character != QLatin1Char('/') && character != QLatin1Char('\\')) {
+            clean.append(character);
+        }
+    }
+    clean = clean.trimmed();
+    if (clean.size() > 64) {
+        clean.truncate(64);
+    }
+    return clean.isEmpty() ? QStringLiteral("source") : clean;
+}
+
+/// sources/<sha8>-<name>.pdf, with an ordinal when that name is already taken by other content.
+/// The checksum prefix is what makes two different PDFs with the same file name two files.
+QString sourceRelativeName(const QByteArray &sha256, const QString &base, int ordinal)
+{
+    const QString key = QString::fromLatin1(sha256.left(8));
+    const QString stem = ordinal <= 1 ? QStringLiteral("%1-%2").arg(key, base)
+                                      : QStringLiteral("%1-%2-%3").arg(key, base).arg(ordinal);
+    return QStringLiteral("sources/%1.pdf").arg(stem);
 }
 
 bool loadManifest(const QString &projectDir, PdfSessionManifest *manifest, QString *why)
@@ -400,6 +442,151 @@ PdfNotebookOps::Outcome PdfNotebookOps::duplicatePage(const QString &projectDir,
     outcome.anchorPage = qBound(0, currentPage >= page + 1 ? currentPage + 1 : currentPage, count);
     outcome.summary = plan.summary;
     return outcome;
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::insertPages(const QString &projectDir, int at,
+                                                    const QString &pdfPath,
+                                                    PdfRenderBackend &backend,
+                                                    int firstPage, int count, int currentPage)
+{
+    PdfSessionManifest before;
+    QString why;
+    if (!loadManifest(projectDir, &before, &why)) {
+        return refused(why);
+    }
+
+    if (!QFileInfo::exists(pdfPath)) {
+        return refused(QStringLiteral("there is no PDF at %1").arg(pdfPath));
+    }
+    if (!backend.isOpen()) {
+        return refused(QStringLiteral("the renderer is not open on %1").arg(pdfPath));
+    }
+
+    const int sourcePages = backend.pageCount();
+    if (count < 0) {
+        count = sourcePages - firstPage;
+    }
+    if (firstPage < 0 || count < 1 || firstPage + count > sourcePages) {
+        return refused(QStringLiteral("pages %1..%2 are not in %3: it has %4 page(s)")
+                           .arg(firstPage + 1)
+                           .arg(firstPage + count)
+                           .arg(QFileInfo(pdfPath).fileName())
+                           .arg(sourcePages));
+    }
+
+    const int pages = before.pages.size();
+    if (at < 0 || at > pages) {
+        return refused(QStringLiteral("pages cannot be inserted at position %1: the notebook has %2 page(s)")
+                           .arg(at + 1)
+                           .arg(pages));
+    }
+    if (currentPage < 0 || currentPage >= pages) {
+        currentPage = at > 0 ? at - 1 : 0;
+    }
+
+    const QByteArray sha = PdfSessionManifest::sha256OfFile(pdfPath);
+    if (sha.isEmpty()) {
+        return refused(QStringLiteral("%1 cannot be read").arg(pdfPath));
+    }
+
+    Plan plan;
+    plan.after = before;
+    plan.opName = "insert";
+
+    /// The PDF becomes a source, or its pages are drawn from one that is already there. Inserting a
+    /// notebook's own PDF, or the same handout twice, must not leave two copies of the same bytes in
+    /// the project -- and an empty sources[] means "one source: the fields beside it", which has to
+    /// become the first entry of the list before anything can be appended to it.
+    int sourceIndex = plan.after.sourceIndexForSha(sha);
+    if (sourceIndex < 0) {
+        if (plan.after.sources.isEmpty()) {
+            PdfSourceRecord existing;
+            existing.file = plan.after.sourceFile;
+            existing.sha256 = plan.after.sourceSha256;
+            existing.byteSize = plan.after.sourceByteSize;
+            plan.after.sources.append(existing);
+        }
+
+        const QString base = safeSourceBase(pdfPath);
+        QString relative = sourceRelativeName(sha, base, 1);
+        /// A name already taken inside the project by different content -- another file whose first
+        /// eight hex digits agree, or a file put there by hand. The content is what the manifest
+        /// records, so the name gives way, not the source.
+        const QDir project(projectDir);
+        int ordinal = 1;
+        while (QFileInfo::exists(project.filePath(relative))
+               && PdfSessionManifest::sha256OfFile(project.filePath(relative)) != sha) {
+            relative = sourceRelativeName(sha, base, ++ordinal);
+        }
+
+        PdfSourceRecord source;
+        source.file = relative;
+        source.sha256 = sha;
+        source.byteSize = QFileInfo(pdfPath).size();
+        sourceIndex = plan.after.sources.size();
+        plan.after.sources.append(source);
+
+        /// A file with that name and that content is already there -- a leftover nothing
+        /// references, from an operation that was undone. Copying over it would be pointless and
+        /// listing it as created would make an undo delete a file the notebook already had.
+        if (!QFileInfo::exists(project.filePath(relative))) {
+            plan.copyExternal.append(qMakePair(pdfPath, relative));
+            plan.added.append(relative);
+        }
+    }
+
+    for (int i = 0; i < count; ++i) {
+        const PdfPageInfo info = backend.pageInfo(firstPage + i);
+        if (!info.isValid()) {
+            return refused(QStringLiteral("page %1 of %2 has no usable geometry")
+                               .arg(firstPage + i + 1)
+                               .arg(QFileInfo(pdfPath).fileName()));
+        }
+
+        PdfPageRecord page;
+        page.index = firstPage + i;
+        page.source = sourceIndex;
+        page.sizePt = info.sizePt;
+        page.rotation = info.rotation;
+        /// Its own number from the allocator: the same PDF page can be inserted twice and the two
+        /// copies stay independent, and nothing is written until one of them is drawn on.
+        const int number = plan.after.allocatePageNumber();
+        page.kraFile = PdfSession::pageFileNameForNumber(number);
+        page.thumbFile = PdfSession::thumbFileNameForNumber(number);
+        page.generation = 0;
+        plan.after.pages.insert(at + i, page);
+    }
+
+    plan.anchorBefore = currentPage;
+    plan.summary = count == 1
+        ? QStringLiteral("inserted page %1 of %2 as notebook page %3")
+              .arg(firstPage + 1)
+              .arg(QFileInfo(pdfPath).fileName())
+              .arg(at + 1)
+        : QStringLiteral("inserted %1 pages of %2 as notebook pages %3..%4")
+              .arg(count)
+              .arg(QFileInfo(pdfPath).fileName())
+              .arg(at + 1)
+              .arg(at + count);
+
+    Outcome outcome;
+    if (!applyPlan(projectDir, plan, &why)) {
+        outcome.why = why;
+        return outcome;
+    }
+
+    /// The reader keeps the page they were reading: pages arriving before it push it down by
+    /// exactly the number that arrived.
+    outcome.ok = true;
+    outcome.anchorPage =
+        qBound(0, at <= currentPage ? currentPage + count : currentPage, plan.after.pages.size() - 1);
+    outcome.summary = plan.summary;
+    return outcome;
+}
+
+QString PdfNotebookOps::sourceFileNameFor(const QString &pdfPath)
+{
+    return sourceRelativeName(PdfSessionManifest::sha256OfFile(pdfPath), safeSourceBase(pdfPath), 1);
 }
 
 PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, int first, int count,

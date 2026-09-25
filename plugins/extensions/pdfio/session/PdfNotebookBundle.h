@@ -25,9 +25,14 @@
  *
  *   manifest.json        the project manifest, byte for byte as it is on disk
  *   <source>.pdf         the original bytes, at the name manifest.source records
+ *   sources/<sha8>-<name>.pdf   every other PDF the notebook's pages are drawn from
  *   pages/pNNNN.kra      ink only, as in the project
  *   thumbs/pNNNN.png     the page previews
  *   bundle.json          the index: what this file carries, and what it deliberately does not
+ *
+ * Every source travels. A notebook whose pages were inserted from another PDF draws those pages'
+ * backgrounds from that file, so a bundle carrying only the first would unpack into a notebook
+ * that renders blank paper where they are -- with nothing said at either end.
  *
  * The archive is written with KZip, which is the KArchive code PdfInkLoader already reads a .kra
  * with: an existing plugin dependency that works on Android, so the bundle costs no new one. It is
@@ -74,6 +79,13 @@ public:
         PdfSessionManifest manifest;
         /// Where the source sits in the archive. Normally manifest.sourceFile.
         QString sourceEntry;
+
+        /**
+         * Where every source sits in the archive, in the manifest's order: entry 0 is the same
+         * name as \ref sourceEntry. A notebook whose pages were inserted from another PDF has more
+         * than one, and all of them have to travel for those pages to render at all.
+         */
+        QStringList sourceEntries;
         /// The files the bundle index lists as carried.
         QList<Entry> entries;
         /**

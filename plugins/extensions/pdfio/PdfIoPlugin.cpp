@@ -32,6 +32,7 @@
 /// Not behind PDFIO_HAVE_POPPLER: the session, the saver, the ink loader and the exporter are all
 /// plain C++ and are built on every platform. Only the renderer differs, and that is chosen by
 /// PdfRenderBackend::create.
+#include "backend/PdfRenderBackend.h"
 #include "session/PdfExporter.h"
 #include "session/PdfInkLoader.h"
 #include "session/PdfNotebookBundle.h"
@@ -615,6 +616,40 @@ void addMenuSeparator(QMenu *menu, const QString &objectName)
     separator->setObjectName(objectName);
 }
 
+/// The runner every entry goes through, defined below; declared here because the insert path,
+/// which picks its file first, is written above it.
+bool applyNotebookOperation(const QString &title,
+                            const std::function<PdfNotebookOps::Outcome(const QString &, int)> &operation);
+
+/// Inserts every page of \a picked after the page that is open.
+///
+/// After, not before: the page the reader is on does not move, which is what makes the result
+/// predictable. The whole file is inserted; choosing a range is the dialog the extract-range entry
+/// will bring with it, and the operation already takes one.
+void insertPickedPdf(const QString &picked, const QString &why)
+{
+    if (picked.isEmpty()) {
+        if (!why.isEmpty()) {
+            say(QStringLiteral("no PDF was inserted: %1").arg(why));
+        }
+        return;
+    }
+
+    QScopedPointer<PdfRenderBackend> backend(PdfRenderBackend::create());
+    if (!backend || !backend->open(picked)) {
+        say(QStringLiteral("%1 could not be opened as a PDF; nothing was inserted").arg(picked));
+        QMessageBox::warning(nullptr, i18n("Insert pages from a PDF"),
+                             i18n("%1 could not be opened as a PDF, so nothing was inserted.", picked));
+        return;
+    }
+
+    PdfRenderBackend *renderer = backend.data();
+    applyNotebookOperation(i18n("Insert pages from a PDF"),
+                           [picked, renderer](const QString &dir, int page) {
+                               return PdfNotebookOps::insertPages(dir, page + 1, picked, *renderer);
+                           });
+}
+
 /// Runs one notebook-level operation the way its invariants require: write the open pages first,
 /// change the notebook, then reload it and open the page the operation answers with.
 ///
@@ -679,6 +714,7 @@ void updateNotebookOpsActions(QMenu *ops)
     };
 
     set("pdfio_rename_notebook", true);
+    set("pdfio_ops_insert", true);
     set("pdfio_ops_move_up", index > 0);
     set("pdfio_ops_move_down", index >= 0 && index < pages - 1);
     set("pdfio_ops_move_to", pages > 1);
@@ -691,7 +727,7 @@ void updateNotebookOpsActions(QMenu *ops)
 /// The "Notebook ops" submenu: everything that changes the notebook itself rather than the page on
 /// screen, under one entry. Deduped like the entries around it, because registerActions() runs
 /// again for a second view and is retried while the first screen has no window.
-void addNotebookOpsMenu(QMenu *menu)
+void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
 {
     if (!menu) {
         return;
@@ -724,6 +760,14 @@ void addNotebookOpsMenu(QMenu *menu)
     QObject::connect(rename, &QAction::triggered, ops, []() { renameNotebook(); });
 
     ops->addSeparator();
+
+    /// Insert comes first of the page operations: it is the one that makes a notebook out of more
+    /// than one PDF, and the entries below it act on pages one at a time.
+    QAction *insert = ops->addAction(i18n("Insert pages from a PDF..."));
+    insert->setObjectName(QStringLiteral("pdfio_ops_insert"));
+    if (plugin) {
+        QObject::connect(insert, &QAction::triggered, plugin, &PdfIoPlugin::slotInsertPages);
+    }
 
     QAction *moveUp = ops->addAction(i18n("Move page up"));
     moveUp->setObjectName(QStringLiteral("pdfio_ops_move_up"));
@@ -830,6 +874,35 @@ void addRecentNotebooksMenu(QMenu *menu)
 }
 
 } // namespace
+
+void PdfIoPlugin::slotInsertPages()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Insert pages from a PDF"),
+                                 i18n("No notebook is open."));
+        return;
+    }
+
+#if defined(Q_OS_ANDROID)
+    /// The same picker the import path uses, told to filter PDFs. The copy happens in the activity
+    /// callback and nothing else does: opening the PDF and the operation itself run on the event
+    /// loop afterwards, which is the rule a crash in that callback taught us.
+    auto *picker = new AndroidDocumentPicker(this);
+    picker->pickFile(QStringLiteral("application/pdf"), QStringLiteral("pdfio-picked-pages.pdf"),
+                     [this](const QString &localPath, const QString &why) {
+                         QTimer::singleShot(0, this, [localPath, why]() {
+                             insertPickedPdf(localPath, why);
+                         });
+                     });
+#else
+    const QString picked = QFileDialog::getOpenFileName(
+        nullptr, i18n("Insert pages from a PDF"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        i18n("PDF documents (*.pdf)"));
+    insertPickedPdf(picked, QString());
+#endif
+}
 
 void PdfIoPlugin::slotInsertImage()
 {
@@ -1071,7 +1144,7 @@ void PdfIoPlugin::registerActions()
 
         /// Everything that changes the notebook itself, Rename included, lives under one entry
         /// here as it does in the full menu -- greyed while there is no notebook to act on.
-        addNotebookOpsMenu(alone);
+        addNotebookOpsMenu(alone, this);
         return;
     }
 
@@ -1157,7 +1230,7 @@ void PdfIoPlugin::registerActions()
 
     /// The notebook's own operations: move, duplicate, delete, undo and rename. They act on the
     /// notebook that is open, so they follow the document block rather than sitting above it.
-    addNotebookOpsMenu(menu);
+    addNotebookOpsMenu(menu, this);
 
     /// The strip switch. The strip existed behind PDFIO_PROBE_STRIP only, which nobody can set on
     /// a tablet; a checkable action is both the way in and the indicator of which mode is in force.
