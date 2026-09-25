@@ -50,6 +50,17 @@ private Q_SLOTS:
     void testDetectsChangedSource();
     void testRejectsBadManifest();
 
+    /// The manifest as the one durable description of a notebook: a write that fails must leave the
+    /// one that was there, the schema-2 fields must round-trip, a notebook made before them must
+    /// still open, and the artifact-number counter must never hand a number out twice.
+    void testManifestWriteLeavesTheOldOneWhenItFails();
+    void testLegacyManifestWithoutSourcesIsUpgradedOnRead();
+    void testSourcesRoundTripAndTheFirstMirrorsTheLegacyFields();
+    void testAPageCannotNameASourceTheManifestDoesNotHave();
+    void testThePageNumberAllocatorNeverReusesANumber();
+    void testDisplaySizeFollowsTheNotebooksOwnRotation();
+    void testOpenProjectVerifiesEverySource();
+
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
     void testRejectsEscapingManifestPaths();
@@ -257,6 +268,300 @@ void PdfSessionTest::testRejectsBadManifest()
     wrongSchema.pages.append(PdfPageRecord{0, QSizeF(10, 10), 0, QStringLiteral("pages/p0001.kra"), QString(), 0});
     QVERIFY(!wrongSchema.isValid(&why));
     QVERIFY(why.contains(QStringLiteral("schema")));
+}
+
+/**
+ * A manifest write that fails leaves the manifest that was already there, byte for byte.
+ *
+ * The manifest is the one durable description of a notebook: the page list, the file each page's
+ * ink lives in, its geometry. A write that truncates the file and then stops -- a full disk, a
+ * crash, a rename that cannot be made -- leaves something that is neither the old manifest nor the
+ * new one, and everything the notebook holds is described only by it. The write now goes through a
+ * temporary file that is renamed into place; this drives the one moment that matters, after the new
+ * content exists and before it is put in place.
+ */
+void PdfSessionTest::testManifestWriteLeavesTheOldOneWhenItFails()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("manifest.json"));
+
+    const PdfSessionManifest original = baseManifest();
+    QString why;
+    QVERIFY2(original.writeTo(path, &why), qPrintable(why));
+
+    QFile before(path);
+    QVERIFY(before.open(QIODevice::ReadOnly));
+    const QByteArray beforeBytes = before.readAll();
+    before.close();
+    QVERIFY(!beforeBytes.isEmpty());
+
+    PdfSessionManifest replacement = original;
+    replacement.name = QStringLiteral("a name a failed write must not leave behind");
+    replacement.pages[0].kraFile = QStringLiteral("pages/p0002.kra");
+
+    PdfSessionManifest::setFailBeforeCommitForTests(true);
+    const bool written = replacement.writeTo(path, &why);
+    PdfSessionManifest::setFailBeforeCommitForTests(false);
+
+    QVERIFY2(!written, "the write reported success although it was made to fail");
+    QVERIFY(!why.isEmpty());
+
+    QFile after(path);
+    QVERIFY(after.open(QIODevice::ReadOnly));
+    QCOMPARE(after.readAll(), beforeBytes);
+    after.close();
+
+    const PdfSessionManifest readBack = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(readBack.isValid(&why), qPrintable(why));
+    QCOMPARE(readBack.name, original.name);
+    QCOMPARE(readBack.pages.at(0).kraFile, original.pages.at(0).kraFile);
+
+    /// And a write that is allowed to finish still lands, so the guard above is not simply refusing
+    /// everything.
+    QVERIFY2(replacement.writeTo(path, &why), qPrintable(why));
+    QCOMPARE(PdfSessionManifest::readFrom(path, &why).name, replacement.name);
+}
+
+/**
+ * A notebook written before sources[] existed still opens, and is upgraded in memory.
+ *
+ * The file a schema 1 build left has one source object, pages with no source and no extra rotation,
+ * and no artifact-number counter. Reading it must fill all of that in without rewriting the file:
+ * a notebook that is only opened is not changed on disk, and the next write is what makes it this
+ * schema.
+ */
+void PdfSessionTest::testLegacyManifestWithoutSourcesIsUpgradedOnRead()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("manifest.json"));
+
+    const QByteArray legacy = R"({
+    "schema": 1,
+    "name": "lecture notes",
+    "source": { "file": "text-fixture.pdf", "sha256": "deadbeef", "bytes": 4 },
+    "pages": [
+        { "index": 0, "sizePt": [595, 842], "rotation": 0, "kra": "pages/p0001.kra", "thumb": "thumbs/p0001.png", "generation": 1 },
+        { "index": 1, "sizePt": [420, 595], "rotation": 90, "kra": "pages/p0002.kra", "thumb": "thumbs/p0002.png", "generation": 0 }
+    ]
+})";
+    writeBytes(path, legacy);
+
+    QString why;
+    const PdfSessionManifest manifest = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    QCOMPARE(manifest.schema, PdfSessionManifest::CurrentSchema);
+    QCOMPARE(manifest.sourceCount(), 1);
+    QCOMPARE(manifest.sourceAt(0).file, QStringLiteral("text-fixture.pdf"));
+    QCOMPARE(manifest.sourceAt(0).sha256, QByteArrayLiteral("deadbeef"));
+    QCOMPARE(manifest.sourceAt(0).byteSize, qint64(4));
+    QCOMPARE(manifest.pages.size(), 2);
+    for (const PdfPageRecord &page : manifest.pages) {
+        QCOMPARE(page.source, 0);
+        QCOMPARE(page.extraRotation, 0);
+    }
+    QCOMPARE(manifest.nextPageNumber, 3);
+
+    /// Reading did not write: the file on disk is still the schema 1 one.
+    QFile raw(path);
+    QVERIFY(raw.open(QIODevice::ReadOnly));
+    const QJsonObject onDisk = QJsonDocument::fromJson(raw.readAll()).object();
+    raw.close();
+    QCOMPARE(onDisk.value(QStringLiteral("schema")).toInt(), 1);
+
+    /// The next write is what turns it into this schema, and the result is this build's own shape.
+    QVERIFY2(manifest.writeTo(path, &why), qPrintable(why));
+    const PdfSessionManifest upgraded = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(upgraded.isValid(&why), qPrintable(why));
+    QCOMPARE(upgraded.toJson(), manifest.toJson());
+    QCOMPARE(upgraded.toJson().value(QStringLiteral("schema")).toInt(),
+             PdfSessionManifest::CurrentSchema);
+    QCOMPARE(upgraded.toJson().value(QStringLiteral("sources")).toArray().size(), 1);
+}
+
+/**
+ * More than one source round-trips, pages say which one they come from, and the first entry keeps
+ * agreeing with the three fields every older reader uses.
+ */
+void PdfSessionTest::testSourcesRoundTripAndTheFirstMirrorsTheLegacyFields()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("manifest.json"));
+
+    PdfSessionManifest manifest = baseManifest();
+    PdfSourceRecord first;
+    first.file = manifest.sourceFile;
+    first.sha256 = manifest.sourceSha256;
+    first.byteSize = manifest.sourceByteSize;
+    PdfSourceRecord second;
+    second.file = QStringLiteral("sources/9f3a1c02-handout.pdf");
+    second.sha256 = QByteArrayLiteral("cafebabe");
+    second.byteSize = 99;
+    manifest.sources << first << second;
+    manifest.pages[0].source = 1;
+    manifest.nextPageNumber = 7;
+    QVERIFY(manifest.isValid());
+
+    QCOMPARE(manifest.sourceCount(), 2);
+    QCOMPARE(manifest.sourceForPage(manifest.pages.at(0)).file, second.file);
+    QCOMPARE(manifest.sourceIndexForSha(QByteArrayLiteral("cafebabe")), 1);
+    QCOMPARE(manifest.sourceIndexForSha(QByteArrayLiteral("not-a-source")), -1);
+
+    QString why;
+    QVERIFY2(manifest.writeTo(path, &why), qPrintable(why));
+    const PdfSessionManifest read = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(read.isValid(&why), qPrintable(why));
+    QCOMPARE(read.toJson(), manifest.toJson());
+    QCOMPARE(read.sourceCount(), 2);
+    QCOMPARE(read.pages.at(0).source, 1);
+    QCOMPARE(read.nextPageNumber, 7);
+
+    /// The list and the legacy object describe different PDFs: refused rather than read two ways,
+    /// because an older reader would follow the legacy object and a newer one the list.
+    PdfSessionManifest mismatched = read;
+    mismatched.sourceFile = QStringLiteral("some-other.pdf");
+    why.clear();
+    QVERIFY(!mismatched.isValid(&why));
+    QVERIFY2(why.contains(QStringLiteral("first source")), qPrintable(why));
+
+    /// A source that is not a file inside the project is refused exactly like the source itself.
+    PdfSessionManifest escaping = read;
+    escaping.sources[1].file = QStringLiteral("../outside.pdf");
+    why.clear();
+    QVERIFY(!escaping.isValid(&why));
+    QVERIFY2(why.contains(QStringLiteral("inside the project")), qPrintable(why));
+}
+
+void PdfSessionTest::testAPageCannotNameASourceTheManifestDoesNotHave()
+{
+    PdfSessionManifest manifest = baseManifest();
+    manifest.pages[0].source = 1;
+
+    QString why;
+    QVERIFY(!manifest.isValid(&why));
+    QVERIFY2(why.contains(QStringLiteral("source")), qPrintable(why));
+}
+
+/**
+ * The artifact-number counter never hands out a number the page list already names.
+ *
+ * A number freed by deleting a page must not come back: an artifact left behind by a failed delete
+ * would be read back as the ink of a page that never had any, which is a silent resurrection of
+ * somebody else's strokes.
+ */
+void PdfSessionTest::testThePageNumberAllocatorNeverReusesANumber()
+{
+    PdfSessionManifest manifest = baseManifest();
+    manifest.pages[0].kraFile = QStringLiteral("pages/p0007.kra");
+    manifest.nextPageNumber = 0;
+
+    QCOMPARE(manifest.allocatePageNumber(), 8);
+    QCOMPARE(manifest.nextPageNumber, 9);
+
+    manifest.pages.append(PdfPageRecord{1, QSizeF(10, 10), 0,
+                                        PdfSession::pageFileNameForNumber(8), QString(), 0, 0, 0});
+    QCOMPARE(manifest.allocatePageNumber(), 9);
+    QCOMPARE(manifest.nextPageNumber, 10);
+
+    /// A counter a hand edit lowered, or one that came from an older file, is raised past what the
+    /// page list already names instead of being trusted.
+    manifest.nextPageNumber = 2;
+    QCOMPARE(manifest.allocatePageNumber(), 9);
+    QCOMPARE(manifest.nextPageNumber, 10);
+
+    /// A name that is not a numbered artifact is none of this counter's business.
+    manifest.pages.append(PdfPageRecord{2, QSizeF(10, 10), 0, QStringLiteral("pages/renamed-ink.kra"),
+                                        QString(), 0, 0, 0});
+    QCOMPARE(manifest.allocatePageNumber(), 10);
+    QCOMPARE(manifest.nextPageNumber, 11);
+}
+
+void PdfSessionTest::testDisplaySizeFollowsTheNotebooksOwnRotation()
+{
+    PdfPageRecord page{0, QSizeF(595, 842), 0, QStringLiteral("pages/p0001.kra"), QString(), 0, 0, 0};
+    QCOMPARE(page.displaySizePt(), QSizeF(595, 842));
+
+    page.extraRotation = 90;
+    QCOMPARE(page.displaySizePt(), QSizeF(842, 595));
+    page.extraRotation = 270;
+    QCOMPARE(page.displaySizePt(), QSizeF(842, 595));
+    page.extraRotation = 180;
+    QCOMPARE(page.displaySizePt(), QSizeF(595, 842));
+
+    /// sizePt is what the file declares and stays that whatever the notebook records, or the two
+    /// would drift and the record would stop surviving a renderer change.
+    QCOMPARE(page.sizePt, QSizeF(595, 842));
+
+    /// Only quarter turns are legal: anything else is a manifest this code refuses rather than a
+    /// size it guesses.
+    PdfSessionManifest manifest = baseManifest();
+    manifest.pages[0].extraRotation = 45;
+    QString why;
+    QVERIFY(!manifest.isValid(&why));
+    QVERIFY2(why.contains(QStringLiteral("quarter turn")), qPrintable(why));
+}
+
+/**
+ * Opening a notebook checks every source, not only its first.
+ *
+ * A page whose background can only come from the second PDF would otherwise be rendered blank --
+ * or, worse, from whatever the first file happens to hold -- with nothing said. A second source
+ * that is missing, or that was replaced under the notebook, is a refusal with a reason.
+ */
+void PdfSessionTest::testOpenProjectVerifiesEverySource()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    PdfSessionManifest manifest =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(manifest.isValid());
+    QCOMPARE(manifest.sourceCount(), 1);
+
+    const QString extra = QStringLiteral("sources/9f3a1c02-handout.pdf");
+    QVERIFY(QDir(project).mkpath(QStringLiteral("sources")));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("text-fixture.pdf")),
+                        QDir(project).filePath(extra)));
+
+    PdfSourceRecord second;
+    second.file = extra;
+    second.sha256 = PdfSessionManifest::sha256OfFile(QDir(project).filePath(extra));
+    second.byteSize = QFileInfo(QDir(project).filePath(extra)).size();
+    manifest.sources << second;
+
+    PdfPageRecord fromSecond = manifest.pages.at(1);
+    fromSecond.source = 1;
+    fromSecond.kraFile = PdfSession::pageFileNameForNumber(manifest.allocatePageNumber());
+    fromSecond.thumbFile.clear();
+    manifest.pages.append(fromSecond);
+
+    QString why;
+    QVERIFY2(manifest.writeTo(PdfSession::manifestPath(project), &why), qPrintable(why));
+    QVERIFY2(PdfSession::openProject(project, &why).isValid(&why), qPrintable(why));
+
+    /// The second source goes away: the notebook has a page that can only be drawn from it.
+    QVERIFY(QFile::remove(QDir(project).filePath(extra)));
+    why.clear();
+    QVERIFY(!PdfSession::openProject(project, &why).isValid());
+    QVERIFY2(why.contains(extra), qPrintable(why));
+
+    /// And a second source that was replaced under the notebook is refused for the same reason the
+    /// first one would be.
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("text-fixture.pdf")),
+                        QDir(project).filePath(extra)));
+    {
+        QFile file(QDir(project).filePath(extra));
+        QVERIFY(file.open(QIODevice::Append));
+        file.write(" ");
+    }
+    why.clear();
+    QVERIFY(!PdfSession::openProject(project, &why).isValid());
+    QVERIFY2(why.contains(QStringLiteral("changed")), qPrintable(why));
 }
 
 /**

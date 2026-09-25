@@ -7,9 +7,9 @@
 #ifndef PDFPAGENAVIGATOR_H
 #define PDFPAGENAVIGATOR_H
 
-/// Included rather than forward declared: the navigator holds a QScopedPointer to it, and that
-/// needs the complete type for its destructor.
-#include "backend/PdfRenderBackend.h"
+/// Included rather than forward declared: the navigator holds a PdfSourceRenderers member, and
+/// that needs the complete type for its destructor. It brings PdfRenderBackend.h with it.
+#include "session/PdfSourceRenderers.h"
 #include "session/PdfPageWindow.h"
 #include "session/PdfSaveQueue.h"
 #include "session/PdfSessionManifest.h"
@@ -439,8 +439,11 @@ private:
     QList<int> m_thumbnailQueue;
     QTimer *m_thumbnailTimer = nullptr;
 
-    /// Kept open between thumbnails: parsing the source once is worth more than the thumbnails.
-    QScopedPointer<PdfRenderBackend> m_thumbnailBackend;
+    /// One open renderer per source, and where "render the page" is answered: the record's own page
+    /// inside the record's own source, never the notebook position. Kept open between thumbnails,
+    /// between the slots of a strip and between the frames of a roll, because parsing a PDF once is
+    /// worth more than all of them.
+    PdfSourceRenderers m_sourceRenderers;
 
     /// So one continued gesture does not turn several pages.
     qint64 m_lastTurn = 0;

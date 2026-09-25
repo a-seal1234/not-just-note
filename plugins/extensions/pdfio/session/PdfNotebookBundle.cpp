@@ -429,8 +429,12 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
 
     /// The schema is read before fromJson, which collapses every reason a manifest can be invalid
     /// into one verdict, and "written by a newer Krita" deserves to be said out loud.
+    ///
+    /// A schema 1 manifest is accepted and upgraded by fromJson, exactly as it is when a notebook
+    /// is opened from its directory: every bundle made before sources[] existed has to keep
+    /// opening. What is refused is a schema this build does not know, in either direction.
     const int schema = manifestDocument.object().value(QStringLiteral("schema")).toInt(0);
-    if (schema != PdfSessionManifest::CurrentSchema) {
+    if (schema < 1 || schema > PdfSessionManifest::CurrentSchema) {
         fail(why, schema > PdfSessionManifest::CurrentSchema
                       ? QStringLiteral("this notebook was written by a newer version (manifest schema %1; "
                                        "this build understands %2)")
@@ -445,6 +449,15 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
         return false;
     }
     const PdfSessionManifest &manifest = analysis->info.manifest;
+
+    /// The same rule on the way in: a manifest naming more than one source describes a notebook
+    /// this format cannot rebuild, because the archive carries exactly one PDF. Refused here rather
+    /// than extracted into a notebook whose other pages would render blank.
+    if (manifest.sourceCount() > 1) {
+        fail(why, QStringLiteral("the bundle's notebook draws pages from %1 PDFs; this format "
+                                 "carries one").arg(manifest.sourceCount()));
+        return false;
+    }
 
     /// Every file the manifest names, before one of them is joined onto a destination. The archive
     /// is not the only place a path comes from, and this is the check that keeps a hostile
@@ -735,6 +748,19 @@ bool PdfNotebookBundle::save(const QString &projectDir, const QString &outPath, 
 
     const PdfSessionManifest manifest = PdfSessionManifest::readFrom(PdfSession::manifestPath(projectDir), why);
     if (!manifest.isValid(why)) {
+        return false;
+    }
+
+    /// One source is what this format carries, and it verifies that one. A notebook that was given
+    /// pages from another PDF has more than one, and writing it out here would silently leave those
+    /// pages' backgrounds behind: the bundle would unpack into a notebook that renders blank paper
+    /// where those pages are, with nothing said at either end.
+    if (manifest.sourceCount() > 1) {
+        fail(why, QStringLiteral("this notebook draws pages from %1 PDFs and the one-file form "
+                                 "carries only one, so the pages that come from %2 would lose "
+                                 "their background")
+                      .arg(manifest.sourceCount())
+                      .arg(manifest.sourceAt(1).file));
         return false;
     }
 

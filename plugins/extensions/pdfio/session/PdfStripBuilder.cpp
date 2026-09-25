@@ -8,6 +8,7 @@
 
 #include "backend/PdfRenderBackend.h"
 #include "session/PdfInkLoader.h"
+#include "session/PdfSourceRenderers.h"
 
 #include <QColor>
 #include <QDebug>
@@ -62,7 +63,7 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
                                               int activePage,
                                               int scope,
                                               qreal dpi,
-                                              PdfRenderBackend &backend,
+                                              PdfSourceRenderers &renderers,
                                               const QString &projectDir,
                                               QString *why)
 {
@@ -73,8 +74,10 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
         fail(why, QStringLiteral("the strip has no valid layout"));
         return strip;
     }
-    if (!backend.isOpen()) {
-        fail(why, QStringLiteral("the renderer is not open"));
+    /// The active page's source, opened once. A slot whose own source cannot be opened renders
+    /// nothing (below) rather than taking the whole strip down with it; the page the user is on is
+    /// the one that has to be there.
+    if (!renderers.forPage(manifest, projectDir, activePage, why)) {
         return strip;
     }
 
@@ -115,9 +118,10 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
             continue;
         }
 
-        const QImage rendered = backend.renderPage(slot.page, dpi);
+        const QImage rendered = renderers.renderPage(manifest, projectDir, slot.page, dpi, nullptr);
         KisPaintLayerSP background =
-            new KisPaintLayer(strip.image, backgroundLayerName(slot.page), OPACITY_OPAQUE_U8);
+            new KisPaintLayer(strip.image, backgroundLayerName(manifest.pages.at(slot.page).index),
+                              OPACITY_OPAQUE_U8);
         if (!rendered.isNull()) {
             /// Said out loud when it happens: the slot was sized from the page's own geometry, and
             /// if the renderer disagrees the page is drawn in the wrong place. Deriving a raster

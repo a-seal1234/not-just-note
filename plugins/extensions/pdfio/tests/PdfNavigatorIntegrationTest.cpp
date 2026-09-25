@@ -70,6 +70,7 @@ private Q_SLOTS:
 
     void testCleanTurnEvictsWithoutSaving();
     void testDirtyPageIsSavedBeforeEvictionAndTheInkComesBack();
+    void testAPageIsWrittenToTheArtifactTheManifestNames();
     void testRefusedSaveKeepsThePageOpenAndTheInkIntact();
     void testInkIsNotWrittenWhileThePenIsStillBusy();
     void testALayerThatIsNotInkIsSavedToo();
@@ -464,6 +465,61 @@ void PdfNavigatorIntegrationTest::testDirtyPageIsSavedBeforeEvictionAndTheInkCom
     QCOMPARE(navigator()->currentIndex(), 0);
     QVERIFY2(inkMarkPresent(navigator()->currentDocument()->image()),
              "the ink saved before the eviction did not come back with the page");
+}
+
+/**
+ * The page is written to the artifact the manifest names, and not to the name its page number
+ * implies.
+ *
+ * The two agree in a notebook that was just created -- PdfSession::createProject() builds both
+ * from the same counter -- which is exactly what made the divergence invisible: the reading half
+ * of the plugin has always used record.kraFile, while the writing half rebuilt the name as
+ * PdfSession::pageFileName(record.index). The moment a notebook operation moves a page's ink from
+ * one name to another -- insert, duplicate, extract -- the write half goes on writing to the old
+ * name, and the ink is saved into a file no reader ever opens. Silent, and only visible as "my
+ * notes were not there when I came back".
+ *
+ * So the manifest is edited to name an artifact the number does not imply, and the page is then
+ * drawn on and turned away from. The write has to land at the recorded name, and nothing may be
+ * left at the implied one.
+ */
+void PdfNavigatorIntegrationTest::testAPageIsWrittenToTheArtifactTheManifestNames()
+{
+    QVERIFY(useNotebook(QStringLiteral("artifact-name")));
+
+    const QString manifestPath = PdfSession::manifestPath(navigator()->projectDir());
+    QString why;
+    PdfSessionManifest manifest = PdfSessionManifest::readFrom(manifestPath, &why);
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    const QString named = QStringLiteral("pages/renamed-ink.kra");
+    const QString implied = artifactFor(0);
+    QVERIFY(QDir(navigator()->projectDir()).filePath(named) != implied);
+    manifest.pages[0].kraFile = named;
+    QVERIFY2(manifest.writeTo(manifestPath, &why), qPrintable(why));
+
+    /// Reopened so the navigator works from that manifest rather than the copy it took when the
+    /// page was first shown, then the implied name is cleared: the save an open makes writes one,
+    /// and leaving it there would make the assertion below pass for the wrong reason.
+    QVERIFY(useNotebook(QStringLiteral("artifact-name")));
+    QCOMPARE(navigator()->currentIndex(), 0);
+    QFile::remove(implied);
+
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 1);
+
+    const QString namedPath = QDir(navigator()->projectDir()).filePath(named);
+    QVERIFY2(QFileInfo::exists(namedPath),
+             qPrintable(QStringLiteral("%1 was never written").arg(namedPath)));
+    QVERIFY2(waitForInk(namedPath), qPrintable(namedPath));
+    QVERIFY2(!QFileInfo::exists(implied),
+             qPrintable(QStringLiteral("the ink was written to %1, the name the page number "
+                                       "implies, instead of the name the manifest records (%2)")
+                            .arg(implied, namedPath)));
 }
 
 /**

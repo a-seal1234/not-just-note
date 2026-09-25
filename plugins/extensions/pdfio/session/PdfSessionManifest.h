@@ -14,6 +14,23 @@
 #include <QString>
 
 /**
+ * One PDF a notebook's pages can be rendered from.
+ *
+ * A notebook used to have exactly one source, and the three fields on the manifest below still
+ * describe it. It has a list now because a notebook can be given pages from another PDF -- inserted
+ * or merged -- and each page then has to say which file its background comes from: the background
+ * is never persisted, so "which PDF" is the only thing that can put it back.
+ *
+ * \c file is relative to the project directory and is checked by isSafeRelativePath() like every
+ * other name the manifest carries.
+ */
+struct PdfSourceRecord {
+    QString file;
+    QByteArray sha256;
+    qint64 byteSize = 0;
+};
+
+/**
  * One page of a note project.
  *
  * A record describes where the page sits in the PDF and which ink file belongs to it; it
@@ -40,6 +57,23 @@ struct PdfPageRecord {
     QString thumbFile;
     /// Bumped on every committed save of this page; used to reason about recovery.
     int generation = 0;
+
+    /// Which entry of PdfSessionManifest::sources the page's background is rendered from. 0 is the
+    /// notebook's own source, which is every page of a notebook made before this field existed.
+    int source = 0;
+
+    /**
+     * A quarter turn the NOTEBOOK applies on top of the source's own /Rotate: 0, 90, 180 or 270.
+     *
+     * Kept apart from \c rotation, which is what the file declares: the source is immutable, so a
+     * page the user rotates is a turn this manifest records rather than one the PDF is rewritten
+     * with. \c sizePt stays the source's displayed size and displaySizePt() is what the user sees,
+     * so the two cannot drift apart.
+     */
+    int extraRotation = 0;
+
+    /// The size the user sees: sizePt with extraRotation applied.
+    QSizeF displaySizePt() const;
 };
 
 /**
@@ -52,15 +86,44 @@ struct PdfPageRecord {
 class PdfSessionManifest
 {
 public:
-    /// Bumped whenever the on-disk shape changes in a way older readers cannot handle.
-    static const int CurrentSchema;
+    /**
+     * Bumped whenever the on-disk shape changes in a way older readers cannot handle.
+     *
+     * 2 adds sources[], pages[].source, pages[].extraRotation and nextPageNumber. A schema 1
+     * manifest is upgraded in memory when it is read (see fromJson) and written back as 2 by the
+     * next write; an older build meeting a 2 refuses it through this guard rather than rendering
+     * pages from the wrong PDF, which is the whole reason the number is bumped instead of the new
+     * fields being added quietly.
+     *
+     * A constexpr member, so that the default below can be the same value: a manifest built in
+     * code that defaulted to the previous schema is refused by its own reader, which is exactly
+     * what happened when the number lived in one place and the default in another.
+     */
+    static constexpr int CurrentSchema = 2;
 
-    int schema = 1;
+    int schema = CurrentSchema;
     /// File name of the source inside the project directory, not a full path.
     QString sourceFile;
     /// Hex encoded SHA-256 of the source, so a moved or edited source is detected.
     QByteArray sourceSha256;
     qint64 sourceByteSize = 0;
+
+    /**
+     * Every PDF this notebook can draw a page from, sources[0] being the notebook's own source.
+     *
+     * Empty is legal and means "one source: the three fields above". A manifest built in code --
+     * by a test, by a probe -- therefore stays valid without repeating itself. When the list is
+     * there, its first entry must agree with those three fields; isValid() enforces that, because
+     * the bundle, the docker and the export still read them.
+     */
+    QList<PdfSourceRecord> sources;
+
+    /**
+     * The next pages/pNNNN.kra number to hand out. Always greater than every number the page list
+     * already names, so a number freed by deleting a page is never handed out again: a leftover
+     * artifact would otherwise be read back as the ink of a page that never had any.
+     */
+    int nextPageNumber = 0;
 
     /**
      * The notebook's own name, as the user sees it: the docker's title and the suggestion the
@@ -77,6 +140,29 @@ public:
 
     /// The name to show: name when there is one, otherwise the source file's own base name.
     QString displayName() const;
+
+    /// How many sources this manifest effectively has: the list when it is there, one otherwise.
+    int sourceCount() const;
+    /// What source \a index resolves to, or a default-constructed record when it is out of range.
+    PdfSourceRecord sourceAt(int index) const;
+    /// The source \a page is rendered from.
+    PdfSourceRecord sourceForPage(const PdfPageRecord &page) const;
+    /// The index of the source whose checksum is \a sha256, or -1. For "is this PDF already here?".
+    int sourceIndexForSha(const QByteArray &sha256) const;
+
+    /// The next artifact number, advancing the counter. Never returns a number a page already names.
+    int allocatePageNumber();
+
+    /**
+     * The counter as it would be written: nextPageNumber raised past every number the page list
+     * already names. What refreshNextPageNumber() stores, and what toJson() records, so a manifest
+     * built in code and serialised without refreshing still reads back as the same value instead
+     * of as a counter one write away from handing out a number a page is using.
+     */
+    int effectiveNextPageNumber() const;
+
+    /// Raises nextPageNumber so that it is past every number the page list already names.
+    void refreshNextPageNumber();
 
     /**
      * Whether \a path is a file name this manifest may carry, and the one rule for all of them.
@@ -100,6 +186,14 @@ public:
     static PdfSessionManifest fromJson(const QJsonObject &object, QString *why = nullptr);
 
     bool writeTo(const QString &path, QString *why = nullptr) const;
+
+    /**
+     * Whether writeTo() should fail after the new content has been written but before it is put in
+     * place. The only caller is a test, and it is what proves that a failed write leaves the
+     * manifest that was already there -- byte for byte -- instead of a truncated or half-edited
+     * file. Nothing in the plugin calls it.
+     */
+    static void setFailBeforeCommitForTests(bool fail);
     static PdfSessionManifest readFrom(const QString &path, QString *why = nullptr);
 
     static QByteArray sha256OfFile(const QString &path);

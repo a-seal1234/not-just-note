@@ -7,6 +7,7 @@
 #include "backends/poppler/PopplerRenderBackend.h"
 #include "session/PdfInkLoader.h"
 #include "session/PdfPageSaver.h"
+#include "session/PdfSourceRenderers.h"
 #include "session/PdfStripBuilder.h"
 #include "session/PdfStripLayout.h"
 #include "session/PdfSessionManifest.h"
@@ -464,9 +465,15 @@ void PdfStripCursorTest::testThreeSlotStripRendersEachPageInItsOwnSlot()
     QTemporaryDir project;
     QVERIFY(project.isValid());
 
+    /// The source is resolved against the project directory now -- the renderer is asked for the
+    /// record's own page of the record's own source -- so the project has to be one that holds the
+    /// file the manifest records, exactly as a real notebook's does.
+    QVERIFY(QFile::copy(m_fixture, QDir(project.path()).filePath(QStringLiteral("mr-strip-3page.pdf"))));
+
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                                backend, project.path(), &why);
+                                                                renderers, project.path(), &why);
     QVERIFY2(strip.image, qPrintable(why));
     QVERIFY(strip.layout.isValid());
 
@@ -554,8 +561,10 @@ void PdfStripCursorTest::testCursorToPageOnTheStripAcrossGapsAndZoom()
     QVERIFY(layout.isValid());
 
     QTemporaryDir project;
+    QVERIFY(QFile::copy(m_fixture, QDir(project.path()).filePath(QStringLiteral("mr-strip-3page.pdf"))));
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                                backend, project.path(), nullptr);
+                                                                renderers, project.path(), nullptr);
     QVERIFY(strip.image);
     QCOMPARE(QSize(strip.image->width(), strip.image->height()), layout.imageSize());
 

@@ -5,7 +5,10 @@
  */
 
 #include "backends/poppler/PopplerRenderBackend.h"
+#include "session/PdfSourceRenderers.h"
 #include "session/PdfStripBuilder.h"
+
+#include <QFileInfo>
 
 #include <QtTest>
 
@@ -33,11 +36,19 @@ private Q_SLOTS:
     void testPagesAreWhereTheLayoutSays();
     void testPaperIsBelowEveryInkGroup();
     void testConsecutiveGapsAreEqual();
+    void testASlotIsRenderedFromItsRecordAndNotItsPosition();
 
 private:
     QString fixturePath() const
     {
         return QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf");
+    }
+
+    /// The renderers resolve a source against the project directory -- a manifest records a source
+    /// relative to the notebook it belongs to -- so the fixture's own directory is the project here.
+    QString fixtureDir() const
+    {
+        return QStringLiteral(FILES_DATA_DIR);
     }
 
     PdfSessionManifest manifestFor(PdfRenderBackend &backend) const
@@ -74,8 +85,9 @@ void PdfStripBuilderTest::testImageIsTheLayoutSize()
     QVERIFY(backend.open(fixturePath()));
 
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                               backend, QString(), &why);
+                                                               renderers, fixtureDir(), &why);
     QVERIFY2(strip.image, qPrintable(why));
     QVERIFY(strip.layout.isValid());
     QCOMPARE(QSize(strip.image->width(), strip.image->height()), strip.layout.imageSize());
@@ -87,8 +99,9 @@ void PdfStripBuilderTest::testEverySlotHasAPageAndAnInkGroup()
     QVERIFY(backend.open(fixturePath()));
 
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                               backend, QString(), &why);
+                                                               renderers, fixtureDir(), &why);
     QVERIFY2(strip.image, qPrintable(why));
 
     /// The desk, one layer of paper per page, and one ink group over all of them with the stroke
@@ -141,8 +154,9 @@ void PdfStripBuilderTest::testOnlyTheInkLayerIsPaintable()
     QVERIFY(backend.open(fixturePath()));
 
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                               backend, QString(), &why);
+                                                               renderers, fixtureDir(), &why);
     QVERIFY2(strip.image, qPrintable(why));
 
     /// The paper is never the user's to edit, and the ink layer is the one a stroke lands in.
@@ -170,8 +184,9 @@ void PdfStripBuilderTest::testPagesAreWhereTheLayoutSays()
     QVERIFY(backend.open(fixturePath()));
 
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                               backend, QString(), &why);
+                                                               renderers, fixtureDir(), &why);
     QVERIFY2(strip.image, qPrintable(why));
 
     /// The page is painted at its own place in the strip, not at the origin: the top of its own
@@ -193,8 +208,9 @@ void PdfStripBuilderTest::testPaperIsBelowEveryInkGroup()
     QVERIFY(backend.open(fixturePath()));
 
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                               backend, QString(), &why);
+                                                               renderers, fixtureDir(), &why);
     QVERIFY2(strip.image, qPrintable(why));
 
     /// All of the paper first, then all of the ink. Adding a slot at a time puts the next page's
@@ -239,8 +255,9 @@ void PdfStripBuilderTest::testConsecutiveGapsAreEqual()
     QVERIFY(backend.open(fixturePath()));
 
     QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifestFor(backend), 1, 3, 200.0,
-                                                               backend, QString(), &why);
+                                                               renderers, fixtureDir(), &why);
     QVERIFY2(strip.image, qPrintable(why));
 
     const QList<PdfStripLayout::Slot> slots = strip.layout.slots();
@@ -261,6 +278,102 @@ void PdfStripBuilderTest::testConsecutiveGapsAreEqual()
 
     qInfo("text-fixture.pdf: slot heights %d, %d, %d; every gap %d px",
           slots.at(0).rect.height(), slots.at(1).rect.height(), slots.at(2).rect.height(), gap);
+}
+
+/**
+ * A slot is rendered from its record's own source and its own page inside that source, and the
+ * locked layer is named after that source page rather than after the slot's position.
+ *
+ * The two numbers agree in a notebook that was just created, which is what made the positional
+ * render invisible: the strip asked the renderer for renderPage(slot.page) and opened "the source".
+ * The moment pages arrive from another PDF, or in an order other than the source's, a slot's
+ * position and its source page are different sheets -- and a page-sized render of the wrong sheet
+ * still fits the slot, so nothing complains. The paper under the ink is simply a different page.
+ *
+ * Here the two records point at page 3 of one file and page 1 of another, and the file each one
+ * came from renders at a different pixel size than the page the slot's position would have picked,
+ * so a positional build cannot pass by coincidence.
+ */
+void PdfStripBuilderTest::testASlotIsRenderedFromItsRecordAndNotItsPosition()
+{
+    const QString other = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-rotations.pdf");
+    QVERIFY2(QFileInfo::exists(other), qPrintable(other));
+
+    PopplerRenderBackend fixture;
+    QVERIFY(fixture.open(fixturePath()));
+    PopplerRenderBackend rotated;
+    QVERIFY(rotated.open(other));
+
+    /// The two files have to render differently for this test to say anything: record 0 is the
+    /// fixture's third page, and the page the slot's position would have chosen is a different size.
+    const QImage expectedFirst = fixture.renderPage(2, 200.0);
+    const QImage positionalFirst = fixture.renderPage(0, 200.0);
+    const QImage expectedSecond = rotated.renderPage(0, 200.0);
+    const QImage positionalSecond = fixture.renderPage(1, 200.0);
+    QVERIFY(!expectedFirst.isNull());
+    QVERIFY(!expectedSecond.isNull());
+    QVERIFY(expectedFirst.size() != positionalFirst.size());
+    QVERIFY(expectedSecond.size() != positionalSecond.size());
+
+    PdfSessionManifest manifest;
+    manifest.sourceFile = QFileInfo(fixturePath()).fileName();
+    manifest.sourceSha256 = QByteArrayLiteral("0000");
+    manifest.sourceByteSize = 1;
+    PdfSourceRecord first;
+    first.file = manifest.sourceFile;
+    first.sha256 = manifest.sourceSha256;
+    first.byteSize = 1;
+    PdfSourceRecord second;
+    second.file = QFileInfo(other).fileName();
+    second.sha256 = QByteArrayLiteral("1111");
+    second.byteSize = 1;
+    manifest.sources << first << second;
+
+    const PdfPageInfo firstPage = fixture.pageInfo(2);
+    const PdfPageInfo secondPage = rotated.pageInfo(0);
+    manifest.pages.append(PdfPageRecord{firstPage.index, firstPage.sizePt, firstPage.rotation,
+                                        QStringLiteral("pages/p0001.kra"), QString(), 0, 0, 0});
+    manifest.pages.append(PdfPageRecord{secondPage.index, secondPage.sizePt, secondPage.rotation,
+                                        QStringLiteral("pages/p0002.kra"), QString(), 0, 1, 0});
+    QVERIFY(manifest.isValid());
+
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
+    QString why;
+    const PdfStripBuilder::Strip strip =
+        PdfStripBuilder::build(manifest, 0, 3, 200.0, renderers, fixtureDir(), &why);
+    QVERIFY2(strip.image, qPrintable(why));
+
+    const int slotFirst = strip.layout.slotForPage(0);
+    const int slotSecond = strip.layout.slotForPage(1);
+    QVERIFY(slotFirst >= 0);
+    QVERIFY(slotSecond >= 0);
+
+    /// The locked layer is named after the SOURCE page the record holds, which is also what the
+    /// single-page builder has always done (PdfProjectBuilder names it from record.index).
+    KisNodeSP paperFirst =
+        childNamed(strip.image, PdfStripBuilder::backgroundLayerName(firstPage.index));
+    KisNodeSP paperSecond =
+        childNamed(strip.image, PdfStripBuilder::backgroundLayerName(secondPage.index));
+    QVERIFY2(paperFirst, qPrintable(PdfStripBuilder::backgroundLayerName(firstPage.index)));
+    QVERIFY2(paperSecond, qPrintable(PdfStripBuilder::backgroundLayerName(secondPage.index)));
+    QVERIFY(paperFirst->userLocked());
+    QVERIFY(paperSecond->userLocked());
+
+    /// And the paper really is that page, from that file: the painted rectangle is the size of the
+    /// render the record asks for, and not the size of the page the slot's position would have
+    /// picked out of the first source.
+    const QRect boundsFirst = paperFirst->paintDevice()->exactBounds();
+    const QRect boundsSecond = paperSecond->paintDevice()->exactBounds();
+    qInfo("slot 0 -> %s: %dx%d (positional would be %dx%d); slot 1 -> %s: %dx%d (positional %dx%d)",
+          qPrintable(paperFirst->name()), boundsFirst.width(), boundsFirst.height(),
+          positionalFirst.width(), positionalFirst.height(), qPrintable(paperSecond->name()),
+          boundsSecond.width(), boundsSecond.height(), positionalSecond.width(),
+          positionalSecond.height());
+
+    QCOMPARE(boundsFirst.size(), expectedFirst.size());
+    QCOMPARE(boundsSecond.size(), expectedSecond.size());
+    QVERIFY(boundsFirst.size() != positionalFirst.size());
+    QVERIFY(boundsSecond.size() != positionalSecond.size());
 }
 
 QTEST_MAIN(PdfStripBuilderTest)

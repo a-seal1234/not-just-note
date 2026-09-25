@@ -19,14 +19,18 @@ constexpr int SlotGap = 112;
 QSize pageSizeInPixels(const PdfSessionManifest &manifest, const PdfPageRecord &page, qreal dpi)
 {
     Q_UNUSED(manifest);
-    if (!page.sizePt.isValid()) {
+    /// displaySizePt(), not sizePt: a page the notebook itself has turned occupies its turned
+    /// shape on the strip. The two are the same until a rotate is recorded, which is exactly why
+    /// the layout must ask the question that already knows about it.
+    const QSizeF visible = page.displaySizePt();
+    if (!visible.isValid()) {
         return QSize();
     }
     /// Rounded, not ceilinged, because that is what the renderers actually produce: a 300 point
     /// page at 200 dpi comes back as 833 pixels, not 834. Deriving a raster size from pt/72*dpi
     /// instead of asking the renderer is the mistake this project already made once.
-    return QSize(qRound(page.sizePt.width() * dpi / 72.0),
-                 qRound(page.sizePt.height() * dpi / 72.0));
+    return QSize(qRound(visible.width() * dpi / 72.0),
+                 qRound(visible.height() * dpi / 72.0));
 }
 
 } // namespace

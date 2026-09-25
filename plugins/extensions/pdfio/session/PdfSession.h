@@ -89,6 +89,15 @@ public:
     static QString sourcePath(const QString &projectDir, const QString &sourceFile);
     static QString pageFileName(int index);
     static QString thumbFileName(int index);
+
+    /**
+     * The artifact name a page NUMBER maps to: 7 gives "pages/p0007.kra".
+     *
+     * pageFileName() takes the zero-based page index, which is what a notebook's own pages use;
+     * this is the one to pair with PdfSessionManifest::allocatePageNumber(), because the number
+     * the allocator hands out is the number in the name rather than an index.
+     */
+    static QString pageFileNameForNumber(int number);
 };
 
 #endif // PDFSESSION_H

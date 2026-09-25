@@ -177,6 +177,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../backends/poppler/PopplerRenderBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfInkLoader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSourceRenderers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripLayout.cpp
         )
@@ -237,6 +238,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSaveQueue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSession.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSourceRenderers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripLayout.cpp
         )
@@ -355,6 +357,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageSaver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfProjectBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSourceRenderers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfStripLayout.cpp
         )

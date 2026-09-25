@@ -13,7 +13,7 @@
 
 #include <kis_types.h>
 
-class PdfRenderBackend;
+class PdfSourceRenderers;
 
 /**
  * Builds the strip image: several pages in one document, which is design B.
@@ -42,17 +42,26 @@ public:
     /**
      * \a projectDir is where the page artifacts live; a page that has been drawn on before has its
      * ink put back, and one that has not is left blank.
+     *
+     * \a renderers is what turns a slot into a render: it resolves the page's own source
+     * (PdfPageRecord::source) and its own page inside that source (PdfPageRecord::index), which is
+     * not the slot's position the moment pages have been moved, deleted or inserted.
      */
     static Strip build(const PdfSessionManifest &manifest,
                        int activePage,
                        int scope,
                        qreal dpi,
-                       PdfRenderBackend &backend,
+                       PdfSourceRenderers &renderers,
                        const QString &projectDir,
                        QString *why = nullptr);
 
     /// The name of the Ink group of a slot, so a page can be found again inside the strip.
     static QString inkGroupName(int page);
+
+    /// The locked layer a slot's page is rendered into, named after the page's SOURCE page number
+    /// and not its position in the notebook: a locked "PDF page N" that changed when the notebook
+    /// was reordered would name a different sheet than the one it holds, while the single-page
+    /// builder has always named it from the record.
     static QString backgroundLayerName(int page);
     static QString inkLayerName(int page);
 

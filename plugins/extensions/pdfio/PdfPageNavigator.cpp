@@ -253,6 +253,7 @@ constexpr qreal ThumbnailRenderDpi = 96;
 
 PdfPageNavigator::PdfPageNavigator()
     : m_saves(SaveLandingTimeoutMs)
+    , m_sourceRenderers([]() { return PdfRenderBackend::create(); })
 {
     /// The window's save is the plugin's own page save: the ink-only document, the crop when the
     /// page lives in a strip, and the asynchronous write saveCurrentPage already owns. Wired once
@@ -600,24 +601,19 @@ void PdfPageNavigator::makeOneThumbnail()
         return;
     }
 
-    if (!m_thumbnailBackend) {
-        m_thumbnailBackend.reset(PdfRenderBackend::create());
-    }
-    if (!m_thumbnailBackend || !m_thumbnailBackend->isOpen()) {
-        if (!m_thumbnailBackend || !m_thumbnailBackend->open(sourcePath())) {
-            return;
-        }
-    }
+    /// Through the source renderers: the page's own source and its own page inside it. A page
+    /// whose source went away gets no thumbnail, which is the same answer the rest of the notebook
+    /// gives, rather than a picture of whatever file happened to be first.
 
     /// Rendered coarser than the page but never as coarse as the thumbnail's own pixel count
     /// suggests. Asking for exactly 256 pixels of an A4 page means about 31 dpi, and text at 31 dpi
     /// is a grey smear: the thumbnail was unreadable. Rendering at 96 and shrinking costs a
     /// megapixel and looks like a page.
-    const PdfPageInfo info = m_thumbnailBackend->pageInfo(index);
+    const PdfPageInfo info = m_sourceRenderers.pageInfo(m_manifest, m_projectDir, index, nullptr);
     const qreal widthPt = qMax(qreal(1), info.sizePt.width());
     const qreal dpi = qBound(ThumbnailRenderDpi, ThumbnailPixels * 72.0 / widthPt, qreal(200));
 
-    const QImage page = m_thumbnailBackend->renderPage(index, dpi);
+    const QImage page = m_sourceRenderers.renderPage(m_manifest, m_projectDir, index, dpi, nullptr);
     if (page.isNull()) {
         return;
     }
@@ -864,9 +860,10 @@ void PdfPageNavigator::closeCurrentPage()
 
 bool PdfPageNavigator::buildForStrip(int index, QString *why)
 {
-    QScopedPointer<PdfRenderBackend> backend(PdfRenderBackend::create());
-    if (!backend || !backend->open(sourcePath())) {
-        fail(why, QStringLiteral("the renderer cannot open the source"));
+    /// The active page's own source, opened once. This used to open "the source" and render pages
+    /// by their notebook position; both are wrong the moment a notebook holds pages from more than
+    /// one PDF, or in an order other than its source's.
+    if (!m_sourceRenderers.forPage(m_manifest, m_projectDir, index, why)) {
         return false;
     }
 
@@ -878,7 +875,7 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     drainWrites(nullptr);
 
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(m_manifest, index, m_scope, m_dpi,
-                                                                *backend, m_projectDir, why);
+                                                                m_sourceRenderers, m_projectDir, why);
     if (!strip.image) {
         return false;
     }
@@ -931,10 +928,15 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         return false;
     }
 
-    QScopedPointer<PdfRenderBackend> backend(PdfRenderBackend::create());
-    if (!backend || !backend->open(sourcePath())) {
-        fail(why, QStringLiteral("the renderer cannot open the source"));
-        return false;
+    /// Every source the new window draws from, opened before anything is done: a roll that cannot
+    /// render its pages has to refuse before it writes and wipes the strip, not after.
+    for (const PdfStripLayout::Slot &slot : target.slots()) {
+        if (slot.page < 0) {
+            continue;
+        }
+        if (!m_sourceRenderers.forPage(m_manifest, m_projectDir, slot.page, why)) {
+            return false;
+        }
     }
 
     const KoColorSpace *colorSpace = m_document->image()->colorSpace();
@@ -1130,11 +1132,13 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             continue;
         }
 
-        const QImage rendered = backend->renderPage(newPage, m_dpi);
+        const QImage rendered =
+            m_sourceRenderers.renderPage(m_manifest, m_projectDir, newPage, m_dpi, nullptr);
         if (paper && !rendered.isNull()) {
             paper->paintDevice()->convertFromQImage(rendered, nullptr,
                                                     slots.at(i).rect.x(), slots.at(i).rect.y());
-            paper->setName(PdfStripBuilder::backgroundLayerName(newPage));
+            paper->setName(PdfStripBuilder::backgroundLayerName(
+                m_manifest.pages.at(newPage).index));
         }
 
         /// Every layer the page has, into the layer of the same name at this page's own
@@ -1519,15 +1523,10 @@ bool PdfPageNavigator::showPage(int index, QString *why)
 
 bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
 {
-    QScopedPointer<PdfRenderBackend> backend(PdfRenderBackend::create());
+    /// The page's own source: the record says which PDF this page's background comes from, and
+    /// the render is of the record's own page inside that file.
+    PdfRenderBackend *backend = m_sourceRenderers.forPage(m_manifest, m_projectDir, index, why);
     if (!backend) {
-        fail(why, QStringLiteral("no PDF render backend on this platform"));
-        return false;
-    }
-
-    const QString source = PdfSession::sourcePath(m_projectDir, m_manifest.sourceFile);
-    if (!backend->open(source)) {
-        fail(why, QStringLiteral("the renderer cannot open %1").arg(source));
         return false;
     }
 
@@ -2189,8 +2188,12 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
         return false;
     }
 
-    const QString path = QDir(m_projectDir).filePath(
-        PdfSession::pageFileName(m_manifest.pages.at(page).index));
+    /// The name the manifest records, not one rebuilt from the page's number. The two agree in a
+    /// notebook that was just created and stop agreeing the moment an operation moves a page's ink
+    /// from one artifact to another -- and a save that lands where no reader looks is ink that is
+    /// silently gone. Every reader in the plugin has always used kraFile; the writer is the last
+    /// one to be brought in line.
+    const QString path = QDir(m_projectDir).filePath(m_manifest.pages.at(page).kraFile);
     QDir().mkpath(QFileInfo(path).absolutePath());
 
     /// Deleted when the save reports back rather than by waiting: a nested event loop around

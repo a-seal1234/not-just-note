@@ -13,6 +13,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
@@ -251,6 +252,8 @@ private Q_SLOTS:
     void testExtractRefusesToOverwriteWithoutTheFlag();
     void testRefusesANewerSchema();
     void testRefusesAnOlderSchema();
+    void testReadsABundleWrittenBeforeSourcesExisted();
+    void testSaveRefusesANotebookWithTwoSources();
     void testRefusesZipSlip();
     void testRefusesAChangedSource();
     void testRefusesAReferencedArtifactTheArchiveLacks();
@@ -557,6 +560,110 @@ void PdfNotebookBundleTest::testRefusesAnOlderSchema()
     QString why;
     QVERIFY(!PdfNotebookBundle::inspect(bundle, &why).isValid());
     QVERIFY2(why.contains(QStringLiteral("schema 0")), qPrintable(why));
+}
+
+/**
+ * A bundle written before sources[] existed still opens.
+ *
+ * The one-file form is how a notebook leaves the device, so a build that refused a schema 1 bundle
+ * would strand every notebook already carried in one. The manifest is upgraded in memory exactly
+ * as it is when a notebook is opened from its own directory, and what lands on extraction is this
+ * build's schema.
+ */
+void PdfNotebookBundleTest::testReadsABundleWrittenBeforeSourcesExisted()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QString project = dir.filePath(QStringLiteral("project"));
+    const PdfSessionManifest manifest = makeProject(project, 2, 2, 2);
+
+    /// The shape a schema 1 build wrote: the schema number, no sources[] list or counter, and no
+    /// per-page source or extra rotation.
+    QJsonObject object = manifest.toJson();
+    object.insert(QStringLiteral("schema"), 1);
+    object.remove(QStringLiteral("sources"));
+    object.remove(QStringLiteral("nextPageNumber"));
+    QJsonArray pages = object.value(QStringLiteral("pages")).toArray();
+    for (int i = 0; i < pages.size(); ++i) {
+        QJsonObject page = pages.at(i).toObject();
+        page.remove(QStringLiteral("source"));
+        page.remove(QStringLiteral("extraRotation"));
+        pages.replace(i, page);
+    }
+    object.insert(QStringLiteral("pages"), pages);
+
+    const QString bundle = dir.filePath(QStringLiteral("legacy.pnb"));
+    QVERIFY(writeRawBundle(bundle, {
+        { QStringLiteral("manifest.json"), QJsonDocument(object).toJson() },
+        { QStringLiteral("source.pdf"), readBytes(QDir(project).filePath(QStringLiteral("source.pdf"))) },
+        { pageName(0), readBytes(QDir(project).filePath(pageName(0))) },
+        { pageName(1), readBytes(QDir(project).filePath(pageName(1))) },
+        { thumbName(0), readBytes(QDir(project).filePath(thumbName(0))) },
+        { thumbName(1), readBytes(QDir(project).filePath(thumbName(1))) },
+    }));
+
+    QString why;
+    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(bundle, &why);
+    QVERIFY2(info.isValid(), qPrintable(why));
+    QCOMPARE(info.manifest.sourceCount(), 1);
+    QCOMPARE(info.manifest.pages.size(), 2);
+    QCOMPARE(info.manifest.pages.at(0).source, 0);
+
+    const QString dest = dir.filePath(QStringLiteral("unpacked"));
+    QVERIFY2(PdfNotebookBundle::extract(bundle, dest, &why), qPrintable(why));
+
+    const PdfSessionManifest read = PdfSession::openProject(dest, &why);
+    QVERIFY2(read.isValid(&why), qPrintable(why));
+    QCOMPARE(read.schema, PdfSessionManifest::CurrentSchema);
+    QCOMPARE(read.sourceCount(), 1);
+    QCOMPARE(read.pages.at(0).source, 0);
+}
+
+/**
+ * A notebook whose pages come from two PDFs is refused by the one-file form, rather than written
+ * without its second source.
+ *
+ * The archive carries exactly one PDF and verifies that one. Writing this notebook out would
+ * produce a file that unpacks into a notebook whose pages from the other PDF render blank, with
+ * nothing said at either end -- so it is refused until the format carries sources[].
+ */
+void PdfNotebookBundleTest::testSaveRefusesANotebookWithTwoSources()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QString project = dir.filePath(QStringLiteral("project"));
+    PdfSessionManifest manifest = makeProject(project, 2, 2, 2);
+
+    /// A second source inside the project, and a page that draws from it.
+    QVERIFY(QDir().mkpath(QDir(project).filePath(QStringLiteral("sources"))));
+    const QString extra = QStringLiteral("sources/9f3a1c02-handout.pdf");
+    QVERIFY(QFile::copy(QDir(project).filePath(QStringLiteral("source.pdf")),
+                        QDir(project).filePath(extra)));
+
+    PdfSourceRecord first;
+    first.file = manifest.sourceFile;
+    first.sha256 = manifest.sourceSha256;
+    first.byteSize = manifest.sourceByteSize;
+    PdfSourceRecord second;
+    second.file = extra;
+    second.sha256 = PdfSessionManifest::sha256OfFile(QDir(project).filePath(extra));
+    second.byteSize = QFileInfo(QDir(project).filePath(extra)).size();
+    manifest.sources.clear();
+    manifest.sources << first << second;
+    manifest.pages[1].source = 1;
+
+    QString why;
+    QVERIFY2(manifest.writeTo(QDir(project).filePath(QStringLiteral("manifest.json")), &why),
+             qPrintable(why));
+
+    const QString bundle = dir.filePath(QStringLiteral("two-sources.pnb"));
+    why.clear();
+    QVERIFY2(!PdfNotebookBundle::save(project, bundle, &why),
+             "the notebook was written out without its second source");
+    QVERIFY2(why.contains(QStringLiteral("draws pages from 2 PDFs")), qPrintable(why));
+    QVERIFY(!QFileInfo::exists(bundle));
 }
 
 void PdfNotebookBundleTest::testRefusesZipSlip()

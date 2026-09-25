@@ -106,7 +106,15 @@ bool PdfSession::isPathInsideProject(const QString &projectDir, const QString &r
 
 QString PdfSession::pageFileName(int index)
 {
-    return numbered(QStringLiteral("pages"), QStringLiteral("p"), index, QStringLiteral(".kra"));
+    return pageFileNameForNumber(index + 1);
+}
+
+QString PdfSession::pageFileNameForNumber(int number)
+{
+    /// The same shape PdfSessionManifest::refreshNextPageNumber() reads back, and the one the
+    /// manifest's pageFileName() has always produced: "pages/pNNNN.kra".
+    return QStringLiteral("pages/p%1.kra")
+        .arg(QString::number(number).rightJustified(4, QLatin1Char('0')));
 }
 
 QString PdfSession::thumbFileName(int index)
@@ -153,6 +161,14 @@ PdfSessionManifest PdfSession::createProject(const QString &projectDir,
     manifest.sourceSha256 = PdfSessionManifest::sha256OfFile(copied);
     manifest.sourceByteSize = QFileInfo(copied).size();
 
+    /// The list those three fields describe, so a page can name the file its background comes from
+    /// from the very first page: one source now, more once pages arrive from another PDF.
+    PdfSourceRecord source;
+    source.file = sourceFile;
+    source.sha256 = manifest.sourceSha256;
+    source.byteSize = manifest.sourceByteSize;
+    manifest.sources.append(source);
+
     for (int i = 0; i < backend.pageCount(); ++i) {
         const PdfPageInfo info = backend.pageInfo(i);
         if (!info.isValid()) {
@@ -169,6 +185,10 @@ PdfSessionManifest PdfSession::createProject(const QString &projectDir,
         page.generation = 0;
         manifest.pages.append(page);
     }
+
+    /// One page per number, and the counter past them: a number handed out later can never be one
+    /// of these, whatever happens to the page list in between.
+    manifest.refreshNextPageNumber();
 
     if (!manifest.writeTo(manifestPath(projectDir), why)) {
         return PdfSessionManifest();
@@ -192,18 +212,33 @@ PdfSessionManifest PdfSession::openProject(const QString &projectDir, QString *w
         return PdfSessionManifest();
     }
 
-    const QString source = sourcePath(projectDir, manifest.sourceFile);
-    if (!QFileInfo::exists(source)) {
-        fail(why, QStringLiteral("the source file %1 is missing").arg(manifest.sourceFile));
-        return PdfSessionManifest();
-    }
+    /// Every source, not only the first. A notebook whose pages arrived from another PDF draws
+    /// those pages' backgrounds from that file too, and one that is missing or has been edited
+    /// would otherwise render blank paper -- or the wrong page -- with nothing said.
+    for (int i = 0; i < manifest.sourceCount(); ++i) {
+        const PdfSourceRecord record = manifest.sourceAt(i);
+        const QString source = sourcePath(projectDir, record.file);
+        if (!QFileInfo::exists(source)) {
+            fail(why, i == 0
+                          ? QStringLiteral("the source file %1 is missing").arg(record.file)
+                          : QStringLiteral("the source file %1 that the notebook's page backgrounds "
+                                           "are drawn from is missing").arg(record.file));
+            return PdfSessionManifest();
+        }
 
-    /// The source is never written back to, so a checksum change means someone else edited
-    /// or replaced it and the recorded page geometry can no longer be trusted.
-    if (PdfSessionManifest::sha256OfFile(source) != manifest.sourceSha256) {
-        fail(why, QStringLiteral("the source file %1 changed since the project was created")
-                      .arg(manifest.sourceFile));
-        return PdfSessionManifest();
+        /// A source is never written back to, so a checksum change means someone else edited or
+        /// replaced it and the recorded page geometry can no longer be trusted.
+        if (PdfSessionManifest::sha256OfFile(source) != record.sha256) {
+            fail(why, QStringLiteral("the source file %1 changed since the project was created")
+                          .arg(record.file));
+            return PdfSessionManifest();
+        }
+
+        /// And every one of them has to stay inside the project, the same rule the first has
+        /// always had: a source's name is joined onto the project directory to be opened.
+        if (!isPathInsideProject(projectDir, record.file, why)) {
+            return PdfSessionManifest();
+        }
     }
 
     return manifest;
