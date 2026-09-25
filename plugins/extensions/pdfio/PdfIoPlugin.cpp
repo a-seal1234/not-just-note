@@ -1150,9 +1150,24 @@ void PdfIoPlugin::slotSaveNotebook()
 QString PdfIoPlugin::bundleSuggestion() const
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
-    const QString base = navigator->hasNotebook()
-        ? QFileInfo(navigator->manifest().sourceFile).completeBaseName()
-        : QStringLiteral("notebook");
+
+    /// The notebook's own name, the same one the tab and the export suggestion use. The source file
+    /// is the cache copy the PDF arrived in, so its base name is the "pdfio-picked" the user never
+    /// chose -- which is exactly what this used to suggest. Only a notebook with no name of its own
+    /// falls back to it, and only a notebook at all falls back to "notebook".
+    QString base;
+    if (navigator->hasNotebook()) {
+        /// From disk, not from the navigator's copy: a rename is written out and the copy the
+        /// navigator holds is not updated with it, so a suggestion read from memory kept the old
+        /// name -- measured on the desktop, "bundle suggestion after rename: text-fixture.pnb".
+        base = notebookNameFromDisk(navigator->projectDir());
+        if (base.isEmpty()) {
+            base = QFileInfo(navigator->manifest().sourceFile).completeBaseName();
+        }
+    }
+    if (base.isEmpty()) {
+        base = QStringLiteral("notebook");
+    }
     return base + QLatin1Char('.') + PdfNotebookBundle::extension();
 }
 
