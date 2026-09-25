@@ -19,9 +19,12 @@
 #include <QScopedPointer>
 #include <QFont>
 
+#include <functional>
+
 #include "config-updaters.h"
 class RecentItemDelegate;
 class KisMainWindow;
+class ExtraRecentEntriesProxy;
 
 // Custom QAction to bridge a QLabel::linkActivated signal to a QAction::setChecked signal
 class ShowNewsAction : public QAction
@@ -44,6 +47,39 @@ class KRITAUI_EXPORT KisWelcomePageWidget : public QWidget, public Ui::KisWelcom
 
     void setMainWindow(KisMainWindow* m_mainWindow);
 
+    /**
+     * An extra entry for the Recent Images list: a notebook, in practice, shown beside Krita's own
+     * recent documents.
+     *
+     * Core UI knows nothing about what an entry is. \a token is opaque and is handed back to the
+     * activation callback when the entry is clicked; \a thumbnailPath may be empty, in which case a
+     * plain icon stands in.
+     */
+    struct ExtraRecentEntry {
+        QString name;
+        QString thumbnailPath;
+        QString token;
+    };
+
+    /**
+     * Replaces the extra entries every welcome page shows, and the callback an entry's click calls.
+     *
+     * Called by the pdfio plugin; with an empty list the extra rows go away again. Krita's own
+     * recent documents are never touched: the entries are appended beside them by a proxy this
+     * widget owns, and an extra row has no source index at all.
+     */
+    static void setExtraRecentEntries(const QList<ExtraRecentEntry> &entries,
+                                      std::function<void(const QString &token)> activate);
+
+    /**
+     * Registers the two notebook buttons beside New Image and Open Image.
+     *
+     * Both stay hidden until handlers are set, so a core UI without the pdfio plugin looks exactly
+     * as it did. Passing empty functions hides them again.
+     */
+    static void setNotebookActions(std::function<void()> importNotebook,
+                                   std::function<void()> openNotebookFile);
+
 public Q_SLOTS:
     /// if a document is placed over this area, a dotted line will appear as an indicator
     /// that it is a droppable area. KisMainwindow is what triggers this
@@ -63,6 +99,8 @@ private Q_SLOTS:
 
     void recentDocumentClicked(QModelIndex index);
     void slotRecentDocContextMenuRequest(const QPoint &pos);
+    void slotImportNotebookClicked();
+    void slotOpenNotebookClicked();
 
     /**
      * Once all files in the recent documents model are checked, cleanup the UI if the model is empty
@@ -97,6 +135,12 @@ protected:
 
 
 private:
+    /// Rebuilds the extra rows from the static registry above.
+    void refreshExtraRecentEntries();
+
+    /// Shows and enables the notebook buttons from the static registry above.
+    void updateNotebookButtons();
+
     void setupNewsLangSelection(QMenu *newsOptionMenu);
     void showDevVersionHighlight();
 
@@ -133,6 +177,15 @@ private:
 
     QScopedPointer<RecentItemDelegate> recentItemDelegate;
 
+    /// Krita's recent-documents model with the extra entries appended; owned by this widget.
+    ExtraRecentEntriesProxy *m_extraProxy {nullptr};
+
+    /// Every live welcome page, so a static registration can reach them all.
+    static QList<KisWelcomePageWidget *> s_instances;
+    static QList<ExtraRecentEntry> s_extraEntries;
+    static std::function<void(const QString &token)> s_activateExtra;
+    static std::function<void()> s_importNotebook;
+    static std::function<void()> s_openNotebook;
 };
 
 #endif // KISWELCOMEPAGEWIDGET_H

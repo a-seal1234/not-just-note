@@ -8,6 +8,7 @@
 
 #include "KisWelcomePageWidget.h"
 #include "KisRecentDocumentsModelWrapper.h"
+#include <QAbstractProxyModel>
 #include <QDesktopServices>
 #include <QMimeData>
 #include <QPixmap>
@@ -119,6 +120,148 @@ public:
     }
 };
 
+
+/// The role an extra row carries its opaque token in; file scope so the class below can be the
+/// type the header forward-declares rather than an anonymous one of the same name.
+/// The role an extra row carries its opaque token in.
+const int ExtraRecentTokenRole = Qt::UserRole + 100;
+
+/**
+ * Krita's recent-documents model with the extra entries appended after it.
+ *
+ * Strictly read-only over the source: it never inserts, removes or writes a row in Krita's model,
+ * and mapToSource() refuses to guess for an extra row -- a notebook is not a document, and anything
+ * that asks the view for a source index must get an invalid one rather than a wrong document. Core
+ * UI does not need to know what an entry is; the token is handed to the callback the plugin
+ * registered.
+ */
+class ExtraRecentEntriesProxy : public QAbstractProxyModel
+{
+public:
+    explicit ExtraRecentEntriesProxy(QObject *parent = nullptr)
+        : QAbstractProxyModel(parent)
+    {
+    }
+
+    void setSourceModel(QAbstractItemModel *source) override
+    {
+        beginResetModel();
+        QAbstractProxyModel::setSourceModel(source);
+        endResetModel();
+    }
+
+    void setEntries(const QList<KisWelcomePageWidget::ExtraRecentEntry> &entries)
+    {
+        beginResetModel();
+        m_entries = entries;
+        endResetModel();
+    }
+
+    int rowCount(const QModelIndex &parent = QModelIndex()) const override
+    {
+        if (parent.isValid() || !sourceModel()) {
+            return 0;
+        }
+        return sourceModel()->rowCount() + m_entries.size();
+    }
+
+    int columnCount(const QModelIndex &parent = QModelIndex()) const override
+    {
+        Q_UNUSED(parent);
+        return 1;
+    }
+
+    QModelIndex index(int row, int column, const QModelIndex &parent = QModelIndex()) const override
+    {
+        if (parent.isValid() || column != 0 || row < 0 || row >= rowCount()) {
+            return QModelIndex();
+        }
+        return createIndex(row, column);
+    }
+
+    QModelIndex parent(const QModelIndex &) const override
+    {
+        return QModelIndex();
+    }
+
+    QModelIndex mapToSource(const QModelIndex &proxyIndex) const override
+    {
+        if (!proxyIndex.isValid() || !sourceModel() || isExtraRow(proxyIndex)) {
+            /// An extra row has no source index; an invalid one is the honest answer.
+            return QModelIndex();
+        }
+        return sourceModel()->index(proxyIndex.row(), 0);
+    }
+
+    QModelIndex mapFromSource(const QModelIndex &sourceIndex) const override
+    {
+        if (!sourceIndex.isValid()) {
+            return QModelIndex();
+        }
+        return index(sourceIndex.row(), 0);
+    }
+
+    QVariant data(const QModelIndex &proxyIndex, int role) const override
+    {
+        if (!proxyIndex.isValid()) {
+            return QVariant();
+        }
+        if (!isExtraRow(proxyIndex)) {
+            return sourceModel() ? sourceModel()->data(mapToSource(proxyIndex), role) : QVariant();
+        }
+
+        const KisWelcomePageWidget::ExtraRecentEntry &entry =
+            m_entries.at(proxyIndex.row() - sourceModel()->rowCount());
+        switch (role) {
+        case Qt::DisplayRole:
+        case Qt::ToolTipRole:
+            return entry.name;
+        case Qt::DecorationRole: {
+            const QIcon thumbnail(entry.thumbnailPath);
+            /// A notebook with no thumbnail yet still has to be visible and clickable.
+            return thumbnail.isNull() ? KisIconUtils::loadIcon(QStringLiteral("document-open"))
+                                      : thumbnail;
+        }
+        default:
+            return QVariant();
+        }
+    }
+
+    Qt::ItemFlags flags(const QModelIndex &proxyIndex) const override
+    {
+        if (!proxyIndex.isValid()) {
+            return Qt::NoItemFlags;
+        }
+        if (isExtraRow(proxyIndex)) {
+            return Qt::ItemIsEnabled;
+        }
+        return sourceModel() ? sourceModel()->flags(mapToSource(proxyIndex)) : Qt::NoItemFlags;
+    }
+
+    bool isExtraRow(const QModelIndex &proxyIndex) const
+    {
+        if (!proxyIndex.isValid() || !sourceModel()) {
+            return false;
+        }
+        return proxyIndex.row() >= sourceModel()->rowCount();
+    }
+
+    QString tokenFor(const QModelIndex &proxyIndex) const
+    {
+        if (!isExtraRow(proxyIndex)) {
+            return QString();
+        }
+        return m_entries.at(proxyIndex.row() - sourceModel()->rowCount()).token;
+    }
+
+private:
+    QList<KisWelcomePageWidget::ExtraRecentEntry> m_entries;
+};
+/// ...
+
+QList<KisWelcomePageWidget *> KisWelcomePageWidget::s_instances;
+QList<KisWelcomePageWidget::ExtraRecentEntry> KisWelcomePageWidget::s_extraEntries;
+std::function<void(const QString &)> KisWelcomePageWidget::s_activateExtra;
 
 KisWelcomePageWidget::KisWelcomePageWidget(QWidget *parent)
     : QWidget(parent)
@@ -242,10 +385,87 @@ KisWelcomePageWidget::KisWelcomePageWidget(QWidget *parent)
 
     // Drop area..
     setAcceptDrops(true);
+
+    /// So a registration made before or after this page exists reaches it.
+    s_instances.append(this);
 }
 
 KisWelcomePageWidget::~KisWelcomePageWidget()
 {
+    s_instances.removeAll(this);
+}
+
+void KisWelcomePageWidget::setExtraRecentEntries(const QList<ExtraRecentEntry> &entries,
+                                                 std::function<void(const QString &token)> activate)
+{
+    s_extraEntries = entries;
+    s_activateExtra = activate;
+
+    const QList<KisWelcomePageWidget *> pages = s_instances;
+    for (KisWelcomePageWidget *page : pages) {
+        page->refreshExtraRecentEntries();
+    }
+}
+
+std::function<void()> KisWelcomePageWidget::s_importNotebook;
+std::function<void()> KisWelcomePageWidget::s_openNotebook;
+
+void KisWelcomePageWidget::setNotebookActions(std::function<void()> importNotebook,
+                                              std::function<void()> openNotebookFile)
+{
+    s_importNotebook = importNotebook;
+    s_openNotebook = openNotebookFile;
+
+    const QList<KisWelcomePageWidget *> pages = s_instances;
+    for (KisWelcomePageWidget *page : pages) {
+        page->updateNotebookButtons();
+    }
+}
+
+void KisWelcomePageWidget::updateNotebookButtons()
+{
+    /// Styled like the two links beside them, and visible only while a handler is registered: with
+    /// no pdfio plugin this screen is exactly the one Krita ships.
+    QFont linkFont = font();
+    linkFont.setUnderline(true);
+    const QList<QToolButton *> buttons{ importNotebookLink, openNotebookLink };
+    for (QToolButton *button : buttons) {
+        button->setFont(linkFont);
+        button->setStyleSheet(blendedStyle);
+        button->setIconSize(QSize(48, 48));
+        button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        button->setCursor(Qt::PointingHandCursor);
+    }
+    importNotebookLink->setIcon(KisIconUtils::loadIcon(QStringLiteral("document-import")));
+    openNotebookLink->setIcon(KisIconUtils::loadIcon(QStringLiteral("document-open")));
+
+    importNotebookLink->setVisible(bool(s_importNotebook));
+    importNotebookLink->setEnabled(bool(s_importNotebook));
+    openNotebookLink->setVisible(bool(s_openNotebook));
+    openNotebookLink->setEnabled(bool(s_openNotebook));
+}
+
+void KisWelcomePageWidget::slotImportNotebookClicked()
+{
+    if (s_importNotebook) {
+        s_importNotebook();
+    }
+}
+
+void KisWelcomePageWidget::slotOpenNotebookClicked()
+{
+    if (s_openNotebook) {
+        s_openNotebook();
+    }
+}
+
+void KisWelcomePageWidget::refreshExtraRecentEntries()
+{
+    if (!m_extraProxy) {
+        return;
+    }
+    m_extraProxy->setEntries(s_extraEntries);
+    slotRecentFilesModelIsUpToDate();
 }
 
 void KisWelcomePageWidget::setMainWindow(KisMainWindow* mainWin)
@@ -262,6 +482,9 @@ void KisWelcomePageWidget::setMainWindow(KisMainWindow* mainWin)
         // until after the view manager is set
         connect(newFileLink, SIGNAL(clicked(bool)), this, SLOT(slotNewFileClicked()));
         connect(openFileLink, SIGNAL(clicked(bool)), this, SLOT(slotOpenFileClicked()));
+        connect(importNotebookLink, SIGNAL(clicked(bool)), this, SLOT(slotImportNotebookClicked()));
+        connect(openNotebookLink, SIGNAL(clicked(bool)), this, SLOT(slotOpenNotebookClicked()));
+        updateNotebookButtons();
         connect(clearRecentFilesLink, SIGNAL(clicked(bool)), mainWin, SLOT(clearRecentFiles()));
 
         KisAction *pasteAction = mainWin->viewManager()->actionManager()->actionByName("edit_paste");
@@ -274,7 +497,15 @@ void KisWelcomePageWidget::setMainWindow(KisMainWindow* mainWin)
 
         KisRecentDocumentsModelWrapper *recentFilesModel = KisRecentDocumentsModelWrapper::instance();
         connect(recentFilesModel, SIGNAL(sigModelIsUpToDate()), this, SLOT(slotRecentFilesModelIsUpToDate()));
-        recentDocumentsListView->setModel(&recentFilesModel->model());
+
+        /// The view gets a proxy, not Krita's model itself: the extra entries live only here, and
+        /// Krita's own recent documents are read through it untouched. Rebuilds of Krita's list
+        /// reset the proxy with it, so the extra rows survive them.
+        m_extraProxy = new ExtraRecentEntriesProxy(this);
+        m_extraProxy->setSourceModel(&recentFilesModel->model());
+        m_extraProxy->setEntries(s_extraEntries);
+        recentDocumentsListView->setModel(m_extraProxy);
+
         slotRecentFilesModelIsUpToDate();
     }
 }
@@ -629,7 +860,21 @@ void KisWelcomePageWidget::updateShortcutLink(QToolButton *button, QLabel *label
 
 void KisWelcomePageWidget::recentDocumentClicked(QModelIndex index)
 {
-    QString fileUrl = index.data(Qt::ToolTipRole).toString();
+    /// An extra entry is not a document: it goes to whoever registered it, and never through
+    /// openDocument(). Everything else maps back to Krita's own model first.
+    if (m_extraProxy && m_extraProxy->isExtraRow(index)) {
+        const QString token = m_extraProxy->tokenFor(index);
+        if (s_activateExtra && !token.isEmpty()) {
+            s_activateExtra(token);
+        }
+        return;
+    }
+
+    const QModelIndex source = m_extraProxy ? m_extraProxy->mapToSource(index) : index;
+    if (!source.isValid()) {
+        return;
+    }
+    QString fileUrl = source.data(Qt::ToolTipRole).toString();
     m_mainWindow->openDocument(fileUrl, KisMainWindow::None );
 }
 
@@ -637,15 +882,23 @@ void KisWelcomePageWidget::slotRecentDocContextMenuRequest(const QPoint &pos)
 {
     QMenu contextMenu;
     QModelIndex index = recentDocumentsListView->indexAt(pos);
+
+    /// A notebook is not one of Krita's recent documents, so there is nothing here to forget:
+    /// "Clear recent" must leave the extra entries alone.
+    if (m_extraProxy && m_extraProxy->isExtraRow(index)) {
+        return;
+    }
+
+    const QModelIndex source = m_extraProxy ? m_extraProxy->mapToSource(index) : index;
     QAction *actionForget = 0;
-    if (index.isValid()) {
-        actionForget = new QAction(i18n("Forget \"%1\"", index.data(Qt::DisplayRole).toString()), &contextMenu);
+    if (source.isValid()) {
+        actionForget = new QAction(i18n("Forget \"%1\"", source.data(Qt::DisplayRole).toString()), &contextMenu);
         contextMenu.addAction(actionForget);
     }
     QAction *triggered = contextMenu.exec(recentDocumentsListView->mapToGlobal(pos));
 
-    if (index.isValid() && triggered == actionForget) {
-        m_mainWindow->removeRecentFile(index.data(Qt::ToolTipRole).toString());
+    if (source.isValid() && triggered == actionForget) {
+        m_mainWindow->removeRecentFile(source.data(Qt::ToolTipRole).toString());
     }
 }
 
@@ -683,7 +936,9 @@ void KisWelcomePageWidget::slotPaste()
 void KisWelcomePageWidget::slotRecentFilesModelIsUpToDate()
 {
     KisRecentDocumentsModelWrapper *recentFilesModel = KisRecentDocumentsModelWrapper::instance();
-    const bool modelIsEmpty = recentFilesModel->model().rowCount() == 0;
+    /// The extra rows count too: a Start screen holding only notebooks is not an empty list.
+    const int rows = m_extraProxy ? m_extraProxy->rowCount() : recentFilesModel->model().rowCount();
+    const bool modelIsEmpty = rows == 0;
 
     if (modelIsEmpty) {
         recentDocsStackedWidget->setCurrentWidget(labelNoRecentDocs);

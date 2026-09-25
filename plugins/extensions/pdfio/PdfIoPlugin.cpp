@@ -43,6 +43,7 @@
 
 #include <QHash>
 #include <QImage>
+#include <QPixmap>
 
 #include <KoDocumentInfo.h>
 
@@ -59,6 +60,7 @@
 #include <KisMainWindow.h>
 #include <KisPart.h>
 #include <KisViewManager.h>
+#include <KisWelcomePageWidget.h>
 #include <kis_canvas_controller.h>
 #include <kis_node_manager.h>
 #include <kis_action.h>
@@ -92,6 +94,10 @@ qint64 residentKb()
     }
     return fields.at(1).toLongLong() * (sysconf(_SC_PAGESIZE) / 1024);
 }
+
+/// Puts the notebook list on the Start screen; defined with the open helpers far below, and
+/// declared here because the plugin constructor uses it.
+void refreshWelcomePageEntries();
 
 /// One recent notebook is remembered as its project directory, a separator, and the name to show.
 /// A directory cannot contain the separator and the name has it stripped, so the split is never
@@ -211,6 +217,7 @@ void rememberRecentNotebook()
     }
     entries.prepend(dir + RecentSeparator + name);
     writeRecentNotebooks(entries);
+    refreshWelcomePageEntries();
 }
 
 /// Gives a notebook its name the first time it is opened: the source PDF's own name, which is what
@@ -259,6 +266,10 @@ void notebookOpened(bool defaultTheName = true)
 /// Puts the notebook's name on the open document's tab; defined with the other name helpers below,
 /// and declared here because the Android provider-name path is defined above them and uses it.
 void applyNotebookNameToTab();
+
+/// Puts the notebook list on the Start screen; defined with the open helpers below, and declared
+/// here because the recent-list bookkeeping above it refreshes that screen.
+void refreshWelcomePageEntries();
 
 #if defined(Q_OS_ANDROID)
 /// Asks the provider for the name of the PDF that was just imported, on the event loop and after
@@ -416,6 +427,50 @@ void applyNotebookNameToTab()
                                      .arg(navigator->pageCount()));
 }
 
+/// Puts the notebook list on the Start screen's Recent Images list.
+///
+/// Krita's own recent documents are left alone: the welcome page appends these beside them through
+/// a proxy of its own, and a click comes back here as the project directory. A notebook whose
+/// directory or manifest is gone is dropped on this pass, so it disappears from the screen on the
+/// next refresh rather than lingering as a dead row; one with no thumbnail yet gets a plain icon.
+void refreshWelcomePageEntries()
+{
+    QList<KisWelcomePageWidget::ExtraRecentEntry> entries;
+    for (const QString &entry : recentNotebookEntries()) {
+        const QString dir = recentNotebookDir(entry);
+        QString why;
+        const PdfSessionManifest manifest =
+            PdfSessionManifest::readFrom(PdfSession::manifestPath(dir), &why);
+        if (!manifest.isValid()) {
+            continue;
+        }
+
+        KisWelcomePageWidget::ExtraRecentEntry extra;
+        extra.name = entry.section(RecentSeparator, 1);
+        if (extra.name.isEmpty()) {
+            extra.name = manifest.displayName();
+        }
+        const QString thumbnail = QDir(dir).filePath(QStringLiteral("thumbs/p0001.png"));
+        extra.thumbnailPath = QFileInfo::exists(thumbnail) ? thumbnail : QString();
+        extra.token = dir;
+        entries.append(extra);
+    }
+
+    KisWelcomePageWidget::setExtraRecentEntries(
+        entries, [](const QString &projectDir) {
+            QString why;
+            const PdfSessionManifest manifest =
+                PdfSessionManifest::readFrom(PdfSession::manifestPath(projectDir), &why);
+            if (!manifest.isValid()) {
+                say(QStringLiteral("that recent notebook can no longer be read: %1").arg(why));
+                return;
+            }
+            /// The same close-first path the Recent notebooks menu uses.
+            openNotebookReplacing(PdfSession::sourcePath(projectDir, manifest.sourceFile),
+                                  QString(), 6);
+        });
+}
+
 /// Writes \a entered into the open notebook's manifest as its name, with the same rejection the
 /// dialog path has, and puts it on the docker. Shared so the menu action and the probe do not
 /// drift apart.
@@ -450,6 +505,7 @@ bool applyNotebookName(const QString &entered)
     reloadDockerNames();
     applyNotebookNameToTab();
     rememberRecentNotebook();
+    refreshWelcomePageEntries();
     return true;
 }
 
@@ -600,6 +656,10 @@ PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
     /// Once per process: a view plugin is created for every view.
     registerPdfIoDocker();
 
+    /// The Start screen asks for its notebook entries; the welcome page applies them when it is
+    /// built, whenever that happens, because the registration is kept statically.
+    refreshWelcomePageEntries();
+
     /// Temporary: answers whether the Android render backend can be pure C++.
     PdfRendererSpike::run();
 
@@ -743,6 +803,15 @@ void PdfIoPlugin::registerActions()
             menu = window->menuBar()->addMenu(i18n("PDF Notebook"));
             menu->setObjectName(QStringLiteral("pdfio_menu"));
         }
+
+        /// The Start screen's two notebook buttons use the very same handlers as the menu below.
+        /// The registration is cleared when this instance goes, so a welcome page that outlives it
+        /// does not call into a dead object.
+        KisWelcomePageWidget::setNotebookActions([this]() { slotOpenNotebook(); },
+                                                 [this]() { slotOpenNotebookBundle(); });
+        connect(this, &QObject::destroyed, []() {
+            KisWelcomePageWidget::setNotebookActions(nullptr, nullptr);
+        });
 
         /// And the first-screen stand-ins go before the real actions are added: two entries that
         /// do the same thing is how a menu starts looking broken.
