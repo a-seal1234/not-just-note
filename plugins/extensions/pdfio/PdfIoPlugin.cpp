@@ -35,6 +35,7 @@
 #include "session/PdfExporter.h"
 #include "session/PdfInkLoader.h"
 #include "session/PdfNotebookBundle.h"
+#include "session/PdfNotebookOps.h"
 #include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfStripBuilder.h"
@@ -614,22 +615,198 @@ void addMenuSeparator(QMenu *menu, const QString &objectName)
     separator->setObjectName(objectName);
 }
 
-/// Puts "Rename notebook..." under \a menu, after the document entries it acts on.
-void addRenameNotebookAction(QMenu *menu)
+/// Runs one notebook-level operation the way its invariants require: write the open pages first,
+/// change the notebook, then reload it and open the page the operation answers with.
+///
+/// Every entry goes through here so that order cannot drift. The flush is what keeps an operation
+/// from being applied to the manifest while ink is still in the air; the reload is what keeps the
+/// open document and the strip describing the notebook that is now on disk.
+bool applyNotebookOperation(const QString &title,
+                            const std::function<PdfNotebookOps::Outcome(const QString &, int)> &operation)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, title, i18n("No notebook is open."));
+        return false;
+    }
+
+    QString why;
+    if (!navigator->prepareForNotebookChange(&why)) {
+        say(QStringLiteral("notebook operation refused before it started: %1").arg(why));
+        QMessageBox::warning(nullptr, title,
+                             i18n("The notebook could not be written, so it was not changed: %1", why));
+        return false;
+    }
+
+    const PdfNotebookOps::Outcome outcome = operation(navigator->projectDir(), navigator->currentIndex());
+    if (!outcome.ok) {
+        say(QStringLiteral("notebook operation refused: %1").arg(outcome.why));
+        QMessageBox::warning(nullptr, title, outcome.why);
+        return false;
+    }
+
+    say(outcome.summary);
+    if (!navigator->reloadNotebook(outcome.anchorPage, &why)) {
+        say(QStringLiteral("notebook operation applied, but the notebook could not be reopened: %1").arg(why));
+        QMessageBox::warning(nullptr, title,
+                             i18n("The notebook was changed, but it could not be opened again: %1", why));
+        return false;
+    }
+    return true;
+}
+
+/// Enables what the notebook can actually do right now.
+///
+/// This is why the entries are plain QActions and not rows in PdfIoPlugin.action: "move up" means
+/// nothing on the first page, "delete" would empty a one-page notebook, and "undo" depends on
+/// whether a change is waiting -- none of which the .action file's activationFlags can see.
+void updateNotebookOpsActions(QMenu *ops)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    const bool open = navigator->hasNotebook();
+    const int index = navigator->currentIndex();
+    const int pages = navigator->pageCount();
+
+    const auto set = [ops, open](const char *name, bool possible) {
+        QAction *action = ops->findChild<QAction *>(QString::fromLatin1(name));
+        if (!action) {
+            /// A name that is not there is a mistake in this file rather than a state: said out
+            /// loud, so renaming an entry cannot quietly leave it enabled or disabled for good.
+            qWarning("[pdfio] the Notebook ops submenu has no entry called %s", name);
+            return;
+        }
+        action->setEnabled(open && possible);
+    };
+
+    set("pdfio_rename_notebook", true);
+    set("pdfio_ops_move_up", index > 0);
+    set("pdfio_ops_move_down", index >= 0 && index < pages - 1);
+    set("pdfio_ops_move_to", pages > 1);
+    set("pdfio_ops_duplicate", pages >= 1);
+    /// A notebook keeps at least one page, and the engine refuses to delete the last one.
+    set("pdfio_ops_delete", pages > 1);
+    set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
+}
+
+/// The "Notebook ops" submenu: everything that changes the notebook itself rather than the page on
+/// screen, under one entry. Deduped like the entries around it, because registerActions() runs
+/// again for a second view and is retried while the first screen has no window.
+void addNotebookOpsMenu(QMenu *menu)
 {
     if (!menu) {
         return;
     }
 
-    if (QAction *previous = menu->findChild<QAction *>(QStringLiteral("pdfio_rename_notebook"))) {
-        menu->removeAction(previous);
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_notebook_ops"))) {
+        menu->removeAction(previous->menuAction());
         previous->deleteLater();
     }
 
-    addMenuSeparator(menu, QStringLiteral("pdfio_rename_separator"));
-    QAction *rename = menu->addAction(i18n("Rename notebook..."));
+    /// One home for the notebook-level entries. A registration from before the submenu existed put
+    /// "Rename notebook..." straight on the menu, and the separator it brought with it; both are
+    /// taken off here rather than left as a second place the same action appears.
+    const QStringList replaced = { QStringLiteral("pdfio_rename_notebook"),
+                                   QStringLiteral("pdfio_rename_separator") };
+    for (const QString &name : replaced) {
+        if (QAction *previous = menu->findChild<QAction *>(name, Qt::FindDirectChildrenOnly)) {
+            menu->removeAction(previous);
+            previous->deleteLater();
+        }
+    }
+
+    QMenu *ops = menu->addMenu(i18n("Notebook ops"));
+    ops->setObjectName(QStringLiteral("pdfio_notebook_ops"));
+
+    /// Rename first: it is the one notebook-level entry that was already there, and the one the
+    /// submenu is a new home for.
+    QAction *rename = ops->addAction(i18n("Rename notebook..."));
     rename->setObjectName(QStringLiteral("pdfio_rename_notebook"));
-    QObject::connect(rename, &QAction::triggered, menu, []() { renameNotebook(); });
+    QObject::connect(rename, &QAction::triggered, ops, []() { renameNotebook(); });
+
+    ops->addSeparator();
+
+    QAction *moveUp = ops->addAction(i18n("Move page up"));
+    moveUp->setObjectName(QStringLiteral("pdfio_ops_move_up"));
+    QObject::connect(moveUp, &QAction::triggered, ops, []() {
+        applyNotebookOperation(i18n("Move page up"), [](const QString &dir, int page) {
+            return PdfNotebookOps::movePage(dir, page, page - 1, page);
+        });
+    });
+
+    QAction *moveDown = ops->addAction(i18n("Move page down"));
+    moveDown->setObjectName(QStringLiteral("pdfio_ops_move_down"));
+    QObject::connect(moveDown, &QAction::triggered, ops, []() {
+        applyNotebookOperation(i18n("Move page down"), [](const QString &dir, int page) {
+            return PdfNotebookOps::movePage(dir, page, page + 1, page);
+        });
+    });
+
+    QAction *moveTo = ops->addAction(i18n("Move to page..."));
+    moveTo->setObjectName(QStringLiteral("pdfio_ops_move_to"));
+    QObject::connect(moveTo, &QAction::triggered, ops, []() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        if (!navigator->hasNotebook()) {
+            return;
+        }
+        bool accepted = false;
+        const int target =
+            QInputDialog::getInt(nullptr, i18n("Move page"),
+                                 i18n("Move page %1 to which position?", navigator->currentIndex() + 1),
+                                 navigator->currentIndex() + 1, 1, navigator->pageCount(), 1, &accepted);
+        if (!accepted || target - 1 == navigator->currentIndex()) {
+            return;
+        }
+        applyNotebookOperation(i18n("Move page"), [target](const QString &dir, int page) {
+            return PdfNotebookOps::movePage(dir, page, target - 1, page);
+        });
+    });
+
+    QAction *duplicate = ops->addAction(i18n("Duplicate page"));
+    duplicate->setObjectName(QStringLiteral("pdfio_ops_duplicate"));
+    QObject::connect(duplicate, &QAction::triggered, ops, []() {
+        applyNotebookOperation(i18n("Duplicate page"), [](const QString &dir, int page) {
+            return PdfNotebookOps::duplicatePage(dir, page, page);
+        });
+    });
+
+    QAction *removePage = ops->addAction(i18n("Delete page..."));
+    removePage->setObjectName(QStringLiteral("pdfio_ops_delete"));
+    QObject::connect(removePage, &QAction::triggered, ops, []() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        if (!navigator->hasNotebook()) {
+            return;
+        }
+        /// Said before it happens, and what "kept" means: the page leaves the notebook and its ink
+        /// goes into the journal, which is what the undo brings back.
+        if (QMessageBox::question(
+                nullptr, i18n("Delete page"),
+                i18n("Delete page %1 of %2? The page's notes are kept and can be brought back with "
+                     "\"Undo the last notebook change\".",
+                     navigator->currentIndex() + 1, navigator->pageCount()))
+            != QMessageBox::Yes) {
+            return;
+        }
+        applyNotebookOperation(i18n("Delete page"), [](const QString &dir, int page) {
+            return PdfNotebookOps::deletePages(dir, page, 1, page);
+        });
+    });
+
+    ops->addSeparator();
+
+    QAction *undo = ops->addAction(i18n("Undo the last notebook change"));
+    undo->setObjectName(QStringLiteral("pdfio_ops_undo"));
+    QObject::connect(undo, &QAction::triggered, ops, []() {
+        /// Stroke-level undo is Krita's, and it covers the page that is open. A notebook operation
+        /// closes that page, so it is its own unit of undo -- one change deep, and this is it.
+        applyNotebookOperation(i18n("Undo the last notebook change"), [](const QString &dir, int) {
+            return PdfNotebookOps::undoLast(dir);
+        });
+    });
+
+    /// Enabled from the state the notebook is in when the user reaches for the menu, not from the
+    /// state it was in when the menu was built.
+    QObject::connect(ops, &QMenu::aboutToShow, ops, [ops]() { updateNotebookOpsActions(ops); });
+    updateNotebookOpsActions(ops);
 }
 
 /// Puts the "Recent notebooks" submenu at the top of \a menu: the entry the user reaches for
@@ -892,8 +1069,9 @@ void PdfIoPlugin::registerActions()
             connect(openBundle, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebookBundle);
         }
 
-        /// Rename acts on an open notebook; it follows the entries that create one.
-        addRenameNotebookAction(alone);
+        /// Everything that changes the notebook itself, Rename included, lives under one entry
+        /// here as it does in the full menu -- greyed while there is no notebook to act on.
+        addNotebookOpsMenu(alone);
         return;
     }
 
@@ -977,9 +1155,9 @@ void PdfIoPlugin::registerActions()
         addEntry(entries[i]);
     }
 
-    /// Rename acts on the notebook that is open, so it follows the document block rather than
-    /// sitting above it.
-    addRenameNotebookAction(menu);
+    /// The notebook's own operations: move, duplicate, delete, undo and rename. They act on the
+    /// notebook that is open, so they follow the document block rather than sitting above it.
+    addNotebookOpsMenu(menu);
 
     /// The strip switch. The strip existed behind PDFIO_PROBE_STRIP only, which nobody can set on
     /// a tablet; a checkable action is both the way in and the indicator of which mode is in force.
