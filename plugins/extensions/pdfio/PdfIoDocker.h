@@ -38,7 +38,15 @@ private Q_SLOTS:
 
     void updateThumbnail(int index);
 
+protected:
+    /// The cards are sized from the room the panel has. A fixed grid looks right while the docker
+    /// is tall and clips into itself as soon as it is not, which is what the preview did.
+    void resizeEvent(QResizeEvent *event) override;
+
 private:
+    /// Recomputes the card size for the room the list has now.
+    void refitCards();
+
     QLabel *m_status = nullptr;
     QListWidget *m_pages = nullptr;
     QPushButton *m_previous = nullptr;

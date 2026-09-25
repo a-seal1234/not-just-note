@@ -9,6 +9,7 @@
 
 #include <QDir>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QSignalBlocker>
 #include <QTimer>
 #include <QHBoxLayout>
@@ -16,6 +17,7 @@
 #include <QLabel>
 #include <QListView>
 #include <QPixmap>
+#include <QResizeEvent>
 #include <QScrollBar>
 #include <QListWidget>
 #include <QPushButton>
@@ -62,8 +64,9 @@ PdfIoDocker::PdfIoDocker()
     /// A wall of pages rather than a column of names: this is the page selector, and the whole
     /// point of it is recognising a page before opening it.
     m_pages->setViewMode(QListView::IconMode);
-    m_pages->setIconSize(QSize(128, 128));
-    m_pages->setGridSize(QSize(150, 176));
+    /// The cards are sized from the room the panel has, here and on every resize: a fixed grid is
+    /// right while the docker is tall and clips into itself as soon as it is not.
+    refitCards();
     m_pages->setResizeMode(QListView::Adjust);
     m_pages->setMovement(QListView::Static);
     m_pages->setWordWrap(true);
@@ -102,6 +105,65 @@ PdfIoDocker::PdfIoDocker()
 }
 
 PdfIoDocker::~PdfIoDocker() = default;
+
+void PdfIoDocker::refitCards()
+{
+    if (!m_pages || !m_pages->viewport()) {
+        return;
+    }
+
+    /// The room the viewport really has. The list keeps its own frame and every card is separated
+    /// from its neighbours by the item spacing, so the usable width is the panel minus both.
+    const int spacing = qMax(0, m_pages->spacing());
+    const int available = m_pages->viewport()->width() - 2 * spacing;
+    if (available <= 0) {
+        return;
+    }
+
+    /// Cards are portrait-ish, because a page is taller than it is wide: a square card leaves two
+    /// bands beside the sheet. The height is bounded so a very wide panel does not grow cards
+    /// without end and a very short one does not leave the label under a sliver.
+    static constexpr int MinCardWidth = 72;
+    static constexpr int MaxCardWidth = 320;
+    static constexpr int MinCardHeight = 96;
+    static constexpr int MaxCardHeight = 320;
+    static constexpr qreal CardAspect = 1.3; // height / width of the sheet
+
+    /// As many columns as fit at the smallest readable card; the width that is left is shared out
+    /// evenly, so the cards fill the panel instead of leaving a ragged right edge.
+    const int columns = qMax(1, (available + spacing) / (MinCardWidth + spacing));
+    const int cardWidth = qBound(MinCardWidth, available / columns - spacing, MaxCardWidth);
+
+    /// The label under the icon wraps onto a second line for the two-digit pages, so it is given
+    /// the room for two lines before the icon gets the rest of the card.
+    const int labelHeight = m_pages->fontMetrics().height() * 2 + 8;
+    const int iconHeight = qBound(MinCardHeight, qRound(cardWidth * CardAspect), MaxCardHeight);
+    const QSize iconSize(cardWidth, iconHeight);
+    const QSize gridSize(cardWidth + spacing, iconHeight + labelHeight);
+
+    if (m_pages->iconSize() == iconSize && m_pages->gridSize() == gridSize) {
+        return;
+    }
+
+    m_pages->setIconSize(iconSize);
+    m_pages->setGridSize(gridSize);
+
+    /// The thumbnails already on screen were scaled for the size the cards had a moment ago;
+    /// re-reading them is what keeps a resize from leaving the old-sized icons behind.
+    for (int i = 0; i < m_pages->count(); ++i) {
+        if (QListWidgetItem *item = m_pages->item(i)) {
+            if (!item->icon().isNull()) {
+                updateThumbnail(i);
+            }
+        }
+    }
+}
+
+void PdfIoDocker::resizeEvent(QResizeEvent *event)
+{
+    QDockWidget::resizeEvent(event);
+    refitCards();
+}
 
 void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
 {
