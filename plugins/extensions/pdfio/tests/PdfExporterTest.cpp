@@ -44,6 +44,9 @@ private Q_SLOTS:
     void testBrowserPdfExport();
     void testManyPageNotebook();
     void testManyPagePeakMemory();
+    void testIndirectContentsArrayExport();
+    void testPageWithoutReadableMediaBoxStillExports();
+    void testRefusesInkWithoutAlpha();
 
 private:
     QString fixturePath(const QString &name) const
@@ -102,6 +105,21 @@ private:
                                                 PdfSession::pageFileName(i), QString(), 0});
         }
         return manifest;
+    }
+
+    /// Pixels a reader would show as content: the same measure the independent renderers were
+    /// checked with, so a test can say "the page's own content plus the mark, not the mark alone".
+    int darkPixels(const QImage &image) const
+    {
+        int dark = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                if (qAlpha(image.pixel(x, y)) > 0 && qGray(image.pixel(x, y)) < 200) {
+                    ++dark;
+                }
+            }
+        }
+        return dark;
     }
 
     QRect darkBounds(const QImage &image) const
@@ -526,6 +544,132 @@ void PdfExporterTest::testManyPagePeakMemory()
         QVERIFY2(QFile::copy(out, QString::fromLocal8Bit(keep)),
                  qPrintable(QString::fromLocal8Bit(keep)));
     }
+}
+
+void PdfExporterTest::testIndirectContentsArrayExport()
+{
+    /// A page's /Contents may be an indirect reference to an array -- this fixture writes exactly
+    /// that on page one (object 9 is "[4 0 R 5 0 R]"). The update used to wrap the reference in an
+    /// array of its own, and a nested array is not a content list: measured before the fix, the
+    /// exported page carried the mark's 2500 dark pixels and none of the source's text (pdfium),
+    /// while Poppler answered "Syntax Error: Weird page contents" and rendered the page blank. That
+    /// is the Mi Pad 8 report -- ink floating on blank paper -- so the array's entries are spliced
+    /// into the new list flat instead.
+    const QString fixture = fixturePath(QStringLiteral("ex-indirect-contents.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixture));
+    QCOMPARE(backend.pageCount(), 3);
+
+    /// What the source renders, so the loss is measured rather than assumed.
+    const QImage sourcePage = backend.renderPage(0, 72.0);
+    QVERIFY(!sourcePage.isNull());
+    const int sourceDark = darkPixels(sourcePage);
+    QVERIFY2(sourceDark > 100, qPrintable(QStringLiteral("the fixture has no visible text: %1 dark "
+                                                         "pixels").arg(sourceDark)));
+
+    QHash<int, QImage> ink;
+    ink.insert(0, inkWithMark(QSize(595, 842)));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString out = dir.filePath(QStringLiteral("exported.pdf"));
+
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(fixture, manifestFor(backend), ink, out, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(out));
+    QCOMPARE(exported.pageCount(), 3);
+
+    /// The text is the sharpest witness: with the nested array in the file it is not there at all.
+    const QString first = exported.pageText(0);
+    QVERIFY2(first.contains(QStringLiteral("Indirect contents page one")), qPrintable(first));
+    QVERIFY2(first.contains(QStringLiteral("Second half of page one.")), qPrintable(first));
+
+    /// And in pixels the page has to carry its own content *plus* the mark, not the mark alone.
+    const QImage exportedPage = exported.renderPage(0, 72.0);
+    QVERIFY(!exportedPage.isNull());
+    const int exportedDark = darkPixels(exportedPage);
+    QVERIFY2(exportedDark > sourceDark + 1000,
+             qPrintable(QStringLiteral("the exported page has %1 dark pixels against the source's "
+                                       "%2: the text plus the mark is expected, the mark alone is "
+                                       "not").arg(exportedDark).arg(sourceDark)));
+    verifyMarkTopLeft(exported, 0);
+
+    /// A page that was not inked is untouched, and its own text is still there.
+    QVERIFY2(exported.pageText(1).contains(QStringLiteral("Direct page two")),
+             qPrintable(exported.pageText(1)));
+}
+
+void PdfExporterTest::testPageWithoutReadableMediaBoxStillExports()
+{
+    /// Page three of the fixture puts its /MediaBox on another object (/MediaBox 10 0 R), which the
+    /// exporter's own reader refuses. The size the notebook recorded is the fallback, and the page's
+    /// content has to survive that instead of the whole export being abandoned -- the failure that
+    /// made pressing Export do nothing at all on the tablet.
+    const QString fixture = fixturePath(QStringLiteral("ex-indirect-contents.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixture));
+    QCOMPARE(backend.pageCount(), 3);
+
+    /// Poppler resolves the reference, so the recorded size is the real one.
+    QCOMPARE(backend.pageInfo(2).sizePt, QSizeF(595, 842));
+
+    QHash<int, QImage> ink;
+    ink.insert(2, inkWithMark(QSize(595, 842)));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString out = dir.filePath(QStringLiteral("exported.pdf"));
+
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(fixture, manifestFor(backend), ink, out, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(out));
+    QCOMPARE(exported.pageCount(), 3);
+
+    QVERIFY2(exported.pageText(2).contains(QStringLiteral("Indirect media box page three")),
+             qPrintable(exported.pageText(2)));
+    QVERIFY2(exported.pageText(2).contains(QStringLiteral("Box on another object.")),
+             qPrintable(exported.pageText(2)));
+    verifyMarkTopLeft(exported, 2);
+}
+
+void PdfExporterTest::testRefusesInkWithoutAlpha()
+{
+    /// An ink plane with no alpha channel is not an overlay at all: /pdfioInk would draw it as an
+    /// opaque sheet and the page underneath would be gone. Measured with the old behaviour on
+    /// text-fixture.pdf, the page's 1758 dark pixels came back as exactly the 2500 of the mark. The
+    /// export refuses and names the page instead of writing that file, because the menu shows the
+    /// reason and a file whose background is gone looks right to nobody.
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixturePath(QStringLiteral("text-fixture.pdf"))));
+
+    QImage opaque(QSize(595, 842), QImage::Format_RGB32);
+    QVERIFY(!opaque.hasAlphaChannel());
+    opaque.fill(Qt::white);
+    for (int y = 10; y < 60; ++y) {
+        for (int x = 10; x < 60; ++x) {
+            opaque.setPixel(x, y, qRgb(0, 0, 0));
+        }
+    }
+
+    QHash<int, QImage> ink;
+    ink.insert(0, opaque);
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString out = dir.filePath(QStringLiteral("exported.pdf"));
+
+    QString why;
+    QVERIFY(!PdfExporter::exportWithInk(fixturePath(QStringLiteral("text-fixture.pdf")),
+                                        manifestFor(backend), ink, out, &why));
+    QVERIFY2(why.contains(QStringLiteral("alpha")), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("page 1")), qPrintable(why));
+    QVERIFY(!QFile::exists(out));
 }
 
 QTEST_MAIN(PdfExporterTest)

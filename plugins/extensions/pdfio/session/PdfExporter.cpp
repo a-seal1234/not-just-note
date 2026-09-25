@@ -141,6 +141,83 @@ int dictEndIndex(const QByteArray &bytes, int start)
     return -1;
 }
 
+/// Index just past the "]" closing the array that starts at \a start. Like dictEndIndex it walks
+/// nested arrays and dictionaries, literal strings (with escapes and nested parens), hex strings and
+/// comments, so a "]" inside a string does not end the array early.
+int arrayEndIndex(const QByteArray &bytes, int start)
+{
+    if (start < 0 || start >= bytes.size() || bytes.at(start) != '[') {
+        return -1;
+    }
+    int depth = 0;
+    int dictDepth = 0;
+    int i = start;
+    while (i < bytes.size()) {
+        const char c = bytes.at(i);
+        if (c == '(') {
+            ++i;
+            int parens = 1;
+            while (i < bytes.size() && parens > 0) {
+                const char d = bytes.at(i);
+                if (d == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (d == '(') {
+                    ++parens;
+                } else if (d == ')') {
+                    --parens;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '<') {
+            if (i + 1 < bytes.size() && bytes.at(i + 1) == '<') {
+                ++dictDepth;
+                i += 2;
+                continue;
+            }
+            ++i;
+            while (i < bytes.size() && bytes.at(i) != '>') {
+                ++i;
+            }
+            if (i < bytes.size()) {
+                ++i;
+            }
+            continue;
+        }
+        if (c == '>' && i + 1 < bytes.size() && bytes.at(i + 1) == '>') {
+            if (dictDepth > 0) {
+                --dictDepth;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '[') {
+            ++depth;
+            ++i;
+            continue;
+        }
+        if (c == ']') {
+            --depth;
+            ++i;
+            if (depth == 0) {
+                return i;
+            }
+            continue;
+        }
+        if (c == '%') {
+            while (i < bytes.size() && bytes.at(i) != '\n' && bytes.at(i) != '\r') {
+                ++i;
+            }
+            continue;
+        }
+        ++i;
+    }
+    return -1;
+}
+
 /// Index of the value that follows "/Key" inside the dictionary [dictStart, dictEnd), or -1.
 /// The key has to end on a delimiter, so "/Size" never matches inside "/SizeX".
 int dictValueAt(const QByteArray &bytes, int dictStart, int dictEnd, const char *key)
@@ -599,8 +676,9 @@ bool streamAt(const QByteArray &bytes, qint64 offset, StreamSlice *slice, int *o
     return true;
 }
 
-/// Body of the indirect object at \a offset: its dictionary and stream if it has one. The body
-/// never includes the trailing "endobj".
+/// Body of the indirect object at \a offset: its dictionary and stream if it has one, and for an
+/// object that is neither -- the array a page's /Contents may point at, for instance -- the plain
+/// value. The body never includes the trailing "endobj".
 bool objectBodyAt(const QByteArray &bytes, qint64 offset, QByteArray *body)
 {
     if (offset < 0 || offset >= bytes.size()) {
@@ -617,27 +695,38 @@ bool objectBodyAt(const QByteArray &bytes, qint64 offset, QByteArray *body)
         return false;
     }
     const int bodyStart = skipWhite(bytes, i + 3);
-    if (bytes.mid(bodyStart, 2) != "<<") {
-        return false;
-    }
-    const int dictEnd = dictEndIndex(bytes, bodyStart);
-    if (dictEnd < 0) {
-        return false;
-    }
 
-    const int afterDict = skipWhite(bytes, dictEnd);
-    if (bytes.mid(afterDict, 6) == "stream") {
-        StreamSlice slice;
-        int objectEnd = -1;
-        if (!streamAt(bytes, offset, &slice, &objectEnd) || objectEnd < 0) {
+    /// Only a dictionary can start a stream, so the stream test is worth doing before the plain
+    /// object below -- and an object whose body is not a dictionary at all is still readable: an
+    /// array object holds the content streams of a page that writes its /Contents indirectly, and
+    /// refusing to read it is what used to leave that page with no background in the export.
+    if (bytes.mid(bodyStart, 2) == "<<") {
+        const int dictEnd = dictEndIndex(bytes, bodyStart);
+        if (dictEnd < 0) {
             return false;
         }
-        *body = bytes.mid(bodyStart, objectEnd - 6 - bodyStart);
+
+        const int afterDict = skipWhite(bytes, dictEnd);
+        if (bytes.mid(afterDict, 6) == "stream") {
+            StreamSlice slice;
+            int objectEnd = -1;
+            if (!streamAt(bytes, offset, &slice, &objectEnd) || objectEnd < 0) {
+                return false;
+            }
+            *body = bytes.mid(bodyStart, objectEnd - 6 - bodyStart);
+            return true;
+        }
+
+        const int endobj = int(bytes.indexOf("endobj", dictEnd));
+        if (endobj < 0) {
+            return false;
+        }
+        *body = bytes.mid(bodyStart, endobj - bodyStart);
         return true;
     }
 
-    const int endobj = int(bytes.indexOf("endobj", dictEnd));
-    if (endobj < 0) {
+    const int endobj = int(bytes.indexOf("endobj", bodyStart));
+    if (endobj < 0 || endobj == bodyStart) {
         return false;
     }
     *body = bytes.mid(bodyStart, endobj - bodyStart);
@@ -1548,11 +1637,170 @@ bool replaceRef(const QByteArray &body, int valueAt, const QByteArray &replaceme
     return true;
 }
 
+/// Index just past the value of /Contents in \a body, which is either a "[ ... ]" array or an
+/// "N G R" reference, or -1 when neither is readable there.
+int contentsValueEnd(const QByteArray &body, int valueAt)
+{
+    const int v = skipWhite(body, valueAt);
+    if (v >= body.size()) {
+        return -1;
+    }
+    if (body.at(v) == '[') {
+        return arrayEndIndex(body, v);
+    }
+    int i = v;
+    qint64 number = 0;
+    qint64 generation = 0;
+    if (!readInt(body, &i, &number) || !readInt(body, &i, &generation)) {
+        return -1;
+    }
+    const int p = skipWhite(body, i);
+    if (p >= body.size() || body.at(p) != 'R') {
+        return -1;
+    }
+    return p + 1;
+}
+
+bool contentEntries(PdfDocument *doc, const QByteArray &owner, int valueAt, int depth,
+                    QByteArray *out, int *count, QString *why);
+
+/// Appends one content stream reference, splicing the entries of an array object instead of writing
+/// the reference itself.
+///
+/// This is the whole point of the flattening below: "/Contents 6 0 R" with 6 = "[4 0 R 5 0 R]" is
+/// legal PDF, and the obvious update -- "[ save 6 0 R ink ]" -- nests one array inside another, which
+/// is not a content list. Poppler answers "Weird page contents" and renders the page blank; Android's
+/// PdfRenderer (PDFium) draws only the streams it can see directly, so the page's own content is lost
+/// and the ink is left floating on blank paper -- which is exactly the Mi Pad 8 report. Splicing the
+/// array's entries in flat keeps the original streams addressable while remaining one array.
+bool appendContentEntry(PdfDocument *doc, int number, int generation, int depth, QByteArray *out,
+                        int *count, QString *why)
+{
+    const QByteArray reference =
+        QByteArray::number(number) + " " + QByteArray::number(generation) + " R";
+    QByteArray target;
+    QString unreadable;
+    if (!objectByNumber(doc, number, &target, &unreadable)) {
+        /// The reference cannot be resolved, but the file still names it. Keeping it verbatim is
+        /// what the update always did, and refusing here would turn a page that used to export into
+        /// a failed notebook.
+        out->append(reference + " ");
+        ++(*count);
+        return true;
+    }
+    const int start = skipWhite(target, 0);
+    if (start < target.size() && target.at(start) == '[') {
+        if (depth >= 4) {
+            fail(why, QStringLiteral("object %1 is a /Contents array nested more than four deep")
+                          .arg(number));
+            return false;
+        }
+        if (!contentEntries(doc, target, start, depth + 1, out, count, why)) {
+            return false;
+        }
+        return true;
+    }
+    out->append(reference + " ");
+    ++(*count);
+    return true;
+}
+
+/// The content stream references of a /Contents value -- an array or a single reference -- as one
+/// flat, space separated list that can be put inside a new array. \a count receives the number of
+/// streams named, which is what the caller logs: a page that keeps zero streams is a page whose
+/// content is about to be lost.
+bool contentEntries(PdfDocument *doc, const QByteArray &owner, int valueAt, int depth,
+                    QByteArray *out, int *count, QString *why)
+{
+    const int v = skipWhite(owner, valueAt);
+    if (v >= owner.size()) {
+        fail(why, QStringLiteral("a /Contents value is empty"));
+        return false;
+    }
+
+    if (owner.at(v) == '[') {
+        const int end = arrayEndIndex(owner, v);
+        if (end < 0) {
+            fail(why, QStringLiteral("a /Contents array is not closed"));
+            return false;
+        }
+        int p = v + 1;
+        while (p < end) {
+            p = skipWhite(owner, p);
+            if (p >= end) {
+                break;
+            }
+            if (owner.at(p) == '[') {
+                /// A nested array written out directly in the file: spliced like an indirect one,
+                /// so what comes back is one flat content list either way.
+                if (depth >= 4) {
+                    fail(why, QStringLiteral("a /Contents array holds arrays nested more than four "
+                                             "deep"));
+                    return false;
+                }
+                if (!contentEntries(doc, owner, p, depth + 1, out, count, why)) {
+                    return false;
+                }
+                p = arrayEndIndex(owner, p);
+                if (p < 0) {
+                    fail(why, QStringLiteral("a nested /Contents array is not closed"));
+                    return false;
+                }
+                continue;
+            }
+            const int element = p;
+            int i = p;
+            qint64 number = 0;
+            qint64 generation = 0;
+            if (readInt(owner, &i, &number) && readInt(owner, &i, &generation)) {
+                const int r = skipWhite(owner, i);
+                if (r < owner.size() && owner.at(r) == 'R') {
+                    if (!appendContentEntry(doc, int(number), int(generation), depth, out, count,
+                                            why)) {
+                        return false;
+                    }
+                    p = r + 1;
+                    continue;
+                }
+            }
+            /// Not a reference and not an array: not a content stream, but it is what the file
+            /// says. A bare token is copied through; anything that is only a delimiter -- the ")"
+            /// that closes this array, most importantly -- is stepped over, so the walk always
+            /// advances and the array's own bracket is never copied into the new list.
+            int e = element;
+            while (e < end && !isWhite(owner.at(e)) && !isDelimiter(owner.at(e))) {
+                ++e;
+            }
+            if (e == element) {
+                ++p;
+                continue;
+            }
+            out->append(owner.mid(element, e - element) + " ");
+            p = e;
+        }
+        return true;
+    }
+
+    int i = v;
+    qint64 number = 0;
+    qint64 generation = 0;
+    if (!readInt(owner, &i, &number) || !readInt(owner, &i, &generation)) {
+        fail(why, QStringLiteral("a /Contents reference is unreadable"));
+        return false;
+    }
+    i = skipWhite(owner, i);
+    if (i >= owner.size() || owner.at(i) != 'R') {
+        fail(why, QStringLiteral("a /Contents reference is unreadable"));
+        return false;
+    }
+    return appendContentEntry(doc, int(number), int(generation), depth, out, count, why);
+}
+
 /// The page body with the ink content stream appended to /Contents and /pdfioInk added to the
 /// page's (possibly inherited) resources.
 bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int contentNumber,
                  int saveContentNumber, int *nextObject, QList<WrittenObject> *appended,
-                 QByteArray *newBody, QString *why)
+                 QByteArray *newBody, int *originalContents, QString *why)
 {
     QByteArray body;
     if (!objectByNumber(doc, page.number, &body, why)) {
@@ -1572,38 +1820,34 @@ bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int c
     const int contentsAt = dictValueAt(body, dictStart, dictEnd, "Contents");
     const QByteArray contentRef = QByteArray::number(contentNumber) + " 0 R";
     const QByteArray saveRef = QByteArray::number(saveContentNumber) + " 0 R";
+    *originalContents = 0;
     if (contentsAt < 0) {
         body = body.left(dictEnd - 2) + " /Contents [ " + saveRef + " " + contentRef + " ] "
                + body.mid(dictEnd - 2);
     } else {
-        const int p = skipWhite(body, contentsAt);
-        if (p < body.size() && body.at(p) == '[') {
-            body = body.left(p + 1) + " " + saveRef + " " + body.mid(p + 1);
-            const int close = int(body.indexOf(']', p));
-            if (close < 0) {
-                fail(why, QStringLiteral("page %1 has an unreadable /Contents array")
-                              .arg(page.number));
-                return false;
-            }
-            body = body.left(close) + " " + contentRef + " " + body.mid(close);
-        } else {
-            int number = 0;
-            int generation = 0;
-            if (!dictRefValue(body, dictStart, dictEnd, "Contents", &number, &generation)) {
-                fail(why, QStringLiteral("page %1 has a /Contents that is neither an array nor a "
-                                         "reference")
-                              .arg(page.number));
-                return false;
-            }
-            QByteArray wrapped;
-            if (!replaceRef(body, contentsAt,
-                            "[" + saveRef + " " + QByteArray::number(number) + " "
-                                + QByteArray::number(generation) + " R " + contentRef + "]",
-                            &wrapped, why)) {
-                return false;
-            }
-            body = wrapped;
+        /// The original content has to sit in the same array as the save and the ink streams, as
+        /// stream references. A /Contents that is an indirect reference to an array is resolved and
+        /// its entries are spliced in flat -- wrapping the reference instead would nest one array
+        /// inside another, which no reader accepts as a content list, and the page's own content
+        /// would silently disappear from the export.
+        QByteArray entries;
+        QString contentWhy;
+        if (!contentEntries(doc, body, contentsAt, 0, &entries, originalContents, &contentWhy)) {
+            fail(why, QStringLiteral("page %1: %2").arg(page.number).arg(contentWhy));
+            return false;
         }
+        if (*originalContents == 0) {
+            fail(why, QStringLiteral("page %1 has a /Contents that names no content stream")
+                          .arg(page.number));
+            return false;
+        }
+        const int valueEnd = contentsValueEnd(body, contentsAt);
+        if (valueEnd < 0) {
+            fail(why, QStringLiteral("page %1 has an unreadable /Contents").arg(page.number));
+            return false;
+        }
+        body = body.left(contentsAt) + " [ " + saveRef + " " + entries + contentRef + " ]"
+               + body.mid(valueEnd);
     }
 
     dictStart = skipWhite(body, 0);
@@ -1704,6 +1948,11 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
     QList<WrittenObject> replacements;
     QList<WrittenObject> appended;
     QSet<int> rewritten;
+    int inkedPages = 0;
+
+    qWarning("[pdfio] export: source %s (%d bytes), %d PDF page(s), %d notebook page(s)",
+             qPrintable(sourcePdf), int(pdf.size()), int(pages.size()),
+             int(manifest.pages.size()));
 
     for (int i = 0; i < pages.size() && i < manifest.pages.size(); ++i) {
         const PageEntry &page = pages.at(i);
@@ -1718,6 +1967,7 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
             return false;
         }
         rewritten.insert(page.number);
+        ++inkedPages;
 
         double x0 = 0;
         double y0 = 0;
@@ -1752,6 +2002,20 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         }
         int rotation = 0;
         if (!effectiveRotation(&doc, page, why, &rotation)) {
+            return false;
+        }
+
+        /// The overlay is composited with the plane's own alpha as its mask, so a plane that has
+        /// no alpha channel is not an overlay at all: it is an opaque rectangle, and drawing it
+        /// hides the page underneath. Measured on text-fixture.pdf: the page's 1758 dark pixels
+        /// came back as exactly the 2500 of the mark, the original text gone. That is the reported
+        /// "ink floating on blank paper", made by the export itself, so it is refused with a
+        /// message the menu shows instead of being written.
+        if (!found->hasAlphaChannel()) {
+            fail(why, QStringLiteral("page %1 (PDF object %2): the ink plane has no alpha channel, "
+                                     "so it would be drawn as an opaque sheet over the page; the "
+                                     "page's artifact must carry transparency")
+                          .arg(i + 1).arg(page.number));
             return false;
         }
 
@@ -1800,12 +2064,30 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                                           + NL + "stream" + NL + content + "endstream"});
 
         QByteArray newBody;
+        int originalContents = 0;
         if (!preparePage(&doc, page, imageNumber, contentNumber, saveContentNumber, &nextObject,
-                         &appended, &newBody, why)) {
+                         &appended, &newBody, &originalContents, why)) {
             return false;
         }
         replacements.append(WrittenObject{page.number, page.generation, newBody});
+
+        /// One line per inked page, so a log from a device that cannot be inspected directly says
+        /// what the file was built from: which box placed the ink, whether that box came from the
+        /// notebook because the page's own /MediaBox could not be read, the plane's size and whether
+        /// it carries alpha, and how many of the page's own content streams survived into the
+        /// update. Zero surviving streams is a page whose background is gone.
+        qWarning("[pdfio] export page %d/%d (PDF object %d): box %.2f,%.2f..%.2f,%.2f%s, rotate %d, "
+                 "ink %dx%d %s, page contents kept: %d stream(s)",
+                 i + 1, int(qMin(pages.size(), manifest.pages.size())), page.number,
+                 x0, y0, x1, y1, rectWhy.isEmpty() ? " from /MediaBox" : " from the notebook",
+                 rotation, placed.width(), placed.height(),
+                 found->hasAlphaChannel() ? "with alpha" : "NO ALPHA", originalContents);
     }
+
+    qWarning("[pdfio] export: %d of %d notebook page(s) inked, %d page object(s) rewritten, "
+             "%d object(s) appended",
+             inkedPages, int(qMin(pages.size(), manifest.pages.size())), int(replacements.size()),
+             int(appended.size()));
 
     if (replacements.isEmpty() && appended.isEmpty()) {
         /// Nothing to add: the honest answer is a clean copy, not an incremental update with an

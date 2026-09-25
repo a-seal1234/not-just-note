@@ -224,6 +224,57 @@ def chromium(name):
     print("wrote %s (%d bytes) with Chromium" % (name, os.path.getsize(target)))
 
 
+def indirect_contents_pdf():
+    """Three pages exercising the two content-list shapes and an unreadable /MediaBox.
+
+    Page one's /Contents is an indirect reference to an array (object 9), which real producers write
+    and which the update has to splice flat instead of nesting. Page two's /Contents is the ordinary
+    single indirect stream. Page three's /MediaBox is itself an indirect array, so the exporter's own
+    reader cannot parse it and has to fall back to the size the notebook recorded -- and the page's
+    content still has to survive that. Object numbers are stable because the test names them:
+    3 page one, 4 and 5 its two content streams, 6 page two, 7 its stream, 8 page three, 9 the
+    /Contents array, 10 the indirect /MediaBox, 11 page three's stream, 12 the font.
+    """
+    box = (0, 0, 595, 842)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 6 0 R 8 0 R] /Count 3 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 9 0 R "
+        b"/Resources << /Font << /F1 12 0 R >> >> >>",
+        stream_object(b"", text_stream(box, "Indirect contents page one", "First half of page one.")),
+        stream_object(b"", b"BT /F1 12 Tf 22 700 Td (Second half of page one.) Tj ET\n"),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 7 0 R "
+        b"/Resources << /Font << /F1 12 0 R >> >> >>",
+        stream_object(b"", text_stream(box, "Direct page two", "The ordinary case.")),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox 10 0 R /Contents 11 0 R "
+        b"/Resources << /Font << /F1 12 0 R >> >> >>",
+        b"[4 0 R 5 0 R]",
+        b"[0 0 595 842]",
+        stream_object(b"", text_stream(box, "Indirect media box page three", "Box on another object.")),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+
+    out = [b"%PDF-1.4", b"%" + FS]
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(sum(len(line) + 1 for line in out))
+        out.append(b"%d 0 obj" % number)
+        out.append(body)
+        out.append(b"endobj")
+    xref_at = sum(len(line) + 1 for line in out)
+    out.append(b"xref")
+    out.append(b"0 %d" % (len(objects) + 1))
+    out.append(b"0000000000 65535 f ")
+    for offset in offsets:
+        out.append(b"%010d 00000 n " % offset)
+    out.append(b"trailer")
+    out.append(b"<< /Size %d /Root 1 0 R >>" % (len(objects) + 1))
+    out.append(b"startxref")
+    out.append(b"%d" % xref_at)
+    out.append(b"%%EOF")
+    return NL.join(out) + NL
+
+
 def write(name, data):
     path = os.path.join(HERE, name)
     with open(path, "wb") as handle:
@@ -248,6 +299,7 @@ def main():
     write("ex-manypage-50.pdf", manypage_pdf(50))
     write("ex-objstm-predictor.pdf", objstm_predictor_pdf())
     write("ex-objstm-badfilter.pdf", objstm_predictor_pdf(b"LZWDecode"))
+    write("ex-indirect-contents.pdf", indirect_contents_pdf())
 
     # Real third party producers: PDF 1.5+ object streams and cross reference streams.
     ghostscript("ex-objstm-rotations.pdf", "ex-rotations.pdf", ["-dCompatibilityLevel=1.5"])
