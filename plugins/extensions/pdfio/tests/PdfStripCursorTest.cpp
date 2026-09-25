@@ -1014,7 +1014,41 @@ void PdfStripCursorTest::testAnInsertedImageLayerReachesThePageArtifact()
           int(root->childCount()), int(carried), int(missingCarried));
     QVERIFY2(carried, "the inserted image layer did not reach the page artifact");
     QVERIFY2(!missingCarried, "a file layer whose source is gone must be skipped, not carried");
+
+    /// And it survives the save and the read-back the notebook actually does: the layer entry is
+    /// not enough, the flatten has to carry the inserted image's pixels.
+    pageDocument->image()->refreshGraphAsync(pageDocument->image()->root(),
+                                             { pageDocument->image()->bounds() },
+                                             pageDocument->image()->bounds());
+    pageDocument->image()->waitForDone();
+
+    const QString path = dir.filePath(QStringLiteral("page.kra"));
+    bool finished = false;
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, this,
+                     [&finished](const QString &) { finished = true; });
+    QString saveWhy;
+    QVERIFY2(PdfPageSaver::saveDocument(pageDocument, path, &saveWhy), qPrintable(saveWhy));
+    QVERIFY2(waitForFlag(finished, 30000), "the save never reported back");
     KisPart::instance()->removeDocument(pageDocument, true);
+
+    const QImage flat = PdfInkLoader::loadInk(path, &saveWhy);
+    QVERIFY2(!flat.isNull(), qPrintable(saveWhy));
+
+    /// The inserted image is a 64x64 red block at the page's top left; nothing else in the banded
+    /// page is that red.
+    int redPixels = 0;
+    for (int y = 0; y < qMin(64, flat.height()); ++y) {
+        for (int x = 0; x < qMin(64, flat.width()); ++x) {
+            const QColor pixel = flat.pixelColor(x, y);
+            if (pixel.red() > 200 && pixel.green() < 60 && pixel.blue() < 60) {
+                ++redPixels;
+            }
+        }
+    }
+    qInfo("file layer save/reload: %dx%d flatten from %lld bytes, red pixels in the inserted "
+          "image's corner: %d",
+          flat.width(), flat.height(), qint64(QFileInfo(path).size()), redPixels);
+    QVERIFY2(redPixels > 100, "the inserted image's pixels are not in the flatten after the save");
 }
 
 /**
