@@ -733,7 +733,24 @@ void PdfIoPlugin::placeInsertedImage(const QString &picked, const QString &why,
     layer->paintDevice()->convertFromQImage(scaled, nullptr, 0, 0);
     layer->setX((page->width() - wanted.width()) / 2);
     layer->setY((page->height() - wanted.height()) / 2);
-    if (!page->addNode(layer, page->rootLayer())) {
+    /// Inside the page's Ink group, not beside it at the root: the picture is part of what the page
+    /// is made of, and the group is what the layer panel and the strip work with. Still its own
+    /// layer, so the no-merge rule stands and a stroke and the picture stay separate children.
+    ///
+    /// A page with no Ink group -- one made before the group existed, say -- takes the layer at the
+    /// root with a line saying so, rather than losing the picture.
+    KisNodeSP parent = page->rootLayer();
+    for (quint32 i = 0; parent.data() == page->rootLayer().data() && i < page->rootLayer()->childCount(); ++i) {
+        KisNodeSP child = page->rootLayer()->at(i);
+        if (child->name() == PdfProjectBuilder::inkLayerName()) {
+            parent = child;
+        }
+    }
+    if (parent.data() == page->rootLayer().data()) {
+        say(QStringLiteral("this page has no Ink group; the image went to the page root"));
+    }
+
+    if (!page->addNode(layer, parent)) {
         say(QStringLiteral("the image layer could not be added to the page"));
         return;
     }
@@ -788,6 +805,7 @@ PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
 #endif
 
     PdfIoProbe::runIfRequested();
+
 
     QTimer::singleShot(0, this, [this, probePath]() {
         /// Android is driven by the menu action. The unattended route that opened a file from the
