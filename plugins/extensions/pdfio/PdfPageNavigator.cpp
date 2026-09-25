@@ -1620,7 +1620,10 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
 
     /// And the tab says which page of which notebook it is rather than "Not Saved": caption() has
     /// nothing but the URL to name a document by, and there is no URL.
-    const QString notebook = QFileInfo(m_manifest.sourceFile).completeBaseName();
+    ///
+    /// The notebook's own name, not the file it was copied from: the tab has to agree with the
+    /// docker's title, the Recent entry and the export suggestion.
+    const QString notebook = m_manifest.displayName();
     document->setUntitledCaption(QStringLiteral("%1 - page %2/%3")
                                      .arg(notebook)
                                      .arg(index + 1)

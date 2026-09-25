@@ -65,6 +65,24 @@ public:
                     const QString &localFile,
                     std::function<void(bool, const QString &)> onWritten);
 
+    /**
+     * The content:// URI the last pick handed over, or an empty string when there was none.
+     *
+     * Kept, not used, here: the provider is asked for the file's display name LATER, on the event
+     * loop, because asking for it from inside the activity-result callback is what took the
+     * application down. The copy itself is untouched -- it still happens in the callback.
+     */
+    QString pickedContentUri() const;
+
+    /**
+     * The name the provider has for \a contentUri, from OpenableColumns.DISPLAY_NAME, or an empty
+     * string when there is no name to be had.
+     *
+     * Every failure is an answer of "no name": no activity, no resolver, no URI, no cursor, no
+     * column, no value. The caller keeps the cache name then, so nothing here can fail an import.
+     */
+    static QString displayNameForContentUri(const QString &contentUri);
+
 private:
     struct Private;
     Private *d;

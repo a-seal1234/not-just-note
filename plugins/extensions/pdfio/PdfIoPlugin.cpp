@@ -173,8 +173,11 @@ QStringList recentNotebookEntries()
 
 void writeRecentNotebooks(const QStringList &entries)
 {
+    /// Kept as a QStringList and put in through QVariant::fromValue: the Qt5 Android build has no
+    /// QVariant conversion from the QList<QString> mid() hands back, and this code is built there.
+    const QStringList kept = entries.mid(0, MaxRecentNotebooks);
     QSettings settings;
-    settings.setValue(QLatin1String(RecentNotebooksKey), entries.mid(0, MaxRecentNotebooks));
+    settings.setValue(QLatin1String(RecentNotebooksKey), QVariant::fromValue(kept));
 }
 
 QString recentNotebookDir(const QString &entry)
@@ -238,11 +241,178 @@ void ensureNotebookName()
 /// What every successful open does, and nothing more: name the notebook if it has no name,
 /// remember it, and put its name on the docker. Deliberately called after the open -- the picker's
 /// copy step stays exactly where it is, and nothing here runs inside an activity callback.
-void notebookOpened()
+///
+/// \a defaultTheName is false only on Android's picker path, where the provider's own name is
+/// asked for straight afterwards: writing the cache name first would make the notebook look named
+/// and the provider's answer would then have to overwrite it. With no name written, the manifest
+/// reader falls back to the cache name anyway.
+void notebookOpened(bool defaultTheName = true)
 {
-    ensureNotebookName();
+    if (defaultTheName) {
+        ensureNotebookName();
+    }
     rememberRecentNotebook();
     reloadDockerNames();
+}
+
+/// Puts the notebook's name on the open document's tab; defined with the other name helpers below,
+/// and declared here because the Android provider-name path is defined above them and uses it.
+void applyNotebookNameToTab();
+
+#if defined(Q_OS_ANDROID)
+/// Asks the provider for the name of the PDF that was just imported, on the event loop and after
+/// the notebook is open -- never inside the activity callback, which is where that query crashed.
+///
+/// It is written only while the notebook still has no name of its own, so a name the user set with
+/// "Rename notebook..." is never overwritten, and every failure (no URI, no provider, no column, no
+/// value) leaves the cache name in place.
+void adoptProviderName(const QString &contentUri)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return;
+    }
+
+    if (contentUri.isEmpty()) {
+        say(QStringLiteral("no content URI was remembered; the notebook keeps \"%1\"")
+                .arg(notebookNameFromDisk(navigator->projectDir())));
+        return;
+    }
+
+    const QString providerName = AndroidDocumentPicker::displayNameForContentUri(contentUri);
+    if (providerName.isEmpty()) {
+        say(QStringLiteral("the provider gave no name; the notebook keeps \"%1\"")
+                .arg(notebookNameFromDisk(navigator->projectDir())));
+        return;
+    }
+
+    const QString path = PdfSession::manifestPath(navigator->projectDir());
+    QString why;
+    PdfSessionManifest manifest = PdfSessionManifest::readFrom(path, &why);
+    if (!manifest.isValid()) {
+        say(QStringLiteral("cannot read the notebook's manifest: %1").arg(why));
+        return;
+    }
+    /// A picker name may replace the auto-default -- the cache name ensureNotebookName() writes --
+    /// because that is not a name the user chose. A name typed with "Rename notebook..." is never
+    /// touched.
+    const QString cacheName = QFileInfo(manifest.sourceFile).completeBaseName();
+    if (!manifest.name.isEmpty() && manifest.name != cacheName) {
+        say(QStringLiteral("the notebook already has the name \"%1\"; the provider's \"%2\" was left alone")
+                .arg(manifest.name, providerName));
+        return;
+    }
+
+    QString clean = nameForFile(providerName);
+    /// The provider usually offers the name with its extension. The notebook is named without it,
+    /// the way the desktop path names one, so the export suggestion does not read
+    /// "<name>.pdf-notes.pdf".
+    if (clean.endsWith(QStringLiteral(".pdf"), Qt::CaseInsensitive)) {
+        clean.chop(4);
+    }
+    if (clean.isEmpty()) {
+        say(QStringLiteral("the provider's name has no usable characters; the notebook keeps the cache name"));
+        return;
+    }
+
+    manifest.name = clean;
+    if (!manifest.writeTo(path, &why)) {
+        say(QStringLiteral("cannot write the notebook's name: %1").arg(why));
+        return;
+    }
+
+    say(QStringLiteral("the notebook is named \"%1\" after the PDF that was imported").arg(clean));
+    reloadDockerNames();
+    applyNotebookNameToTab();
+    rememberRecentNotebook();
+}
+#endif
+
+/// Opens \a pdfPath, replacing whatever notebook is open.
+///
+/// A page that is already open is closed first and the open is deferred until that close has
+/// happened -- the same shape rebuildForScope() uses, and for the same reason: opening the new
+/// notebook while the old document's view is still alive leaves the import with nothing on screen,
+/// which is what "importing while a page is open opens nothing" was. \a contentUri is the Android
+/// picker's URI when the open came from the picker, and empty otherwise; when it is there the
+/// provider's own name is adopted instead of the cache-name default.
+void openNotebookReplacing(const QString &pdfPath,
+                           const QString &contentUri,
+                           int attemptsLeft,
+                           std::function<void()> then = nullptr)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+
+    /// The first screen may have no main window yet, and the view a notebook opens into is made on
+    /// it. From the first screen the import then had nowhere to appear; waiting for the window is
+    /// the same retry the menu registration already does, rather than importing into nothing.
+    if (!KisPart::instance()->currentMainwindow() && attemptsLeft > 0) {
+        say(QStringLiteral("no main window yet; opening the notebook when one arrives"));
+        QTimer::singleShot(500, navigator, [pdfPath, contentUri, attemptsLeft, then]() {
+            openNotebookReplacing(pdfPath, contentUri, attemptsLeft - 1, then);
+        });
+        return;
+    }
+
+    /// The document that is open is still in the way while Krita closes it, and the close is
+    /// deferred, so this waits rather than spinning: each attempt gives the event loop 700 ms.
+    if (navigator->currentDocument() && attemptsLeft > 0) {
+        if (KisDocument *document = navigator->currentDocument()) {
+            /// Its ink was written just before this was called; leaving it modified would make
+            /// Krita ask whether to save it while the close is already under way.
+            document->setModified(false);
+        }
+        if (KisView *view = navigator->currentView()) {
+            view->closeView();
+        }
+        QTimer::singleShot(700, navigator, [pdfPath, contentUri, attemptsLeft, then]() {
+            openNotebookReplacing(pdfPath, contentUri, attemptsLeft - 1, then);
+        });
+        return;
+    }
+
+    QString why;
+    if (!navigator->openNotebook(pdfPath, &why)) {
+        say(QStringLiteral("could not open the notebook: %1").arg(why));
+        return;
+    }
+
+#if defined(Q_OS_ANDROID)
+    /// From the picker the cache name is not written as the notebook's name: the provider's own
+    /// name is asked for below, and the manifest reader already falls back to the cache name.
+    const bool fromPicker = !contentUri.isEmpty();
+    notebookOpened(!fromPicker);
+    if (fromPicker) {
+        adoptProviderName(contentUri);
+    }
+#else
+    Q_UNUSED(contentUri);
+    notebookOpened();
+#endif
+
+    if (then) {
+        then();
+    }
+}
+
+/// Puts the notebook's name on the open document's tab as well, so the tab agrees with the
+/// docker, the Recent entry and the export suggestion the moment a name is adopted or changed.
+void applyNotebookNameToTab()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    KisDocument *document = navigator->currentDocument();
+    if (!document || !navigator->hasNotebook()) {
+        return;
+    }
+
+    const QString name = notebookNameFromDisk(navigator->projectDir());
+    const QString shown = name.isEmpty()
+        ? QFileInfo(navigator->manifest().sourceFile).completeBaseName()
+        : name;
+    document->setUntitledCaption(QStringLiteral("%1 - page %2/%3")
+                                     .arg(shown)
+                                     .arg(navigator->currentIndex() + 1)
+                                     .arg(navigator->pageCount()));
 }
 
 /// Writes \a entered into the open notebook's manifest as its name, with the same rejection the
@@ -277,6 +447,7 @@ bool applyNotebookName(const QString &entered)
 
     say(QStringLiteral("the notebook is now named \"%1\"").arg(clean));
     reloadDockerNames();
+    applyNotebookNameToTab();
     rememberRecentNotebook();
     return true;
 }
@@ -511,8 +682,17 @@ void PdfIoPlugin::registerActions()
             connect(open, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebook);
         }
 
-        /// The recent list belongs on this screen too: it is the one menu entry that is useful
-        /// before any document exists.
+        /// The bundle's inverse needs a stand-in here too: opening a notebook that came from
+        /// another device is one of the three things a person looks for before any document is
+        /// open, and without this it was reachable only once a view existed. Removed the same way
+        /// the import stand-in is when the action manager arrives.
+        if (!alone->findChild<QAction *>(QStringLiteral("pdfio_open_bundle_alone"))) {
+            QAction *openBundle = alone->addAction(i18n("Open a notebook file..."));
+            openBundle->setObjectName(QStringLiteral("pdfio_open_bundle_alone"));
+            connect(openBundle, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebookBundle);
+        }
+
+        /// And the recent list: the one menu entry that is useful before any document exists.
         addNotebookNameActions(alone);
         return;
     }
@@ -541,9 +721,13 @@ void PdfIoPlugin::registerActions()
             menu->setObjectName(QStringLiteral("pdfio_menu"));
         }
 
-        /// And the first-screen stand-in goes before the real action is added: two entries that do
-        /// the same thing is how a menu starts looking broken.
+        /// And the first-screen stand-ins go before the real actions are added: two entries that
+        /// do the same thing is how a menu starts looking broken.
         if (QAction *standin = menu->findChild<QAction *>(QStringLiteral("pdfio_open_notebook_alone"))) {
+            menu->removeAction(standin);
+            standin->deleteLater();
+        }
+        if (QAction *standin = menu->findChild<QAction *>(QStringLiteral("pdfio_open_bundle_alone"))) {
             menu->removeAction(standin);
             standin->deleteLater();
         }
@@ -685,6 +869,10 @@ void PdfIoPlugin::slotOpenNotebook()
     auto *picker = new AndroidDocumentPicker(this);
     say(QStringLiteral("the document picker is opening"));
     picker->pickPdf([this, picker](const QString &localPath, const QString &why) {
+        /// Read before the picker is released, and used only on the event loop below: the URI is
+        /// what the provider's display name can be asked for, and asking for it here is what
+        /// crashed the application. The copy above this point is untouched.
+        const QString contentUri = picker->pickedContentUri();
         picker->deleteLater();
         say(QStringLiteral("picker finished: path \"%1\" reason \"%2\"").arg(localPath, why));
 
@@ -696,15 +884,10 @@ void PdfIoPlugin::slotOpenNotebook()
         /// Deferred out of the activity result callback. Opening a document builds a view and
         /// walks the resource system, and doing that while the activity transition is still
         /// unwinding crashed inside Qt's own hash tables.
-        QTimer::singleShot(0, this, [this, localPath]() {
-            QString error;
-            if (!PdfPageNavigator::instance()->openNotebook(localPath, &error)) {
-                say(QStringLiteral("could not open the chosen file: %1").arg(error));
-                return;
-            }
-            /// After the open, never inside the activity callback: the picker's copy step is
-            /// untouched, and the name the provider may give is asked for later still.
-            notebookOpened();
+        QTimer::singleShot(0, this, [this, localPath, contentUri]() {
+            /// Replaces whatever is open: the picker route has the same rule as the menu route,
+            /// because importing while a page is open is exactly the case that opened nothing.
+            openNotebookReplacing(localPath, contentUri, 6);
         });
     });
 #else
@@ -716,11 +899,9 @@ void PdfIoPlugin::slotOpenNotebook()
         return;
     }
 
-    if (!PdfPageNavigator::instance()->openNotebook(path, nullptr)) {
-        qWarning() << "pdfio could not open" << path;
-        return;
-    }
-    notebookOpened();
+    /// Replaces whatever is open, closing the page that is there first: importing from a state
+    /// that already has a page open is the case that used to end with nothing on screen.
+    openNotebookReplacing(path, QString(), 6);
 #endif
 }
 
@@ -921,24 +1102,24 @@ void PdfIoPlugin::openBundleFile(const QString &bundlePath, bool replaceWithoutA
     /// activity result callback.
     QTimer::singleShot(0, this, [this, destination, info]() {
         const QString source = QDir(destination).filePath(info.manifest.sourceFile);
-        QString why;
-        if (!PdfPageNavigator::instance()->openNotebook(source, &why)) {
-            say(QStringLiteral("the unpacked notebook could not be opened: %1").arg(why));
-            return;
-        }
 
-        /// Opening goes through the navigator, which keys a project by the source's own hash. It
-        /// finds the directory just written only while its root is the one assumed here, so a drift
-        /// between the two is said out loud instead of leaving an empty notebook and no reason.
-        if (QFileInfo(PdfPageNavigator::instance()->projectDir()).absoluteFilePath()
-            != QFileInfo(destination).absoluteFilePath()) {
-            say(QStringLiteral("WARNING: the notebook opened from %1, not from %2: the project root "
-                               "assumed by PdfNotebookBundle::defaultProjectRoot() no longer matches "
-                               "the navigator's, and the ink that came in the file was not used")
-                    .arg(PdfPageNavigator::instance()->projectDir(), destination));
-        }
-
-        notebookOpened();
+        /// Replaces whatever is open, exactly as the PDF import does: a notebook opened from a
+        /// file has to end up open even when another notebook was already there. The check below
+        /// runs after the open has actually happened, deferral and all.
+        openNotebookReplacing(source, QString(), 6, [destination]() {
+            /// Opening goes through the navigator, which keys a project by the source's own hash.
+            /// It finds the directory just written only while its root is the one assumed here, so
+            /// a drift between the two is said out loud instead of leaving an empty notebook and no
+            /// reason.
+            if (QFileInfo(PdfPageNavigator::instance()->projectDir()).absoluteFilePath()
+                != QFileInfo(destination).absoluteFilePath()) {
+                say(QStringLiteral("WARNING: the notebook opened from %1, not from %2: the project root "
+                                   "assumed by PdfNotebookBundle::defaultProjectRoot() no longer "
+                                   "matches the navigator's, and the ink that came in the file was "
+                                   "not used")
+                        .arg(PdfPageNavigator::instance()->projectDir(), destination));
+            }
+        });
     });
 }
 

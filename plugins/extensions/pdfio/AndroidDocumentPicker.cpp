@@ -166,11 +166,127 @@ bool writeFileToUri(const QString &localPath, const QString &uri, QString *why)
     return true;
 }
 
+/// The name the provider has for a content:// URI, through OpenableColumns.DISPLAY_NAME.
+///
+/// Every failure is answered with an empty string: no activity, no resolver, no URI, no cursor, no
+/// column, no value all mean "no name to be had". The caller keeps the cache name then.
+QString queryDisplayName(const QString &uri)
+{
+    if (uri.isEmpty()) {
+        return QString();
+    }
+
+    QJniObject activity = QJniObject::callStaticObjectMethod("org/qtproject/qt5/android/QtNative",
+                                                             "activity",
+                                                             "()Landroid/app/Activity;");
+    if (!activity.isValid()) {
+        return QString();
+    }
+    QJniObject contentResolver = activity.callObjectMethod("getContentResolver",
+                                                           "()Landroid/content/ContentResolver;");
+    QJniObject juri = QJniObject::callStaticObjectMethod("android/net/Uri", "parse",
+                                                         "(Ljava/lang/String;)Landroid/net/Uri;",
+                                                         QJniObject::fromString(uri).object<jstring>());
+    if (!contentResolver.isValid() || !juri.isValid()) {
+        return QString();
+    }
+
+    /// Raw JNI for the query itself, because the projection has to be a real String[].
+    ///
+    /// Two things are load-bearing here and both were learned from a crash on the tablet:
+    ///  - the declared signature. ContentResolver.query returns android.database.Cursor, not
+    ///    content.Cursor; the wrong return type is NoSuchMethodError.
+    ///  - every lookup's exception is cleared before the next JNI call. A pending exception at a
+    ///    following FindClass aborts the process (CheckJNI is on for a debuggable build), which is
+    ///    what killed the app on the import that first used this query.
+    QJniEnvironment env;
+    jobject resolver = contentResolver.object<jobject>();
+    if (!resolver) {
+        return QString();
+    }
+
+    jclass resolverClass = env->FindClass("android/content/ContentResolver");
+    if (!resolverClass) {
+        reportJniException("FindClass(ContentResolver)");
+        return QString();
+    }
+    jmethodID query = env->GetMethodID(
+        resolverClass, "query",
+        "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;");
+    reportJniException("GetMethodID(ContentResolver.query)");
+    env->DeleteLocalRef(resolverClass);
+    if (!query) {
+        return QString();
+    }
+
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (!stringClass) {
+        reportJniException("FindClass(String)");
+        return QString();
+    }
+    /// The projection holds the column name itself, "_display_name" -- the value of
+    /// OpenableColumns.DISPLAY_NAME -- not the name of the constant.
+    jstring columnName = env->NewStringUTF("_display_name");
+    jobjectArray projection = env->NewObjectArray(1, stringClass, columnName);
+    env->DeleteLocalRef(columnName);
+    env->DeleteLocalRef(stringClass);
+    if (!projection) {
+        reportJniException("NewObjectArray(projection)");
+        return QString();
+    }
+
+    jobject cursor = env->CallObjectMethod(resolver, query, juri.object<jobject>(), projection,
+                                           nullptr, nullptr, nullptr);
+    env->DeleteLocalRef(projection);
+    reportJniException("ContentResolver.query");
+    if (!cursor) {
+        return QString();
+    }
+
+    jclass cursorClass = env->FindClass("android/database/Cursor");
+    if (!cursorClass) {
+        reportJniException("FindClass(Cursor)");
+        env->DeleteLocalRef(cursor);
+        return QString();
+    }
+    jmethodID moveToFirst = env->GetMethodID(cursorClass, "moveToFirst", "()Z");
+    reportJniException("GetMethodID(moveToFirst)");
+    jmethodID getString = env->GetMethodID(cursorClass, "getString", "(I)Ljava/lang/String;");
+    reportJniException("GetMethodID(getString)");
+    jmethodID close = env->GetMethodID(cursorClass, "close", "()V");
+    reportJniException("GetMethodID(close)");
+    env->DeleteLocalRef(cursorClass);
+
+    QString name;
+    /// Column 0 is the only column the projection asked for, so getColumnIndex() is not needed.
+    if (moveToFirst && getString && env->CallBooleanMethod(cursor, moveToFirst)) {
+        jstring value = static_cast<jstring>(env->CallObjectMethod(cursor, getString, jint(0)));
+        reportJniException("Cursor.getString");
+        if (value) {
+            const char *utf = env->GetStringUTFChars(value, nullptr);
+            if (utf) {
+                name = QString::fromUtf8(utf).trimmed();
+                env->ReleaseStringUTFChars(value, utf);
+            }
+            env->DeleteLocalRef(value);
+        }
+    }
+    if (close) {
+        env->CallVoidMethod(cursor, close);
+    }
+    env->DeleteLocalRef(cursor);
+
+    qWarning("[pdfio] provider display name for %s is \"%s\"", qPrintable(uri), qPrintable(name));
+    return name;
+}
+
 } // namespace
 
 struct AndroidDocumentPicker::Private
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 {
+    /// Only the Qt5 branch can fill it, but the accessor exists on every platform.
+    QString pickedUri;
 };
 #else
     : public QAndroidActivityResultReceiver
@@ -183,6 +299,10 @@ struct AndroidDocumentPicker::Private
     /// What the picked content is copied to while it is worked on. Set by pickFile() before the
     /// activity starts, because the result callback only ever sees the URI.
     QString pendingCacheName;
+
+    /// The content:// URI the last pick returned. Remembered here so the provider can be asked for
+    /// the display name later, on the event loop, and never from inside the callback.
+    QString pickedUri;
 
     void handleActivityResult(int receiverRequestCode, int resultCode, const QAndroidJniObject &data) override
     {
@@ -237,6 +357,11 @@ struct AndroidDocumentPicker::Private
         QJniObject text = uri.callObjectMethod("toString", "()Ljava/lang/String;");
         qWarning("[pdfio] picked uri: %s", qPrintable(text.toString()));
 
+        /// Remembered, not asked about: the provider is asked for the file's display name later,
+        /// on the event loop, because that query from inside this callback crashed the application.
+        /// This is the receiver's own field, not the base class's private "d".
+        pickedUri = text.toString();
+
         const QString local = copyContentToCache(text.toString(), pendingCacheName);
         qWarning("[pdfio] copied to %s (%lld bytes)", qPrintable(local),
                  qint64(local.isEmpty() ? 0 : QFileInfo(local).size()));
@@ -262,6 +387,16 @@ AndroidDocumentPicker::AndroidDocumentPicker(QObject *parent)
 AndroidDocumentPicker::~AndroidDocumentPicker()
 {
     delete d;
+}
+
+QString AndroidDocumentPicker::pickedContentUri() const
+{
+    return d->pickedUri;
+}
+
+QString AndroidDocumentPicker::displayNameForContentUri(const QString &contentUri)
+{
+    return queryDisplayName(contentUri);
 }
 
 void AndroidDocumentPicker::pickPdf(std::function<void(const QString &, const QString &)> onPicked)
@@ -362,6 +497,17 @@ AndroidDocumentPicker::AndroidDocumentPicker(QObject *parent)
 AndroidDocumentPicker::~AndroidDocumentPicker()
 {
     delete d;
+}
+
+QString AndroidDocumentPicker::pickedContentUri() const
+{
+    return QString();
+}
+
+QString AndroidDocumentPicker::displayNameForContentUri(const QString &contentUri)
+{
+    Q_UNUSED(contentUri);
+    return QString();
 }
 
 void AndroidDocumentPicker::pickPdf(std::function<void(const QString &, const QString &)> onPicked)
