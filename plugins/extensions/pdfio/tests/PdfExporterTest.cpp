@@ -47,6 +47,7 @@ private Q_SLOTS:
     void testIndirectContentsArrayExport();
     void testPageWithoutReadableMediaBoxStillExports();
     void testRefusesInkWithoutAlpha();
+    void testMediaBoxCases();
 
 private:
     QString fixturePath(const QString &name) const
@@ -74,6 +75,44 @@ private:
             }
         }
         return ink;
+    }
+
+    /// The same mark in red: the page's own text is dark, so a colour that appears nowhere in the
+    /// source lets a test measure where the ink landed instead of where anything dark is.
+    QImage inkWithRedMark(const QSize &displaySize) const
+    {
+        QImage ink(displaySize, QImage::Format_ARGB32);
+        ink.fill(Qt::transparent);
+        for (int y = 10; y < 60; ++y) {
+            for (int x = 10; x < 60; ++x) {
+                ink.setPixel(x, y, qRgba(255, 0, 0, 255));
+            }
+        }
+        return ink;
+    }
+
+    /// Where the red mark came back, in the exported page's own pixels at 72 dpi. Invalid when the
+    /// mark is nowhere on the page, which is itself a result: with the fallback box taken as it
+    /// stood, the /Rotate 270 page's mark was drawn right off the page.
+    QRect redMarkBounds(const QImage &image) const
+    {
+        const QImage rgb = image.convertToFormat(QImage::Format_RGB32);
+        int x0 = rgb.width();
+        int y0 = rgb.height();
+        int x1 = -1;
+        int y1 = -1;
+        for (int y = 0; y < rgb.height(); ++y) {
+            for (int x = 0; x < rgb.width(); ++x) {
+                const QRgb pixel = rgb.pixel(x, y);
+                if (qRed(pixel) > 150 && qGreen(pixel) < 100 && qBlue(pixel) < 100) {
+                    x0 = qMin(x0, x);
+                    y0 = qMin(y0, y);
+                    x1 = qMax(x1, x);
+                    y1 = qMax(y1, y);
+                }
+            }
+        }
+        return x1 < 0 ? QRect() : QRect(QPoint(x0, y0), QPoint(x1, y1));
     }
 
     /// The manifest is what maps a page index to a record, so the test builds a real one rather
@@ -670,6 +709,84 @@ void PdfExporterTest::testRefusesInkWithoutAlpha()
     QVERIFY2(why.contains(QStringLiteral("alpha")), qPrintable(why));
     QVERIFY2(why.contains(QStringLiteral("page 1")), qPrintable(why));
     QVERIFY(!QFile::exists(out));
+}
+
+void PdfExporterTest::testMediaBoxCases()
+{
+    /// One page per /MediaBox shape: 1 a direct array, 2 an indirect reference, 3 a direct array
+    /// with /Rotate 90, 4 an indirect reference with /Rotate 90, 5 no box anywhere.
+    ///
+    /// The two indirect pages fall back to the size the notebook recorded, and that size is the
+    /// DISPLAYED one, because both renderers report the page the way the reader shows it. For a
+    /// page turned a quarter turn the displayed size is the transpose of the page's own user space,
+    /// so using it as it stood drew a 595x842 ink plane into an 842x595 box: measured before the
+    /// fix, page 4's 50x50 mark came back 35x71 at (7,14) and page 5's mark was not on the page at
+    /// all (0 red pixels).
+    const QString fixture = fixturePath(QStringLiteral("ex-mediabox-cases.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixture));
+    QCOMPARE(backend.pageCount(), 5);
+
+    QCOMPARE(backend.pageInfo(0).rotation, 0);
+    QCOMPARE(backend.pageInfo(1).rotation, 0);
+    QCOMPARE(backend.pageInfo(2).rotation, 90);
+    QCOMPARE(backend.pageInfo(3).rotation, 90);
+    QCOMPARE(backend.pageInfo(4).rotation, 270);
+    /// The quarter-turned pages are recorded as their displayed size, which is the transpose of
+    /// their user space: 842x595 for the A4 page, 792x612 for the page Poppler gives a Letter
+    /// default because it has no /MediaBox at all. Both are what the fallback has to turn back.
+    QCOMPARE(backend.pageInfo(3).sizePt, QSizeF(842, 595));
+    QCOMPARE(backend.pageInfo(4).sizePt, QSizeF(792, 612));
+
+    QHash<int, QImage> ink;
+    for (int i = 0; i < backend.pageCount(); ++i) {
+        const QSizeF sizePt = backend.pageInfo(i).sizePt;
+        ink.insert(i, inkWithRedMark(QSize(qRound(sizePt.width()), qRound(sizePt.height()))));
+    }
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString out = dir.filePath(QStringLiteral("exported.pdf"));
+
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(fixture, manifestFor(backend), ink, out, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(out));
+    QCOMPARE(exported.pageCount(), 5);
+
+    /// Every page, whatever its box shape, has to show the mark where it was drawn: a 50x50 square
+    /// at (10,10) of the page as displayed.
+    for (int i = 0; i < 5; ++i) {
+        const QImage rendered = exported.renderPage(i, 72.0);
+        QVERIFY(!rendered.isNull());
+        const QRect mark = redMarkBounds(rendered);
+        const QString where = QStringLiteral("page %1 (%2x%3 as displayed): the mark came back at "
+                                             "(%4,%5) measuring %6x%7, expected 50x50 at (10,10)")
+                                  .arg(i + 1)
+                                  .arg(rendered.width()).arg(rendered.height())
+                                  .arg(mark.left()).arg(mark.top())
+                                  .arg(mark.width()).arg(mark.height());
+        QVERIFY2(mark.isValid(), qPrintable(QStringLiteral("page %1: the mark is not on the page")
+                                                    .arg(i + 1)));
+        QVERIFY2(qAbs(mark.width() - 50) <= 3 && qAbs(mark.height() - 50) <= 3, qPrintable(where));
+        QVERIFY2(qAbs(mark.left() - 10) <= 3 && qAbs(mark.top() - 10) <= 3, qPrintable(where));
+    }
+
+    /// The page's own content survives every one of those paths, including the two that fall back.
+    const QStringList headings = {
+        QStringLiteral("Direct media box"),
+        QStringLiteral("Indirect media box"),
+        QStringLiteral("Rotated direct box"),
+        QStringLiteral("Rotated indirect box"),
+        QStringLiteral("Missing media box"),
+    };
+    for (int i = 0; i < headings.size(); ++i) {
+        QVERIFY2(exported.pageText(i).contains(headings.at(i)),
+                 qPrintable(QStringLiteral("page %1: expected \"%2\", got \"%3\"")
+                                .arg(i + 1).arg(headings.at(i)).arg(exported.pageText(i))));
+    }
 }
 
 QTEST_MAIN(PdfExporterTest)

@@ -1346,21 +1346,31 @@ bool effectiveRect(PdfDocument *doc, const PageEntry &page, QString *why,
         fail(why, QStringLiteral("page %1 has an unreadable /MediaBox").arg(page.number));
         return false;
     }
-    const QStringList parts = QString::fromLatin1(body.mid(i + 1, close - i - 1))
-                                  .simplified().split(QLatin1Char(' '));
+    const QByteArray slice = body.mid(i + 1, close - i - 1);
+    const QStringList parts = QString::fromLatin1(slice).simplified().split(QLatin1Char(' '));
     if (parts.size() != 4) {
         fail(why, QStringLiteral("page %1 has a /MediaBox that is not a rectangle")
                       .arg(page.number));
         return false;
     }
-    *x0 = parts.at(0).toDouble();
-    *y0 = parts.at(1).toDouble();
-    *x1 = parts.at(2).toDouble();
-    *y1 = parts.at(3).toDouble();
-    if (!(x1 > x0) || !(y1 > y0)) {
+
+    /// The four numbers are held apart and compared as numbers. The check used to read
+    /// "if (!(x1 > x0) || !(y1 > y0))" on the out-parameters themselves, which are double
+    /// *pointers*: it compared their addresses, a question whose answer depends on how the
+    /// platform lays the arguments out. x86-64 put x1 above x0 and accepted every box; the
+    /// tablet's arm64 build put it the other way, so every readable /MediaBox came back "empty or
+    /// inverted" and the export silently fell back to the notebook's displayed size -- the whole
+    /// reason this task exists, and invisible to every desktop test by construction.
+    const double values[4] = {parts.at(0).toDouble(), parts.at(1).toDouble(),
+                              parts.at(2).toDouble(), parts.at(3).toDouble()};
+    if (!(values[2] > values[0]) || !(values[3] > values[1])) {
         fail(why, QStringLiteral("page %1 has an empty or inverted /MediaBox").arg(page.number));
         return false;
     }
+    *x0 = values[0];
+    *y0 = values[1];
+    *x1 = values[2];
+    *y1 = values[3];
     return true;
 }
 
@@ -1969,6 +1979,14 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         rewritten.insert(page.number);
         ++inkedPages;
 
+        /// The rotation comes first: the fallback below has to know it, because the notebook's
+        /// recorded size is the *displayed* size and a quarter turn has to be undone before it can
+        /// stand in for a page-space box.
+        int rotation = 0;
+        if (!effectiveRotation(&doc, page, why, &rotation)) {
+            return false;
+        }
+
         double x0 = 0;
         double y0 = 0;
         double x1 = 0;
@@ -1992,17 +2010,22 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                 return false;
             }
 
-            qWarning("[pdfio] page %d (PDF object %d): %s; using the notebook's own %.2fx%.2f points",
-                     i + 1, page.number, qPrintable(rectWhy),
-                     pageSize.width(), pageSize.height());
+            /// Both renderers report the size the reader shows, with /Rotate already applied, so a
+            /// page turned a quarter turn is recorded as tall-by-wide when its own user space is
+            /// wide-by-tall. Using it as it stands drew a 595x842 ink plane into an 842x595 box:
+            /// measured on ex-mediabox-cases.pdf, a 50x50 mark came back 35x71 on the /Rotate 90
+            /// page and the /Rotate 270 page's mark fell off the page entirely (0 red pixels).
+            const bool quarterTurn = rotation == 90 || rotation == 270;
             x0 = 0;
             y0 = 0;
-            x1 = pageSize.width();
-            y1 = pageSize.height();
-        }
-        int rotation = 0;
-        if (!effectiveRotation(&doc, page, why, &rotation)) {
-            return false;
+            x1 = quarterTurn ? pageSize.height() : pageSize.width();
+            y1 = quarterTurn ? pageSize.width() : pageSize.height();
+
+            qWarning("[pdfio] page %d (PDF object %d): %s; using the notebook's own %.2fx%.2f "
+                     "points%s",
+                     i + 1, page.number, qPrintable(rectWhy),
+                     pageSize.width(), pageSize.height(),
+                     quarterTurn ? ", turned back into page space for the /Rotate" : "");
         }
 
         /// The overlay is composited with the plane's own alpha as its mask, so a plane that has

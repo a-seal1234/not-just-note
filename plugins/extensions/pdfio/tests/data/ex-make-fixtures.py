@@ -275,6 +275,63 @@ def indirect_contents_pdf():
     return NL.join(out) + NL
 
 
+def mediabox_cases_pdf():
+    """Five pages, one per /MediaBox shape the reader has to survive.
+
+    Page 1 a direct array, page 2 an indirect reference, page 3 a direct array with /Rotate 90,
+    page 4 an indirect reference with /Rotate 90 (a fallback has to give the box back in PAGE space,
+    not the displayed size), page 5 no /MediaBox anywhere. Object numbers are stable because the test
+    names them: 3, 5, 7, 9, 11 are the pages, 4, 6, 8, 10, 15 their content streams, 12 and 13 the
+    indirect boxes, 14 the font.
+    """
+    box = (0, 0, 595, 842)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R 11 0 R] /Count 5 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 14 0 R >> >> >>",
+        stream_object(b"", text_stream(box, "Direct media box", "Read straight from the page.")),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox 12 0 R /Contents 6 0 R "
+        b"/Resources << /Font << /F1 14 0 R >> >> >>",
+        stream_object(b"", text_stream(box, "Indirect media box", "The box is another object.")),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Rotate 90 /Contents 8 0 R "
+        b"/Resources << /Font << /F1 14 0 R >> >> >>",
+        stream_object(b"", text_stream(box, "Rotated direct box", "A quarter turn clockwise.")),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox 13 0 R /Rotate 90 /Contents 10 0 R "
+        b"/Resources << /Font << /F1 14 0 R >> >> >>",
+        stream_object(b"", text_stream(box, "Rotated indirect box", "Displayed size is swapped.")),
+        b"<< /Type /Page /Parent 2 0 R /Rotate 270 /Contents 15 0 R "
+        b"/Resources << /Font << /F1 14 0 R >> >> >>",
+        b"[0 0 595 842]",
+        b"[0 0 595 842]",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        # Letter, not A4: with no /MediaBox to read, a reader falls back to Letter, and text placed
+        # for an A4 box would be clipped away before it could prove anything.
+        stream_object(b"", text_stream((0, 0, 612, 792), "Missing media box",
+                                       "Nothing to read at all.")),
+    ]
+
+    out = [b"%PDF-1.4", b"%" + FS]
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(sum(len(line) + 1 for line in out))
+        out.append(b"%d 0 obj" % number)
+        out.append(body)
+        out.append(b"endobj")
+    xref_at = sum(len(line) + 1 for line in out)
+    out.append(b"xref")
+    out.append(b"0 %d" % (len(objects) + 1))
+    out.append(b"0000000000 65535 f ")
+    for offset in offsets:
+        out.append(b"%010d 00000 n " % offset)
+    out.append(b"trailer")
+    out.append(b"<< /Size %d /Root 1 0 R >>" % (len(objects) + 1))
+    out.append(b"startxref")
+    out.append(b"%d" % xref_at)
+    out.append(b"%%EOF")
+    return NL.join(out) + NL
+
+
 def write(name, data):
     path = os.path.join(HERE, name)
     with open(path, "wb") as handle:
@@ -300,6 +357,7 @@ def main():
     write("ex-objstm-predictor.pdf", objstm_predictor_pdf())
     write("ex-objstm-badfilter.pdf", objstm_predictor_pdf(b"LZWDecode"))
     write("ex-indirect-contents.pdf", indirect_contents_pdf())
+    write("ex-mediabox-cases.pdf", mediabox_cases_pdf())
 
     # Real third party producers: PDF 1.5+ object streams and cross reference streams.
     ghostscript("ex-objstm-rotations.pdf", "ex-rotations.pdf", ["-dCompatibilityLevel=1.5"])
