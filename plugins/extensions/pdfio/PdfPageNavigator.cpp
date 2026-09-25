@@ -4,6 +4,7 @@
  *  SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <QPainter>
 #include "PdfPageNavigator.h"
 
 #include <cstdio>
@@ -2025,8 +2026,21 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
     const QString thumbPath = project.filePath(m_manifest.pages.at(page).thumbFile);
     if (KisPaintDeviceSP projection = m_document->image()->projection()) {
         /// Of the page's own rectangle, or a strip's thumbnail would be a picture of the strip.
+        ///
+        /// The page keeps its shape inside the square. The projection helper scales to exactly the
+        /// width and height it is given, so asking it for a square squashes an A4 page into one --
+        /// measured as a 256x256 thumbnail that was 99.6% white pixels, which is what a preview of a
+        /// mostly blank page looks like once it has been stretched. Transparent margins and a
+        /// hairline around the page make its shape visible in the list.
+        const QSize scaled = thumbArea.size().scaled(QSize(ThumbnailPixels, ThumbnailPixels),
+                                                     Qt::KeepAspectRatio);
+
+        /// The picture is the page as it looks -- paper, ink and all -- in the page's own shape.
+        /// No square canvas and no margins: a thumbnail is a small page, and the page it stands for
+        /// is a portrait sheet of paper, not a square. The other renderer in this file has always
+        /// produced exactly this shape (measured on the tablet as 197x256 for A4).
         const QImage thumb =
-            projection->createThumbnailUncached(ThumbnailPixels, ThumbnailPixels, thumbArea);
+            projection->createThumbnailUncached(scaled.width(), scaled.height(), thumbArea);
         if (!thumb.isNull()) {
             QDir().mkpath(QFileInfo(thumbPath).absolutePath());
             thumb.save(thumbPath, "PNG");
