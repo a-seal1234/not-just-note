@@ -7,6 +7,7 @@
 #include "PdfPageNavigator.h"
 
 #include "session/PdfInkLoader.h"
+#include "session/PdfNotebookOps.h"
 #include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
@@ -78,6 +79,8 @@ private Q_SLOTS:
     void testClosingTheTabWritesTheInkAndAsksNothing();
     void testAnInsertedImageStaysItsOwnLayerAcrossAReopen();
     void testInsertingOnAStripWritesThePageAndNotTheStrip();
+    void testAMovedPageKeepsTheReaderAndTheirInk();
+    void testADeletedPageLeavesTheReaderOnTheNextOne();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1111,6 +1114,104 @@ void PdfNavigatorIntegrationTest::testInsertingOnAStripWritesThePageAndNotTheStr
         QApplication::processEvents();
     }
     QTest::qWait(50);
+}
+
+/**
+ * After the notebook is changed under the open page, the reader keeps their page and its ink.
+ *
+ * A move changes what every page NUMBER means, so the page that is open cannot simply be turned to
+ * a new index: it is closed, the manifest is re-read, and the anchor the operation reported is
+ * opened in a fresh document. What is under test is the whole round trip -- ink written before the
+ * change, the manifest changed underneath it, the notebook reloaded, and the ink read back out of
+ * the artifact that travelled with its record.
+ */
+void PdfNavigatorIntegrationTest::testAMovedPageKeepsTheReaderAndTheirInk()
+{
+    QVERIFY(useNotebook(QStringLiteral("ops-move")));
+    QVERIFY(navigator()->pageCount() >= 3);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    /// The ink has to be on disk before the manifest that describes it changes, or the change is
+    /// applied on top of ink that is going somewhere else.
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    QVERIFY2(!page->isModified(), "the document stayed modified after its ink was written");
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::movePage(navigator()->projectDir(), 0, 2, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, 2);
+
+    QVERIFY2(navigator()->reloadNotebook(outcome.anchorPage, &why), qPrintable(why));
+    QVERIFY(navigator()->reloadPending());
+
+    /// The rebuild runs on the event loop: the old view has to be gone before the new document is
+    /// built, which is the same wait every notebook open uses.
+    QElapsedTimer clock;
+    clock.start();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload never finished");
+
+    QCOMPARE(navigator()->currentIndex(), 2);
+    QCOMPARE(navigator()->pageCount(), 3);
+
+    /// The record travelled with its file name, and it is the page that is open -- so the ink that
+    /// was drawn on it before the move came back out of the artifact it was written to.
+    QCOMPARE(navigator()->manifest().pages.at(2).kraFile, PdfSession::pageFileName(0));
+    QVERIFY2(inkMarkPresent(navigator()->currentDocument()->image()),
+             "the moved page came back without its ink");
+
+    /// And nothing is left waiting: the reload is a one-shot, not a state the notebook sits in.
+    QVERIFY(!navigator()->reloadPending());
+}
+
+/**
+ * Deleting the page the reader is on leaves them on the page that took its place, and the pages
+ * around it keep their own ink.
+ */
+void PdfNavigatorIntegrationTest::testADeletedPageLeavesTheReaderOnTheNextOne()
+{
+    QVERIFY(useNotebook(QStringLiteral("ops-delete")));
+    QVERIFY(navigator()->pageCount() >= 3);
+
+    /// Ink on page 1, then turn to page 2 and delete it: the reader has to land on the page that
+    /// takes its place -- and page 1's ink must still be in page 1's artifact afterwards.
+    KisDocument *first = navigator()->currentDocument();
+    QVERIFY(first);
+    drawInk(first);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 1);
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::deletePages(navigator()->projectDir(), 1, 1, 1);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, 1);
+
+    QVERIFY2(navigator()->reloadNotebook(outcome.anchorPage, &why), qPrintable(why));
+    QElapsedTimer clock;
+    clock.start();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload never finished");
+
+    QCOMPARE(navigator()->pageCount(), 2);
+    QCOMPARE(navigator()->currentIndex(), 1);
+
+    /// Page 1 was not the page that was deleted, and its artifact still holds its ink.
+    const QString artifact = QDir(navigator()->projectDir()).filePath(PdfSession::pageFileName(0));
+    QVERIFY2(waitForInk(artifact), qPrintable(artifact));
+    QVERIFY2(navigator()->previous(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 0);
+    QVERIFY2(inkMarkPresent(navigator()->currentDocument()->image()),
+             "the page that was not deleted lost its ink to the delete");
 }
 
 /**

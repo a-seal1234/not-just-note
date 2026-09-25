@@ -82,6 +82,35 @@ public:
     KisDocument *pageLayersDocument(KisDocument *page, int index, QString *why = nullptr);
 
     /**
+     * Makes the notebook safe to change on disk: writes every page the open document holds and
+     * clears the document's modified flag, so the operation that follows cannot be applied on top
+     * of ink that is still in the air, and the document can be closed afterwards without Krita
+     * asking to save it.
+     *
+     * Returns false when a page could not be written, and the caller must then NOT change the
+     * notebook: a change applied over unsaved ink is a change that loses it.
+     */
+    bool prepareForNotebookChange(QString *why = nullptr);
+
+    /**
+     * Re-reads the notebook from disk -- after something changed its manifest -- and opens
+     * \a anchorPage (clamped to the pages that exist) in a fresh document and view.
+     *
+     * Refuses when the open page still carries ink that is not on disk, because the page list has
+     * just changed meaning: page 3 of the old manifest is not necessarily the page that is open.
+     * The caller is expected to have run prepareForNotebookChange() before the change.
+     *
+     * Everything that describes the old page list is thrown away -- the window, the strip, its
+     * cells and paper layers, the slot bookkeeping, the queued thumbnails -- and the rebuild runs
+     * on the event loop, because the old view has to be gone before the new document is built.
+     * \ref reloadFinished() says when it is done.
+     */
+    bool reloadNotebook(int anchorPage, QString *why = nullptr);
+
+    /// Whether a reload is waiting for the event loop.
+    bool reloadPending() const;
+
+    /**
      * Writes what the open page -- every page the window holds -- still has unsaved, so that
      * closing a tab or quitting Krita cannot lose ink.
      *
@@ -146,7 +175,13 @@ Q_SIGNALS:
     /// A thumbnail that was missing has been written, so a view showing that page can update.
     void thumbnailReady(int index);
 
+    /// A reload has finished: \a index is the page now open, \a ok whether it opened at all.
+    void reloadFinished(int index, bool ok);
+
 private:
+    /// The half of reloadNotebook() that waits for the old view to go: see it for the contract.
+    void finishReload();
+
     /// Installs the window's save hook and sets its bound to the current scope, once. The page
     /// switch then cannot run without the policy in front of it.
     PdfPageNavigator();
@@ -438,6 +473,13 @@ private:
 
     QList<int> m_thumbnailQueue;
     QTimer *m_thumbnailTimer = nullptr;
+
+    /// What reloadNotebook() is going to open once the old view has gone, and whether one is
+    /// waiting. The manifest is read BEFORE the reload is scheduled, so a notebook that cannot be
+    /// read back is the caller's answer rather than a reload that half happened on the event loop.
+    PdfSessionManifest m_reloadManifest;
+    int m_reloadAnchor = 0;
+    bool m_reloadPending = false;
 
     /// One open renderer per source, and where "render the page" is answered: the record's own page
     /// inside the record's own source, never the notebook position. Kept open between thumbnails,

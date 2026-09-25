@@ -6,6 +6,8 @@
 
 #include "PdfExporter.h"
 
+#include "session/PdfNotebookOps.h"
+
 #include <QDebug>
 
 #include <QFile>
@@ -1925,6 +1927,16 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                                 QString *why)
 {
     if (!manifest.isValid(why)) {
+        return false;
+    }
+
+    /// F3's guard, and it is the whole reason it is here rather than in the menu. The overlay below
+    /// is attached to the PDF page at the SAME POSITION as the notebook page, so it is only correct
+    /// while the notebook's page N is the PDF's page N. A move, a delete, a duplicate, an insert or
+    /// a page from another PDF breaks that, and the file that would come out has every mark on the
+    /// wrong sheet -- with nothing to show for it but a PDF that looks fine. Refusing with the
+    /// reason is the only safe answer until the writer can rebuild the page tree in notebook order.
+    if (!PdfNotebookOps::exportIsOrderPreserving(manifest, why)) {
         return false;
     }
 

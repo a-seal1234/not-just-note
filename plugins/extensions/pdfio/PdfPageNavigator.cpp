@@ -238,6 +238,11 @@ constexpr qint64 AutoSaveTickMs = 250;
 constexpr qint64 AutoSaveMinGapMs = 1000;
 constexpr qint64 AutoSaveMaxIntervalMs = 5 * 60 * 1000;
 
+/// How long a notebook change waits before the page is rebuilt. The old view has to be gone before
+/// the new document is built -- Krita closes it on the event loop -- and this is the same wait
+/// every notebook open uses.
+constexpr int ReloadSettleMs = 700;
+
 /// The gap the strip decoration leaves between pages, in widget pixels.
 constexpr qreal GapWidgetPixels = 16;
 
@@ -1967,6 +1972,134 @@ bool PdfPageNavigator::prepareForClose()
     say(QStringLiteral("closing: page %1 of %2 written through the notebook, nothing for Krita to ask about")
             .arg(m_index + 1).arg(m_manifest.pages.size()));
     return true;
+}
+
+bool PdfPageNavigator::prepareForNotebookChange(QString *why)
+{
+    if (!hasNotebook()) {
+        fail(why, QStringLiteral("no notebook is open"));
+        return false;
+    }
+    if (m_reloadPending) {
+        fail(why, QStringLiteral("the notebook is already being reloaded"));
+        return false;
+    }
+
+    /// The ink first, and waited for. Everything an operation does is decided by the manifest, and
+    /// a page written after the manifest changed would be written against a page list that no
+    /// longer describes the document in front of it.
+    if (!saveStripPages()) {
+        fail(why, QStringLiteral("the notebook could not be written, so nothing was changed"));
+        return false;
+    }
+
+    QString drainWhy;
+    if (!drainWrites(&drainWhy)) {
+        fail(why, QStringLiteral("a page write was still in flight: %1").arg(drainWhy));
+        return false;
+    }
+
+    /// Only now, and only because every page above reached its artifact: leaving the document
+    /// modified would have Krita ask whether to save it while the notebook is being closed under
+    /// it -- and the answer would be "save the old page list".
+    if (m_document) {
+        m_document->setModified(false);
+    }
+    return true;
+}
+
+bool PdfPageNavigator::reloadPending() const
+{
+    return m_reloadPending;
+}
+
+bool PdfPageNavigator::reloadNotebook(int anchorPage, QString *why)
+{
+    if (!hasNotebook()) {
+        fail(why, QStringLiteral("no notebook is open"));
+        return false;
+    }
+    if (m_reloadPending) {
+        fail(why, QStringLiteral("the notebook is already being reloaded"));
+        return false;
+    }
+    if (m_inPageTurn) {
+        fail(why, QStringLiteral("a page turn is in progress"));
+        return false;
+    }
+
+    /// Deliberately no write here. The page list has just changed, so the open document describes
+    /// pages by numbers that now mean something else: writing it now would put one page's ink into
+    /// another page's artifact. Ink that is still unsaved is therefore a refusal, not a save --
+    /// prepareForNotebookChange() is what the caller runs before it changes the notebook.
+    if (m_document && m_document->isModified()) {
+        fail(why, QStringLiteral("the open page still carries ink that is not on disk; write the "
+                                 "notebook before changing it"));
+        return false;
+    }
+
+    /// Whatever an earlier write already started still gets to land.
+    QString drainWhy;
+    drainWrites(&drainWhy);
+
+    /// Read now, so a notebook that cannot be read back is the caller's answer instead of a reload
+    /// that half happened on the event loop.
+    PdfSessionManifest manifest = PdfSession::openProject(m_projectDir, why);
+    if (!manifest.isValid(why)) {
+        return false;
+    }
+
+    m_reloadManifest = manifest;
+    m_reloadAnchor = qBound(0, anchorPage, manifest.pages.size() - 1);
+    m_reloadPending = true;
+
+    say(QStringLiteral("reloading the notebook: %1 page(s), opening page %2")
+            .arg(manifest.pages.size()).arg(m_reloadAnchor + 1));
+
+    /// The old view has to be gone before the new document is built; Krita closes it on the event
+    /// loop, which is the same reason every notebook open defers. finishReload() does the rest.
+    closeCurrentPage();
+    QTimer::singleShot(ReloadSettleMs, this, &PdfPageNavigator::finishReload);
+    return true;
+}
+
+void PdfPageNavigator::finishReload()
+{
+    if (!m_reloadPending) {
+        return;
+    }
+    m_reloadPending = false;
+
+    /// Everything that describes the OLD page list goes. A page number is a position, and the
+    /// positions just changed: the window, the strip and its cells and paper layers, the slot
+    /// bookkeeping, the write stamps and the thumbnails queued for pages that may now be other
+    /// pages. Keeping any of it is how a strip shows the notebook as it was before the change.
+    m_window.clear();
+    m_stripPages.clear();
+    m_stripRects.clear();
+    m_stripCells.clear();
+    m_stripPaper.clear();
+    m_stripActiveSlot = -1;
+    m_windowSlot = -1;
+    m_saveStamps.clear();
+    m_thumbnailQueue.clear();
+
+    m_manifest = m_reloadManifest;
+
+    /// The clocks start over for the same reason openNotebook() resets them: a mark left by a page
+    /// that is no longer in this notebook would have the idle write chase a page that is not there.
+    m_lastInkChange = 0;
+    m_lastAutoSave = QDateTime::currentMSecsSinceEpoch();
+
+    QString why;
+    const bool shown = showPage(m_reloadAnchor, &why);
+    if (!shown) {
+        say(QStringLiteral("the notebook was reloaded but page %1 did not open: %2")
+                .arg(m_reloadAnchor + 1).arg(why));
+    }
+
+    Q_EMIT pageChanged(m_index, pageCount(), QFileInfo(m_manifest.sourceFile).completeBaseName());
+    Q_EMIT reloadFinished(m_index, shown);
 }
 
 bool PdfPageNavigator::savePageAndWait(int index, QString *why)

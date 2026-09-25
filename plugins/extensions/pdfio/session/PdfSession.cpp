@@ -64,13 +64,6 @@ bool notebookLooksComplete(const QString &dir, QString *why)
     return true;
 }
 
-QString numbered(const QString &directory, const QString &prefix, int index, const QString &suffix)
-{
-    return QStringLiteral("%1/p%2%3").arg(directory,
-                                          QString::number(index + 1).rightJustified(4, QLatin1Char('0')),
-                                          suffix);
-}
-
 void fail(QString *why, const QString &message)
 {
     if (why) {
@@ -119,7 +112,13 @@ QString PdfSession::pageFileNameForNumber(int number)
 
 QString PdfSession::thumbFileName(int index)
 {
-    return numbered(QStringLiteral("thumbs"), QStringLiteral("p"), index, QStringLiteral(".png"));
+    return thumbFileNameForNumber(index + 1);
+}
+
+QString PdfSession::thumbFileNameForNumber(int number)
+{
+    return QStringLiteral("thumbs/p%1.png")
+        .arg(QString::number(number).rightJustified(4, QLatin1Char('0')));
 }
 
 PdfSessionManifest PdfSession::createProject(const QString &projectDir,

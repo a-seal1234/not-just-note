@@ -9,6 +9,7 @@ set(kritapdfio_SOURCES
     session/PdfExporter.cpp
     session/PdfInkLoader.cpp
     session/PdfNotebookBundle.cpp
+    session/PdfNotebookOps.cpp
     session/PdfPageSaver.cpp
     session/PdfPageWindow.cpp
     session/PdfProjectBuilder.cpp

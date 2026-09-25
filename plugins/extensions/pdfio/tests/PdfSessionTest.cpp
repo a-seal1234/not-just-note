@@ -5,12 +5,14 @@
  */
 
 #include "backends/poppler/PopplerRenderBackend.h"
+#include "session/PdfNotebookOps.h"
 #include "session/PdfSession.h"
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -26,6 +28,15 @@ void writeBytes(const QString &path, const QByteArray &bytes)
         return;
     }
     file.write(bytes);
+}
+
+QByteArray readBytes(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return QByteArray();
+    }
+    return file.readAll();
 }
 
 } // namespace
@@ -60,6 +71,16 @@ private Q_SLOTS:
     void testThePageNumberAllocatorNeverReusesANumber();
     void testDisplaySizeFollowsTheNotebooksOwnRotation();
     void testOpenProjectVerifiesEverySource();
+
+    /// The notebook-level operations, as changes to the files on disk: what they change, what they
+    /// keep, what they refuse, and that a change which cannot be committed leaves nothing behind.
+    void testMovingAPageChangesOnlyTheManifest();
+    void testDeletingAPageJournalsItsFiles();
+    void testDeletingTheLastPageIsRefused();
+    void testDuplicatingAPageCopiesItsArtifacts();
+    void testAnOperationThatCannotCommitChangesNothing();
+    void testUndoUndoesTheLastChangeOnly();
+    void testTheExportGuardRefusesAPageListThatIsNotTheSourcesOrder();
 
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
@@ -562,6 +583,338 @@ void PdfSessionTest::testOpenProjectVerifiesEverySource()
     why.clear();
     QVERIFY(!PdfSession::openProject(project, &why).isValid());
     QVERIFY2(why.contains(QStringLiteral("changed")), qPrintable(why));
+}
+
+/**
+ * Moving a page changes the manifest and nothing on disk.
+ *
+ * The records carry their own file names, so a reorder is one atomic manifest write: no artifact is
+ * renamed, no sidecar is touched, and the page a record points at keeps its ink. That is also why
+ * the operation can be undone by putting one file back.
+ */
+void PdfSessionTest::testMovingAPageChangesOnlyTheManifest()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    /// An artifact for the page that moves, so "nothing moved" is a statement about a file.
+    const QString artifact = QDir(project).filePath(before.pages.at(0).kraFile);
+    const QByteArray ink = QByteArrayLiteral("the first page's ink");
+    writeBytes(artifact, ink);
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::movePage(project, 0, 2, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, 2);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 3);
+    QCOMPARE(after.pages.at(2).kraFile, before.pages.at(0).kraFile);
+    QCOMPARE(after.pages.at(0).kraFile, before.pages.at(1).kraFile);
+    QCOMPARE(after.pages.at(1).kraFile, before.pages.at(2).kraFile);
+
+    /// The artifact is where it was, with the same bytes.
+    QVERIFY(QFileInfo::exists(artifact));
+    QCOMPARE(readBytes(artifact), ink);
+
+    QVERIFY(PdfNotebookOps::canUndo(project));
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    /// The reader goes back to the page they were reading, which is where they were when the
+    /// change was made.
+    QCOMPARE(undo.anchorPage, 0);
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+}
+
+/**
+ * Deleting a page takes its files out of the notebook and keeps them in the journal.
+ *
+ * Nothing is deleted: the artifact, its sidecar and the thumbnail are moved aside, which is what
+ * makes the change reversible and what keeps a crash from taking the ink with it.
+ */
+void PdfSessionTest::testDeletingAPageJournalsItsFiles()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    const PdfPageRecord second = before.pages.at(1);
+    const QByteArray ink = QByteArrayLiteral("ink of page 2");
+    const QByteArray sidecar = QByteArrayLiteral("a sidecar layer");
+    const QByteArray thumb = QByteArrayLiteral("thumb of page 2");
+    writeBytes(QDir(project).filePath(second.kraFile), ink);
+    writeBytes(QDir(project).filePath(second.kraFile + QStringLiteral(".layers/Inserted image.png")), sidecar);
+    writeBytes(QDir(project).filePath(second.thumbFile), thumb);
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::deletePages(project, 1, 1, 1);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    /// The page that took its place is where the reader lands: the deletion does not move them.
+    QCOMPARE(outcome.anchorPage, 1);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 2);
+    QCOMPARE(after.pages.at(1).kraFile, before.pages.at(2).kraFile);
+
+    /// Gone from the notebook...
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(second.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(second.thumbFile)));
+
+    /// ...and in the journal.
+    const QString journal = PdfNotebookOps::journalDir(project);
+    const QString removed = QDir(journal).filePath(QStringLiteral("removed"));
+    QVERIFY(QFileInfo::exists(QDir(removed).filePath(second.kraFile)));
+    QVERIFY(QFileInfo::exists(QDir(removed).filePath(second.thumbFile)));
+    QVERIFY(QFileInfo::exists(
+        QDir(removed).filePath(second.kraFile + QStringLiteral(".layers/Inserted image.png"))));
+
+    /// The undo puts every byte back where it was.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(undo.anchorPage, 1);
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+    QCOMPARE(readBytes(QDir(project).filePath(second.kraFile)), ink);
+    QCOMPARE(readBytes(QDir(project).filePath(second.thumbFile)), thumb);
+    QCOMPARE(readBytes(QDir(project).filePath(second.kraFile + QStringLiteral(".layers/Inserted image.png"))),
+             sidecar);
+    QVERIFY(!QFileInfo::exists(journal));
+}
+
+void PdfSessionTest::testDeletingTheLastPageIsRefused()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    /// Every page: a notebook with none is not a notebook, and the manifest refuses it.
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::deletePages(project, 0, 3, 0);
+    QVERIFY(!outcome.ok);
+    QVERIFY2(outcome.why.contains(QStringLiteral("last page")), qPrintable(outcome.why));
+
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+
+    /// One page short of that is allowed, so the refusal is the last page and not "delete".
+    QVERIFY2(PdfNotebookOps::deletePages(project, 0, 2, 0).ok, "two of three pages must be deletable");
+}
+
+/**
+ * A duplicate is a page of its own: its own artifact, its own sidecar, its own preview, copied
+ * before the manifest that names them is committed.
+ */
+void PdfSessionTest::testDuplicatingAPageCopiesItsArtifacts()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    const PdfPageRecord original = before.pages.at(0);
+    writeBytes(QDir(project).filePath(original.kraFile), QByteArrayLiteral("ink of page 1"));
+    writeBytes(QDir(project).filePath(original.kraFile + QStringLiteral(".layers/Inserted image.png")),
+               QByteArrayLiteral("a sidecar layer"));
+    writeBytes(QDir(project).filePath(original.thumbFile), QByteArrayLiteral("thumb of page 1"));
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::duplicatePage(project, 0, 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    /// The reader stays on the page they duplicated.
+    QCOMPARE(outcome.anchorPage, 0);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 4);
+    QCOMPARE(after.pages.at(0).kraFile, original.kraFile);
+
+    const PdfPageRecord copy = after.pages.at(1);
+    QVERIFY(copy.kraFile != original.kraFile);
+    /// The number comes from the allocator, past every number the page list already names: three
+    /// pages name 1..3, so the copy is 4.
+    QCOMPARE(copy.kraFile, PdfSession::pageFileNameForNumber(4));
+    QCOMPARE(copy.thumbFile, PdfSession::thumbFileNameForNumber(4));
+
+    QCOMPARE(readBytes(QDir(project).filePath(copy.kraFile)),
+             readBytes(QDir(project).filePath(original.kraFile)));
+    QCOMPARE(readBytes(QDir(project).filePath(copy.thumbFile)),
+             readBytes(QDir(project).filePath(original.thumbFile)));
+    QCOMPARE(readBytes(QDir(project).filePath(copy.kraFile + QStringLiteral(".layers/Inserted image.png"))),
+             QByteArrayLiteral("a sidecar layer"));
+
+    /// The undo takes the copy away and leaves the original exactly as it was.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile + QStringLiteral(".layers"))));
+    QCOMPARE(readBytes(QDir(project).filePath(original.kraFile)), QByteArrayLiteral("ink of page 1"));
+}
+
+/**
+ * An operation that cannot commit its manifest leaves the notebook exactly as it was.
+ *
+ * The commit is the manifest write, and it comes after every file the change creates -- so the
+ * failure here is the interesting one: the copies are already on disk. They are rolled back, and no
+ * undo is offered for a change that did not happen.
+ */
+void PdfSessionTest::testAnOperationThatCannotCommitChangesNothing()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    const QString artifact = QDir(project).filePath(before.pages.at(0).kraFile);
+    writeBytes(artifact, QByteArrayLiteral("ink of page 1"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    PdfSessionManifest::setFailBeforeCommitForTests(true);
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::duplicatePage(project, 0, 0);
+    PdfSessionManifest::setFailBeforeCommitForTests(false);
+
+    QVERIFY2(!outcome.ok, "the duplicate was reported as done although the manifest was not committed");
+    QVERIFY(!outcome.why.isEmpty());
+
+    /// The manifest is the one that was there, byte for byte.
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+
+    /// The copy the operation had made is gone, and so is its journal: there is no change to undo.
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(PdfSession::pageFileNameForNumber(4))));
+    QVERIFY(!QFileInfo::exists(PdfNotebookOps::journalDir(project)));
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+
+    /// And the original is untouched.
+    QCOMPARE(readBytes(artifact), QByteArrayLiteral("ink of page 1"));
+}
+
+/**
+ * Undo is one change deep, and it is the LAST change: a second operation replaces what the first
+ * one left to undo.
+ */
+void PdfSessionTest::testUndoUndoesTheLastChangeOnly()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    PdfSessionManifest start =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(start.isValid());
+
+    QVERIFY(PdfNotebookOps::movePage(project, 0, 2, 0).ok);
+    QString why;
+    const PdfSessionManifest afterMove = PdfSession::openProject(project, &why);
+    QVERIFY2(afterMove.isValid(&why), qPrintable(why));
+
+    QVERIFY(PdfNotebookOps::duplicatePage(project, 1, 1).ok);
+    const PdfSessionManifest afterDuplicate = PdfSession::openProject(project, &why);
+    QCOMPARE(afterDuplicate.pages.size(), 4);
+
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+
+    /// Back to the state after the move -- not to the notebook before it.
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), afterMove.toJson());
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+    QCOMPARE(PdfSession::openProject(project, &why).pages.size(), 3);
+}
+
+/**
+ * The export guard: ink is placed by list position, so the export is only correct while the
+ * notebook's page N is the PDF's page N. Everything else is refused, with the reason.
+ *
+ * This is what keeps "move a page, then export" from writing a PDF whose marks are on the wrong
+ * sheets -- a file that looks right and is not. Stage G's page-tree rebuild is what will replace it.
+ */
+void PdfSessionTest::testTheExportGuardRefusesAPageListThatIsNotTheSourcesOrder()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest untouched =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(untouched.isValid());
+
+    QString why;
+    QVERIFY2(PdfNotebookOps::exportIsOrderPreserving(untouched, &why), qPrintable(why));
+
+    /// A move: notebook page 1 now holds PDF page 3.
+    PdfSessionManifest moved = untouched;
+    moved.pages.move(0, 2);
+    why.clear();
+    QVERIFY2(!PdfNotebookOps::exportIsOrderPreserving(moved, &why),
+             "a moved notebook was allowed to export");
+    QVERIFY2(why.contains(QStringLiteral("wrong page")), qPrintable(why));
+    /// [P2, P3, P1] after the move, so notebook page 1 now holds PDF page 2 -- and the message says
+    /// which page of the PDF it holds, so the user can see what would have happened.
+    QVERIFY2(why.contains(QStringLiteral("notebook page 1")) && why.contains(QStringLiteral("page 2 of the PDF")),
+             qPrintable(why));
+
+    /// A delete out of the middle: the pages after it are no longer at their own positions.
+    PdfSessionManifest deleted = untouched;
+    deleted.pages.removeAt(1);
+    why.clear();
+    QVERIFY(!PdfNotebookOps::exportIsOrderPreserving(deleted, &why));
+    QVERIFY2(why.contains(QStringLiteral("notebook page 2")), qPrintable(why));
+
+    /// A duplicate: two notebook pages would name one PDF page.
+    PdfSessionManifest duplicated = untouched;
+    duplicated.pages.insert(1, duplicated.pages.at(0));
+    QVERIFY(!PdfNotebookOps::exportIsOrderPreserving(duplicated, &why));
+
+    /// A page from another PDF.
+    PdfSessionManifest twoSources = untouched;
+    PdfSourceRecord first;
+    first.file = twoSources.sourceFile;
+    first.sha256 = twoSources.sourceSha256;
+    first.byteSize = twoSources.sourceByteSize;
+    PdfSourceRecord second;
+    second.file = QStringLiteral("sources/other.pdf");
+    second.sha256 = QByteArrayLiteral("cafebabe");
+    second.byteSize = 1;
+    twoSources.sources.clear();
+    twoSources.sources << first << second;
+    twoSources.pages[0].source = 1;
+    why.clear();
+    QVERIFY(!PdfNotebookOps::exportIsOrderPreserving(twoSources, &why));
+    QVERIFY2(why.contains(QStringLiteral("PDFs")), qPrintable(why));
+
+    /// A notebook that is the source's first pages, in order, is still exportable: an untouched
+    /// page is copied through, which is what the export has always done.
+    PdfSessionManifest shorter = untouched;
+    shorter.pages.removeLast();
+    why.clear();
+    QVERIFY2(PdfNotebookOps::exportIsOrderPreserving(shorter, &why), qPrintable(why));
 }
 
 /**

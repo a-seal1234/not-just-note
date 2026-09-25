@@ -49,6 +49,10 @@ private Q_SLOTS:
     void testRefusesInkWithoutAlpha();
     void testMediaBoxCases();
 
+    /// The guard that makes a notebook whose pages are no longer the PDF's own order refuse to
+    /// export, rather than write a file whose ink is on the wrong pages.
+    void testAMovedPageIsRefusedRatherThanExportedWrongly();
+
 private:
     QString fixturePath(const QString &name) const
     {
@@ -709,6 +713,56 @@ void PdfExporterTest::testRefusesInkWithoutAlpha()
     QVERIFY2(why.contains(QStringLiteral("alpha")), qPrintable(why));
     QVERIFY2(why.contains(QStringLiteral("page 1")), qPrintable(why));
     QVERIFY(!QFile::exists(out));
+}
+
+/**
+ * A notebook whose pages are not the PDF's own pages, in their own order, is refused.
+ *
+ * The export finds the page to overlay by the notebook's LIST POSITION: the ink is keyed by
+ * position and the page object written is the one at the same index. So a moved page would have its
+ * ink attached to a different sheet -- silently, in a file that opens perfectly, which is exactly
+ * the failure mode this project keeps having to design against. The guard refuses with the reason
+ * until the writer can rebuild the page tree in notebook order (stage G of the Notebook ops plan).
+ *
+ * It lives in this function rather than in the menu because this is what writes the file: a menu
+ * check a future caller forgets cannot then produce a wrong PDF.
+ */
+void PdfExporterTest::testAMovedPageIsRefusedRatherThanExportedWrongly()
+{
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixturePath(QStringLiteral("text-fixture.pdf"))));
+    QCOMPARE(backend.pageCount(), 3);
+
+    QHash<int, QImage> ink;
+    ink.insert(0, inkWithMark(QSize(595, 842)));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = fixturePath(QStringLiteral("text-fixture.pdf"));
+
+    /// The notebook as it was made: the source's own pages in their own order, and it exports.
+    QString why;
+    const QString good = dir.filePath(QStringLiteral("good.pdf"));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifestFor(backend), ink, good, &why), qPrintable(why));
+
+    /// The same notebook with page 1 moved to the end: the ink that was on PDF page 1 would be
+    /// written onto PDF page 3, and PDF page 1 would keep the original art with no ink at all.
+    PdfSessionManifest moved = manifestFor(backend);
+    moved.pages.move(0, 2);
+
+    const QString wrong = dir.filePath(QStringLiteral("wrong.pdf"));
+    why.clear();
+    QVERIFY2(!PdfExporter::exportWithInk(source, moved, ink, wrong, &why),
+             "a notebook whose pages are not the PDF's own order was exported anyway");
+    QVERIFY2(why.contains(QStringLiteral("wrong page")), qPrintable(why));
+    /// [P2, P3, P1] after the move, so notebook page 1 now holds PDF page 2: the ink that was on
+    /// PDF page 1 would be written onto PDF page 2, and the message names both.
+    QVERIFY2(why.contains(QStringLiteral("notebook page 1")) && why.contains(QStringLiteral("page 2 of the PDF")),
+             qPrintable(why));
+
+    /// Nothing was written: a refusal that left a file behind would be worse than useless, and the
+    /// destination is the thing a user would hand on.
+    QVERIFY(!QFileInfo::exists(wrong));
 }
 
 void PdfExporterTest::testMediaBoxCases()

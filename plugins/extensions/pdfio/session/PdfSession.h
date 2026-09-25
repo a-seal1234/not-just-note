@@ -98,6 +98,9 @@ public:
      * the allocator hands out is the number in the name rather than an index.
      */
     static QString pageFileNameForNumber(int number);
+
+    /// The same, for a page's preview: 7 gives "thumbs/p0007.png".
+    static QString thumbFileNameForNumber(int number);
 };
 
 #endif // PDFSESSION_H
