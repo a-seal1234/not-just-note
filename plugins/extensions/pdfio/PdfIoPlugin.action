@@ -9,7 +9,10 @@
        <whatsThis></whatsThis>
        <toolTip></toolTip>
        <iconText></iconText>
-       <activationFlags>10000</activationFlags>
+       <!-- 0 is "always activate": this action creates the first document, so it must be live on
+            the first screen where there is no image or active device to satisfy any other flag.
+            The flags are parsed as base 2; 10000 used to mean ACTIVE_DEVICE and greyed it out. -->
+       <activationFlags>0</activationFlags>
        <activationConditions>0</activationConditions>
        <shortcut></shortcut>
        <isCheckable>false</isCheckable>
@@ -22,7 +25,8 @@
        <whatsThis></whatsThis>
        <toolTip></toolTip>
        <iconText></iconText>
-       <activationFlags>10000</activationFlags>
+       <!-- Same as the import above: opening a notebook file must work with nothing open. -->
+       <activationFlags>0</activationFlags>
        <activationConditions>0</activationConditions>
        <shortcut></shortcut>
        <isCheckable>false</isCheckable>
@@ -48,7 +52,9 @@
        <whatsThis></whatsThis>
        <toolTip></toolTip>
        <iconText></iconText>
-       <activationFlags>10000</activationFlags>
+       <!-- 0 is "always activate": a plugin setting, not a document operation, so it is settable
+            with nothing open just like the import above. -->
+       <activationFlags>0</activationFlags>
        <activationConditions>0</activationConditions>
        <shortcut></shortcut>
        <isCheckable>true</isCheckable>
@@ -61,7 +67,8 @@
        <whatsThis></whatsThis>
        <toolTip></toolTip>
        <iconText></iconText>
-       <activationFlags>10000</activationFlags>
+       <!-- Same as the strip switch: a setting, so always activate. -->
+       <activationFlags>0</activationFlags>
        <activationConditions>0</activationConditions>
        <shortcut></shortcut>
        <isCheckable>true</isCheckable>

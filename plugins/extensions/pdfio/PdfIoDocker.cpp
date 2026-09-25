@@ -4,6 +4,7 @@
  *  SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <QApplication>
 #include "PdfIoDocker.h"
 #include "PdfPageNavigator.h"
 #include "session/PdfSession.h"
@@ -24,6 +25,9 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QVBoxLayout>
+
+#include <KisMainWindow.h>
+#include <KisPart.h>
 
 #include <KoDockFactoryBase.h>
 #include <KoDockRegistry.h>
@@ -362,4 +366,46 @@ void registerPdfIoDocker()
     registered = true;
 
     KoDockRegistry::instance()->add(new PdfIoDockFactory());
+
+#if defined(Q_OS_ANDROID)
+    /// The tablet's notebook layout must not carry the "Touch Docker": it is a mobile drawing aid,
+    /// not part of a notebook, and the user asked for it gone.
+    ///
+    /// It cannot be said in the shipped workspace file. KisMainWindow's serializer only writes the
+    /// dock widgets it manages, so a docker the state never mentions is left by restoreState() at
+    /// its own default -- hidden here or there, never written. It is hidden here instead: at once,
+    /// a moment later when the saved layout has been restored, and again every ten seconds for ten
+    /// minutes so a workspace switched to shortly after start is covered too. A user who
+    /// deliberately re-opens it after that is not fought forever.
+    auto hideTouchDocker = []() {
+        KisMainWindow *window = KisPart::instance()->currentMainwindow();
+        if (!window) {
+            return;
+        }
+        const QList<QDockWidget *> dockers = window->findChildren<QDockWidget *>();
+        for (QDockWidget *docker : dockers) {
+            if (docker->objectName() == QLatin1String("TouchDocker") && docker->isVisible()) {
+                docker->hide();
+                qWarning() << "pdfio: hid the Touch Docker; the notebook layout does not use it";
+            }
+        }
+    };
+    QTimer::singleShot(3000, qApp, hideTouchDocker);
+    QTimer::singleShot(8000, qApp, hideTouchDocker);
+    QTimer::singleShot(20000, qApp, hideTouchDocker);
+    auto *touchWatch = new QTimer(qApp);
+    touchWatch->setInterval(10000);
+    auto *touchWatchTicks = new int(0);
+    QObject::connect(touchWatch, &QTimer::timeout, touchWatch,
+                     [hideTouchDocker, touchWatch, touchWatchTicks]() {
+                         hideTouchDocker();
+                         if (++(*touchWatchTicks) >= 60) {
+                             touchWatch->stop();
+                             touchWatch->deleteLater();
+                             delete touchWatchTicks;
+                         }
+                     });
+    touchWatch->start();
+
+#endif
 }

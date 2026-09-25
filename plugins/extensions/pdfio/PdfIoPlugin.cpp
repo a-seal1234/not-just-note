@@ -4,6 +4,7 @@
  *  SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <QCoreApplication>
 #include "AndroidDocumentPicker.h"
 #include "PdfIoDocker.h"
 #include "PdfIoPlugin.h"
@@ -534,37 +535,53 @@ void rebuildRecentNotebooks(QMenu *menu)
     }
 }
 
-/// The two entries that are about the notebook's own name rather than an action from the action
-/// manager: no .action file describes a rename, and the recent list is rebuilt every time it opens.
-void addNotebookNameActions(QMenu *menu)
+/// A separator that is removed before it is re-added, like the entries around it: registerActions()
+/// runs again for a second view and is retried while the first screen has no window, so an
+/// unconditional separator would leave one more behind on every call.
+void addMenuSeparator(QMenu *menu, const QString &objectName)
+{
+    if (!menu) {
+        return;
+    }
+    if (QAction *previous = menu->findChild<QAction *>(objectName)) {
+        menu->removeAction(previous);
+        previous->deleteLater();
+    }
+    QAction *separator = menu->addSeparator();
+    separator->setObjectName(objectName);
+}
+
+/// Puts "Rename notebook..." under \a menu, after the document entries it acts on.
+void addRenameNotebookAction(QMenu *menu)
 {
     if (!menu) {
         return;
     }
 
-    /// A stale group from an earlier view's plugin instance goes first: its connections died with
-    /// that instance, and two entries doing the same thing is how a menu starts looking broken.
     if (QAction *previous = menu->findChild<QAction *>(QStringLiteral("pdfio_rename_notebook"))) {
         menu->removeAction(previous);
         previous->deleteLater();
     }
+
+    addMenuSeparator(menu, QStringLiteral("pdfio_rename_separator"));
+    QAction *rename = menu->addAction(i18n("Rename notebook..."));
+    rename->setObjectName(QStringLiteral("pdfio_rename_notebook"));
+    QObject::connect(rename, &QAction::triggered, menu, []() { renameNotebook(); });
+}
+
+/// Puts the "Recent notebooks" submenu at the top of \a menu: the entry the user reaches for
+/// first, open document or not. Rebuilt every time it opens, so it is never stale; deduped like the
+/// entries around it.
+void addRecentNotebooksMenu(QMenu *menu)
+{
+    if (!menu) {
+        return;
+    }
+
     if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_recent_notebooks"))) {
         menu->removeAction(previous->menuAction());
         previous->deleteLater();
     }
-    /// The separator belongs to this group and is tracked by its object name like the other two:
-    /// registerActions() runs again for a second view and is retried while the first screen has no
-    /// window, so a separator added unconditionally would leave one more behind on every call.
-    if (QAction *previous = menu->findChild<QAction *>(QStringLiteral("pdfio_name_separator"))) {
-        menu->removeAction(previous);
-        previous->deleteLater();
-    }
-
-    QAction *separator = menu->addSeparator();
-    separator->setObjectName(QStringLiteral("pdfio_name_separator"));
-    QAction *rename = menu->addAction(i18n("Rename notebook..."));
-    rename->setObjectName(QStringLiteral("pdfio_rename_notebook"));
-    QObject::connect(rename, &QAction::triggered, menu, []() { renameNotebook(); });
 
     QMenu *recent = menu->addMenu(i18n("Recent notebooks"));
     recent->setObjectName(QStringLiteral("pdfio_recent_notebooks"));
@@ -673,6 +690,11 @@ void PdfIoPlugin::registerActions()
             alone->setObjectName(QStringLiteral("pdfio_menu"));
         }
 
+        /// Recent first, the same order as the full menu: it is the entry the user reaches for
+        /// first with nothing open.
+        addRecentNotebooksMenu(alone);
+        addMenuSeparator(alone, QStringLiteral("pdfio_open_separator"));
+
         /// A plain action: the KisAction that carries the icon and the shortcut is the action
         /// manager's to make, and there is none yet. The registration that does have a view
         /// manager takes it off the menu again, so the entry is never doubled.
@@ -692,8 +714,8 @@ void PdfIoPlugin::registerActions()
             connect(openBundle, &QAction::triggered, this, &PdfIoPlugin::slotOpenNotebookBundle);
         }
 
-        /// And the recent list: the one menu entry that is useful before any document exists.
-        addNotebookNameActions(alone);
+        /// Rename acts on an open notebook; it follows the entries that create one.
+        addRenameNotebookAction(alone);
         return;
     }
 
@@ -733,10 +755,10 @@ void PdfIoPlugin::registerActions()
         }
     }
 
-    for (const Entry &entry : entries) {
+    auto addEntry = [this, menu](const Entry &entry) {
         KisAction *action = viewManager()->actionManager()->createAction(QString::fromLatin1(entry.name));
         if (!action) {
-            continue;
+            return;
         }
         connect(action, &KisAction::triggered, this, entry.slot);
 
@@ -744,7 +766,30 @@ void PdfIoPlugin::registerActions()
         if (menu) {
             menu->addAction(action);
         }
+    };
+
+    const int entryCount = int(sizeof(entries) / sizeof(entries[0]));
+
+    /// Recent first: the entry the user reaches for first, open document or not.
+    addRecentNotebooksMenu(menu);
+    addMenuSeparator(menu, QStringLiteral("pdfio_open_separator"));
+
+    /// Import and Open next. They are what creates the first document, so they stay enabled with
+    /// nothing open (their activationFlags are NONE in the .action file) and they are not part of
+    /// the block below that only means something once a page is on screen.
+    for (int i = 0; i < 2 && i < entryCount; ++i) {
+        addEntry(entries[i]);
     }
+    addMenuSeparator(menu, QStringLiteral("pdfio_document_separator"));
+
+    /// The document's own entries: save, turn, export, and the two ways of writing the notebook out.
+    for (int i = 2; i < entryCount; ++i) {
+        addEntry(entries[i]);
+    }
+
+    /// Rename acts on the notebook that is open, so it follows the document block rather than
+    /// sitting above it.
+    addRenameNotebookAction(menu);
 
     /// The strip switch. The strip existed behind PDFIO_PROBE_STRIP only, which nobody can set on
     /// a tablet; a checkable action is both the way in and the indicator of which mode is in force.
@@ -755,7 +800,7 @@ void PdfIoPlugin::registerActions()
         m_stripAction = stripAction;
         connect(stripAction, &KisAction::toggled, this, &PdfIoPlugin::slotToggleStripMode);
         if (menu) {
-            menu->addSeparator();
+            addMenuSeparator(menu, QStringLiteral("pdfio_strip_separator"));
             menu->addAction(stripAction);
         }
     }
@@ -772,12 +817,11 @@ void PdfIoPlugin::registerActions()
             PdfPageNavigator::instance()->setScrollFollowEnabled(enabled);
         });
         if (menu) {
-            menu->addSeparator();
+            addMenuSeparator(menu, QStringLiteral("pdfio_follow_separator"));
             menu->addAction(followAction);
         }
     }
 
-    addNotebookNameActions(menu);
 }
 
 void PdfIoPlugin::updateStripAction()
