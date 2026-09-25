@@ -799,6 +799,19 @@ bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
     /// than the whole process.
     m_window.clear();
 
+    /// And the strip of the notebook being replaced goes with it -- its slots, cells and paper
+    /// layers, and the slot bookkeeping. Without this, showPage(0) below finds page 0 already
+    /// inside the OLD strip and only unlocks that slot: the tab changes to the new notebook while
+    /// the previous notebook's pages stay on the canvas, which is what switching with Recent
+    /// notebooks looked like. The plugin closes the old view first, but a path that forgets to
+    /// cannot be allowed to leave the old strip behind.
+    m_stripPages.clear();
+    m_stripRects.clear();
+    m_stripCells.clear();
+    m_stripPaper.clear();
+    m_stripActiveSlot = -1;
+    m_windowSlot = -1;
+
     /// And with no ink-change history: the clock the idle write waits on starts at the first
     /// stroke actually made in this notebook, not wherever the last one left it.
     ///

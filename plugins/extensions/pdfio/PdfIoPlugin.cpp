@@ -493,13 +493,14 @@ void openRecentNotebook(const QString &projectDir)
     }
 
     const QString source = PdfSession::sourcePath(projectDir, manifest.sourceFile);
-    QTimer::singleShot(0, PdfPageNavigator::instance(), [source, projectDir]() {
-        QString error;
-        if (!PdfPageNavigator::instance()->openNotebook(source, &error)) {
-            say(QStringLiteral("could not open the recent notebook %1: %2").arg(projectDir, error));
-            return;
-        }
-        notebookOpened();
+
+    /// Deferred out of the menu action, and close-first like every other open: opening the new
+    /// notebook while the old document and its strip are still alive leaves the OLD strip on
+    /// screen, because showPage() then finds the page it is asked for already inside the strip it
+    /// is holding and unlocks that slot instead of building the new one. That is the "the tab
+    /// changes but the strip does not" seen when switching notebooks with Recent notebooks.
+    QTimer::singleShot(0, PdfPageNavigator::instance(), [source]() {
+        openNotebookReplacing(source, QString(), 6);
     });
 }
 
