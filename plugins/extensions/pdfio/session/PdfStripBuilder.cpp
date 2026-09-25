@@ -12,6 +12,7 @@
 #include <QColor>
 #include <QDebug>
 #include <QDir>
+#include <QHash>
 
 #include <kis_group_layer.h>
 #include <kis_image.h>
@@ -151,25 +152,77 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
                                                  OPACITY_OPAQUE_U8, strip.image->colorSpace());
     KisPaintLayerSP ink = new KisPaintLayer(strip.image, QStringLiteral("Ink"), OPACITY_OPAQUE_U8);
 
-    /// Every page's saved ink goes back into that one layer, at its own place in the strip.
+    /// Every page's saved layers go back in, each into a layer of its own: the artifact's stroke
+    /// entry (the one named like this layer) into the strip-wide stroke layer that keeps being what
+    /// a stroke lands in, and every other name the artifacts carry into one strip-wide layer of
+    /// that name, made the first time the name is seen and put inside the same Ink group.
+    ///
+    /// Reading each page's MERGED image instead is what merged the inserted picture into Ink: the
+    /// merged image is the flatten of every layer the page holds, so pouring it into the one layer
+    /// the strip had turned a picture that was its own layer into strokes. Measured on the desktop:
+    /// after an insert and a notebook reopened, the Ink group came back with one child where there
+    /// had been two, and "Ink" carried the picture's pixels.
+    ///
+    /// The order the names are first seen in decides the stacking, and each page's part is written
+    /// at that page's own rectangle: an artifact's pixels are page-local, so the slot's top left is
+    /// where they belong. A page whose artifact cannot be read at all changes nothing here.
+    QList<QPair<QString, KisPaintLayerSP>> restored;
+    QHash<QString, int> restoredByName;
     for (const PdfStripLayout::Slot &slot : slots) {
         if (slot.page < 0) {
             continue;
         }
 
-        const QImage savedInk =
-            PdfInkLoader::loadInk(project.filePath(manifest.pages.at(slot.page).kraFile), nullptr);
-        if (!savedInk.isNull()) {
-            ink->paintDevice()->convertFromQImage(savedInk, nullptr, slot.rect.x(), slot.rect.y());
+        const QString kraPath = project.filePath(manifest.pages.at(slot.page).kraFile);
+        const QList<QPair<QString, QImage>> saved =
+            PdfInkLoader::loadInkLayersFromSidecar(kraPath, nullptr);
+
+        if (saved.isEmpty()) {
+            /// No sidecar: an artifact written before the layer PNGs existed, whose only readable
+            /// form is the merged image. Its layers cannot be told apart any more, so the pixels go
+            /// into the stroke layer -- which is what this always did.
+            const QImage flattened = PdfInkLoader::loadInk(kraPath, nullptr);
+            if (!flattened.isNull()) {
+                ink->paintDevice()->convertFromQImage(flattened, nullptr,
+                                                      slot.rect.x(), slot.rect.y());
+            }
+            continue;
+        }
+
+        for (const QPair<QString, QImage> &entry : saved) {
+            if (entry.second.isNull()) {
+                continue;
+            }
+
+            KisPaintLayerSP layer = ink;
+            if (entry.first != ink->name()) {
+                const int known = restoredByName.value(entry.first, -1);
+                if (known >= 0) {
+                    layer = restored.at(known).second;
+                } else {
+                    layer = new KisPaintLayer(strip.image, entry.first, OPACITY_OPAQUE_U8);
+                    restoredByName.insert(entry.first, int(restored.size()));
+                    restored.append(QPair<QString, KisPaintLayerSP>(entry.first, layer));
+                }
+            }
+
+            layer->paintDevice()->convertFromQImage(entry.second, nullptr,
+                                                    slot.rect.x(), slot.rect.y());
+            qWarning() << "[pdfio] strip: page" << (slot.page + 1) << "restored layer"
+                       << entry.first << entry.second.size() << "at" << slot.rect.topLeft();
         }
     }
 
-    /// The group goes into the image and the stroke layer inside it. The two lines that used to be
-    /// here made the group and then added the layer to the ROOT: the group never entered the graph,
-    /// and the strip was still a bare layer beside the notebook -- the shape the user saw in the
-    /// Layer panel, and the one commit 476ec00147 meant to replace but did not.
+    /// The group goes into the image and the stroke layer inside it, and the restored content
+    /// layers after it. The two lines that used to be here made the group and then added the layer
+    /// to the ROOT: the group never entered the graph, and the strip was still a bare layer beside
+    /// the notebook -- the shape the user saw in the Layer panel, and the one commit 476ec00147
+    /// meant to replace but did not.
     strip.image->addNode(inkGroup, strip.image->root());
     strip.image->addNode(ink, inkGroup);
+    for (const QPair<QString, KisPaintLayerSP> &extra : restored) {
+        strip.image->addNode(extra.second, inkGroup);
+    }
     strip.activeInkLayer = ink;
 
     if (!strip.activeInkLayer) {

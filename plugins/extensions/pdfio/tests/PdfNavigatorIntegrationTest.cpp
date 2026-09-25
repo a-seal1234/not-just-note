@@ -17,6 +17,7 @@
 #include <KisResourceLocator.h>
 #include <KisView.h>
 
+#include <kis_group_layer.h>
 #include <kis_image.h>
 #include <kis_paint_device.h>
 #include <kis_paint_layer.h>
@@ -73,6 +74,7 @@ private Q_SLOTS:
     void testALayerThatIsNotInkIsSavedToo();
     void testQuittingWritesTheInkToo();
     void testClosingTheTabWritesTheInkAndAsksNothing();
+    void testAnInsertedImageStaysItsOwnLayerAcrossAReopen();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -648,6 +650,190 @@ void PdfNavigatorIntegrationTest::testClosingTheTabWritesTheInkAndAsksNothing()
     const QStringList rootKra = project.entryList(QStringList() << QStringLiteral("*.kra"), QDir::Files);
     QVERIFY2(rootKra.isEmpty(), qPrintable(rootKra.join(QLatin1Char(','))));
     QCOMPARE(homeKraFiles(), homeKraBefore);
+}
+
+/**
+ * The inserted image stays its own layer inside the Ink group when the page is left and the
+ * notebook is opened again. This is the user's report, reproduced headlessly.
+ *
+ * The flow is the one they perform: a five-page strip (the shipped scope), a picture inserted into
+ * the open page's Ink group as a paint layer of its own, a turn to a page outside the window --
+ * which writes every page the window holds and redraws the strip from those artifacts -- and then
+ * the notebook opened again, which builds the strip from the artifacts a second time.
+ *
+ * The second build is where the merge happened. PdfStripBuilder::build() read each page with
+ * PdfInkLoader::loadInk(), which is the artifact's MERGED image: the flatten of every layer the
+ * page holds. Pouring that into the strip's single "Ink" layer turned the inserted picture into
+ * ink -- one layer in the panel where there had been two. Measured before the fix: "after the
+ * reopen: the Ink group holds 1 child(ren): Ink", and this test fails on the missing child. After
+ * it: two children, the picture's 3600 pixels in the layer that owns them, none in Ink.
+ */
+void PdfNavigatorIntegrationTest::testAnInsertedImageStaysItsOwnLayerAcrossAReopen()
+{
+    /// A source long enough that a five-page window has somewhere to roll to.
+    const QString usualFixture = m_fixture;
+    m_fixture = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(m_fixture), qPrintable(m_fixture));
+
+    QVERIFY(useNotebook(QStringLiteral("inserted-layer"), 5));
+    m_fixture = usualFixture;
+
+    QVERIFY(navigator()->pageCount() >= 8);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisImageSP image = document->image();
+    QVERIFY(image);
+
+    KisNodeSP group;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        KisNodeSP child = image->root()->at(i);
+        if (child->name() == QStringLiteral("Ink")
+            && qobject_cast<KisGroupLayer *>(child.data())) {
+            group = child;
+            break;
+        }
+    }
+    QVERIFY2(group, "the strip has no Ink group");
+
+    /// What placeInsertedImage() does: its own paint layer, its own pixels, the place on the page
+    /// carried by the layer offset, inside the Ink group.
+    const QRect picture(200, 300, 60, 60);
+    const KoColorSpace *colorSpace = image->colorSpace();
+    KisPaintLayerSP inserted = new KisPaintLayer(image, QStringLiteral("Inserted image"),
+                                                 OPACITY_OPAQUE_U8);
+    inserted->paintDevice()->fill(QRect(QPoint(0, 0), picture.size()),
+                                  KoColor(QColor(255, 0, 0), colorSpace));
+    inserted->setX(picture.x());
+    inserted->setY(picture.y());
+    QVERIFY2(image->addNode(inserted, group), "the picture could not be added to the Ink group");
+
+    const auto childNames = [](const KisNodeSP &parent) {
+        QStringList names;
+        for (quint32 i = 0; i < parent->childCount(); ++i) {
+            names.append(parent->at(i)->name());
+        }
+        return names;
+    };
+    qInfo("before the turn: the Ink group holds %d child(ren): %s", int(group->childCount()),
+          qPrintable(childNames(group).join(QStringLiteral(", "))));
+
+    document->setModified(true);
+    Q_EMIT image->sigImageModified();
+
+    /// A turn outside the window: the roll writes every page the window holds, page 1 included.
+    QString why;
+    QVERIFY2(navigator()->showPage(5, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 5);
+    QVERIFY2(QFileInfo::exists(artifactFor(0)), "the roll did not write page 1");
+
+    QFile list(artifactFor(0) + QStringLiteral(".layers.txt"));
+    QVERIFY2(list.open(QIODevice::ReadOnly | QIODevice::Text), qPrintable(list.fileName()));
+    const QString listing = QString::fromUtf8(list.readAll());
+    qInfo("page 1's sidecar after the roll:\n%s", qPrintable(listing));
+    QVERIFY2(listing.contains(QStringLiteral("Inserted image")),
+             "the artifact does not list the inserted layer as a layer of its own");
+
+    /// And the notebook opened again, which is the build a page switch reaches when the page is
+    /// rebuilt from what is on disk.
+    QVERIFY(useNotebook(QStringLiteral("inserted-layer"), 5));
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *reopened = navigator()->currentDocument();
+    QVERIFY(reopened);
+    KisImageSP strip = reopened->image();
+    QVERIFY(strip);
+
+    const PdfStripLayout layout = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
+    QVERIFY(layout.isValid());
+    const int slot = layout.slotForPage(0);
+    QVERIFY(slot >= 0);
+    const QRect slotRect = layout.slots().at(slot).rect;
+
+    KisNodeSP reopenedGroup;
+    for (quint32 i = 0; i < strip->root()->childCount(); ++i) {
+        KisNodeSP child = strip->root()->at(i);
+        if (qobject_cast<KisGroupLayer *>(child.data())) {
+            reopenedGroup = child;
+            break;
+        }
+    }
+    QVERIFY2(reopenedGroup, "the rebuilt strip has no Ink group");
+    const QStringList names = childNames(reopenedGroup);
+    qInfo("after the reopen: the Ink group holds %d child(ren): %s", int(names.size()),
+          qPrintable(names.join(QStringLiteral(", "))));
+
+    QVERIFY2(names.contains(QStringLiteral("Inserted image")),
+             "the inserted image came back inside the Ink layer instead of as its own child");
+    QVERIFY2(names.contains(QStringLiteral("Ink")), "the strip's stroke layer is gone");
+
+    const auto redPixelsIn = [](const QImage &pixels, const QRect &area) {
+        int count = 0;
+        const QRect clipped = area.intersected(pixels.rect());
+        for (int y = clipped.top(); y <= clipped.bottom(); ++y) {
+            for (int x = clipped.left(); x <= clipped.right(); ++x) {
+                const QRgb pixel = pixels.pixel(x, y);
+                if (qAlpha(pixel) > 200 && qRed(pixel) > 200 && qGreen(pixel) < 60
+                    && qBlue(pixel) < 60) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    };
+
+    /// The stroke layer, and the layer that owns the picture: the picture's pixels must be in the
+    /// second and nowhere in the first.
+    KisPaintLayer *strokes = nullptr;
+    KisPaintLayer *restored = nullptr;
+    for (quint32 i = 0; i < reopenedGroup->childCount(); ++i) {
+        KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(reopenedGroup->at(i).data());
+        if (!layer) {
+            continue;
+        }
+        if (layer->name() == QStringLiteral("Ink")) {
+            strokes = layer;
+        } else if (layer->name() == QStringLiteral("Inserted image")) {
+            restored = layer;
+        }
+    }
+    QVERIFY(strokes);
+    QVERIFY2(restored, "the inserted image is not a paint layer of the rebuilt group");
+
+    const int redInInk = redPixelsIn(strokes->paintDevice()->convertToQImage(0, strip->bounds()),
+                                     slotRect);
+    const QImage restoredPixels = restored->paintDevice()->convertToQImage(0, strip->bounds());
+    const int redInPicture = redPixelsIn(restoredPixels, slotRect);
+
+    qInfo("after the reopen: red pixels inside page 1's slot -- in the Ink stroke layer %d, in "
+          "the inserted image's own layer %d (expected about %d)",
+          redInInk, redInPicture, picture.width() * picture.height());
+
+    QCOMPARE(redInInk, 0);
+    QVERIFY2(redInPicture > picture.width() * picture.height() / 2,
+             "the inserted picture's pixels did not come back into its own layer");
+
+    /// Where it came to rest: the picture's own place inside page 1's slot, not the slot's corner.
+    QVERIFY2(restoredPixels.valid(slotRect.topLeft() + picture.center()), "outside the slot");
+    const QColor atPlace = restoredPixels.pixelColor(slotRect.topLeft() + picture.center());
+    qInfo("the inserted picture in its own layer: rgba(%d,%d,%d,%d) at %d,%d",
+          atPlace.red(), atPlace.green(), atPlace.blue(), atPlace.alpha(),
+          slotRect.x() + picture.center().x(), slotRect.y() + picture.center().y());
+    QVERIFY2(atPlace.red() > 200 && atPlace.green() < 60 && atPlace.blue() < 60,
+             "the inserted picture is not at its own place inside the page's slot");
+
+    /// And the tab is closed, the way the roll test closes its own: a view nobody closed takes the
+    /// main window down with it in the teardown. The document is marked clean first -- its ink is on
+    /// disk and nothing was drawn since -- so closing asks nothing.
+    reopened->setModified(false);
+    navigator()->setScope(1);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
 }
 
 /**

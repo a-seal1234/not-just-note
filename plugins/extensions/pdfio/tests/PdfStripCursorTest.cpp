@@ -98,6 +98,7 @@ private Q_SLOTS:
     void testStaleActivationRefusesRatherThanMisdirects();
     void testAPageFolderWithSeveralLayersComesBackFlattened();
     void testAnInsertedImageLayerReachesThePageArtifact();
+    void testTheSidecarKeepsEachLayersOwnPixels();
     void testRestoringTheLayerStackCostsAFullKraLoad();
 
 private:
@@ -1049,6 +1050,109 @@ void PdfStripCursorTest::testAnInsertedImageLayerReachesThePageArtifact()
           "image's corner: %d",
           flat.width(), flat.height(), qint64(QFileInfo(path).size()), redPixels);
     QVERIFY2(redPixels > 100, "the inserted image's pixels are not in the flatten after the save");
+}
+
+/**
+ * The sidecar, per layer: two layers with different pixels come back as two layers with their own
+ * pixels, in their own places.
+ *
+ * This is the cheap proof of both halves of the artifact's layer path -- PdfPageSaver writes one
+ * PNG per layer, PdfInkLoader::loadInkLayersFromSidecar reads them back by name -- and it is also
+ * the measurement that shows what the writer used to do: a layer carrying a position of its own
+ * (an inserted picture is placed by its layer offset) had that offset thrown away by the copy, so
+ * its PNG came back at the page's top left, and the layers beside it were read out of pixels that
+ * were not theirs.
+ *
+ * The page is the one PdfStripCursorTest already builds for this question: a white paper, an Ink
+ * group, three coloured bands as the page's layers. The inserted picture goes in beside them, the
+ * way placeInsertedImage() puts one there.
+ */
+void PdfStripCursorTest::testTheSidecarKeepsEachLayersOwnPixels()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    KisDocument *document = KisPart::instance()->createDocument();
+    PageFolders folders = buildBandedPage(document, 300, 300);
+    QVERIFY(folders.image);
+    QCOMPARE(folders.groups.size(), 1);
+
+    const KoColorSpace *colorSpace = folders.image->colorSpace();
+
+    /// Pixels at the device's origin, the place on the page carried by the layer offset -- exactly
+    /// the shape placeInsertedImage() leaves behind.
+    const QRect pictureOnPage(100, 120, 40, 40);
+    KisPaintLayerSP picture = new KisPaintLayer(folders.image, QStringLiteral("Inserted image"),
+                                                OPACITY_OPAQUE_U8);
+    picture->paintDevice()->fill(QRect(QPoint(0, 0), pictureOnPage.size()),
+                                 KoColor(QColor(255, 0, 0), colorSpace));
+    picture->setX(pictureOnPage.x());
+    picture->setY(pictureOnPage.y());
+    QVERIFY(folders.image->addNode(picture, folders.groups.at(0)));
+
+    KisDocument *pageDocument = PdfPageSaver::createPageLayersDocument(folders.image, nullptr);
+    QVERIFY(pageDocument);
+    pageDocument->image()->refreshGraphAsync(pageDocument->image()->root(),
+                                             { pageDocument->image()->bounds() },
+                                             pageDocument->image()->bounds());
+    pageDocument->image()->waitForDone();
+
+    const QString path = dir.filePath(QStringLiteral("page.kra"));
+    bool finished = false;
+    QObject::connect(pageDocument, &KisDocument::sigSavingFinished, this,
+                     [&finished](const QString &) { finished = true; });
+    QString why;
+    QVERIFY2(PdfPageSaver::saveDocument(pageDocument, path, &why), qPrintable(why));
+    QVERIFY2(waitForFlag(finished, 30000), "the save never reported back");
+    KisPart::instance()->removeDocument(pageDocument, true);
+
+    QFile index(path + QStringLiteral(".layers.txt"));
+    QVERIFY2(index.open(QIODevice::ReadOnly | QIODevice::Text), qPrintable(index.fileName()));
+    const QString listing = QString::fromUtf8(index.readAll());
+    qInfo("the sidecar the writer left:\n%s", qPrintable(listing));
+
+    const QList<QPair<QString, QImage>> layers = PdfInkLoader::loadInkLayersFromSidecar(path, &why);
+    QCOMPARE(layers.size(), 4);
+    QCOMPARE(layers.at(0).first, QStringLiteral("Ink band 1"));
+    QCOMPARE(layers.at(1).first, QStringLiteral("Ink band 2"));
+    QCOMPARE(layers.at(2).first, QStringLiteral("Ink band 3"));
+    QCOMPARE(layers.at(3).first, QStringLiteral("Inserted image"));
+
+    for (const QPair<QString, QImage> &entry : layers) {
+        QCOMPARE(entry.second.size(), QSize(300, 300));
+    }
+
+    const QImage band2 = layers.at(1).second;
+    const QImage inserted = layers.at(3).second;
+
+    const auto opaqueAt = [](const QImage &pixels, const QPoint &at) {
+        return pixels.valid(at) && qAlpha(pixels.pixel(at)) > 0;
+    };
+    const auto redAt = [](const QImage &pixels, const QPoint &at) {
+        if (!pixels.valid(at)) {
+            return false;
+        }
+        const QRgb pixel = pixels.pixel(at);
+        return qAlpha(pixel) > 200 && qRed(pixel) > 200 && qGreen(pixel) < 60 && qBlue(pixel) < 60;
+    };
+
+    qInfo("the inserted layer's PNG: red at its own place %d, its own pixels left untouched %d; "
+          "the band beside it red where the picture is %d",
+          int(redAt(inserted, QPoint(120, 140))), int(!opaqueAt(inserted, QPoint(30, 30))),
+          int(redAt(band2, QPoint(120, 140))));
+
+    QVERIFY2(redAt(inserted, QPoint(120, 140)),
+             "the inserted image's own PNG does not carry it where its layer offset puts it");
+    QVERIFY2(!opaqueAt(inserted, QPoint(30, 30)),
+             "the inserted image's PNG carries pixels from a layer it does not own");
+    QVERIFY2(!redAt(band2, QPoint(120, 140)),
+             "a band's PNG carries the inserted image's pixels");
+
+    /// The recorded position is the page-local one, not the artifact origin: the picture sits at
+    /// 100,120 of the page, and the artifact's origin is the page's.
+    QVERIFY2(listing.contains(QStringLiteral("Inserted image\t3.png\t255\t100\t120")),
+             qPrintable(QStringLiteral("the sidecar does not record the layer's own place:\n%1")
+                            .arg(listing)));
 }
 
 /**

@@ -97,8 +97,8 @@ void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRe
             ++rasterisedCount;
             KisPaintLayerSP copy = new KisPaintLayer(target, child->name(), child->opacity());
             copy->paintDevice()->makeCloneFrom(projection, area);
-            copy->setX(-area.x());
-            copy->setY(-area.y());
+            copy->setX(copy->x() - area.x());
+            copy->setY(copy->y() - area.y());
             target->addNode(copy, parent);
             continue;
         }
@@ -115,8 +115,16 @@ void copyPageLayers(KisImageSP target, const QList<KisNodeSP> &layers, const QRe
         /// was taken from, and without this the page's pixels sit where the page sits inside the
         /// strip -- outside a page-sized artifact. Measured by the roll test: "the mark did not
         /// reach the artifact of the page that stayed".
-        copy->setX(-area.x());
-        copy->setY(-area.y());
+        ///
+        /// Translated BY the crop, not overwritten with its origin. makeCloneFrom() copied the
+        /// layer's own offset into the copy, and a layer can have one: an inserted picture is placed
+        /// by its layer offset, and overwriting that offset with -area.topLeft() threw it away.
+        /// Measured on a 300x300 page with the crop at the origin: "srcX 100 srcY 120 ... -> copyX 0
+        /// copyY 0", and the picture's PNG came back at the page's top left instead of where the
+        /// picture is. Subtracting keeps both: the crop moves the page to the artifact's origin and
+        /// the layer's own place survives it.
+        copy->setX(copy->x() - area.x());
+        copy->setY(copy->y() - area.y());
 
         target->addNode(copy, parent);
     }
