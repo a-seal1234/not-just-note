@@ -8,8 +8,8 @@
 #include "PdfPageNavigator.h"
 
 #include <QDir>
+#include <QEvent>
 #include <QFileInfo>
-#include <QFontMetrics>
 #include <QSignalBlocker>
 #include <QTimer>
 #include <QHBoxLayout>
@@ -72,6 +72,9 @@ PdfIoDocker::PdfIoDocker()
     m_pages->setWordWrap(true);
     m_pages->setUniformItemSizes(true);
     m_pages->setSpacing(4);
+    /// The cards follow the list's own viewport, so the refit is driven from it rather than only
+    /// from the docker: see eventFilter().
+    m_pages->viewport()->installEventFilter(this);
     layout->addWidget(m_pages);
 
     auto *buttons = new QHBoxLayout();
@@ -112,34 +115,27 @@ void PdfIoDocker::refitCards()
         return;
     }
 
-    /// The room the viewport really has. The list keeps its own frame and every card is separated
-    /// from its neighbours by the item spacing, so the usable width is the panel minus both.
-    const int spacing = qMax(0, m_pages->spacing());
-    const int available = m_pages->viewport()->width() - 2 * spacing;
-    if (available <= 0) {
-        return;
-    }
-
-    /// Cards are portrait-ish, because a page is taller than it is wide: a square card leaves two
-    /// bands beside the sheet. The height is bounded so a very wide panel does not grow cards
-    /// without end and a very short one does not leave the label under a sliver.
-    static constexpr int MinCardWidth = 72;
+    /// One card per row is the shape a page selector wants: a page is recognised as a page, as
+    /// large as the panel allows. Two only when the panel is genuinely wide enough for two
+    /// comfortable cards, and never more than two -- a narrower panel must not turn the page into
+    /// a small strip beside another one. That is what the first attempt at this got wrong.
+    static constexpr int MinComfortableCardWidth = 190;
+    static constexpr int CardMargin = 24;
     static constexpr int MaxCardWidth = 320;
     static constexpr int MinCardHeight = 96;
     static constexpr int MaxCardHeight = 320;
-    static constexpr qreal CardAspect = 1.3; // height / width of the sheet
+    static constexpr qreal CardAspect = 1.414; // a portrait page: height / width
+    static constexpr int CardSpacing = 12;
 
-    /// As many columns as fit at the smallest readable card; the width that is left is shared out
-    /// evenly, so the cards fill the panel instead of leaving a ragged right edge.
-    const int columns = qMax(1, (available + spacing) / (MinCardWidth + spacing));
-    const int cardWidth = qBound(MinCardWidth, available / columns - spacing, MaxCardWidth);
+    const int viewportWidth = m_pages->viewport()->width();
+    const int columns = viewportWidth >= 2 * MinComfortableCardWidth + CardMargin ? 2 : 1;
+    const int cardWidth = qMin(MaxCardWidth, qMax(1, (viewportWidth - CardMargin) / columns));
 
-    /// The label under the icon wraps onto a second line for the two-digit pages, so it is given
-    /// the room for two lines before the icon gets the rest of the card.
-    const int labelHeight = m_pages->fontMetrics().height() * 2 + 8;
-    const int iconHeight = qBound(MinCardHeight, qRound(cardWidth * CardAspect), MaxCardHeight);
-    const QSize iconSize(cardWidth, iconHeight);
-    const QSize gridSize(cardWidth + spacing, iconHeight + labelHeight);
+    /// The card is the page's own shape. The height is bounded so a very wide panel does not
+    /// produce a card taller than any page.
+    const int cardHeight = qBound(MinCardHeight, qRound(cardWidth * CardAspect), MaxCardHeight);
+    const QSize iconSize(cardWidth, cardHeight);
+    const QSize gridSize(cardWidth + CardSpacing, cardHeight + CardSpacing);
 
     if (m_pages->iconSize() == iconSize && m_pages->gridSize() == gridSize) {
         return;
@@ -163,6 +159,14 @@ void PdfIoDocker::resizeEvent(QResizeEvent *event)
 {
     QDockWidget::resizeEvent(event);
     refitCards();
+}
+
+bool PdfIoDocker::eventFilter(QObject *watched, QEvent *event)
+{
+    if (m_pages && m_pages->viewport() == watched && event->type() == QEvent::Resize) {
+        refitCards();
+    }
+    return QDockWidget::eventFilter(watched, event);
 }
 
 void PdfIoDocker::refresh(int index, int pageCount, const QString &label)

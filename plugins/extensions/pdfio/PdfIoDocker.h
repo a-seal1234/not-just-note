@@ -9,6 +9,7 @@
 
 #include <QDockWidget>
 
+class QEvent;
 class QLabel;
 class QListWidget;
 class QPushButton;
@@ -42,6 +43,12 @@ protected:
     /// The cards are sized from the room the panel has. A fixed grid looks right while the docker
     /// is tall and clips into itself as soon as it is not, which is what the preview did.
     void resizeEvent(QResizeEvent *event) override;
+
+    /// The list's viewport is what actually holds the room the cards are fitted to. The docker's
+    /// own resize arrives before the list has been given its new width -- and no second docker
+    /// resize follows the layout that gives it -- so the refit is driven from the child that
+    /// changed. Without this the cards keep the width they were given at construction.
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     /// Recomputes the card size for the room the list has now.
