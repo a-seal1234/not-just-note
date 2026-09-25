@@ -164,7 +164,12 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
         }
     }
 
-    strip.image->addNode(ink, strip.image->root());
+    /// The group goes into the image and the stroke layer inside it. The two lines that used to be
+    /// here made the group and then added the layer to the ROOT: the group never entered the graph,
+    /// and the strip was still a bare layer beside the notebook -- the shape the user saw in the
+    /// Layer panel, and the one commit 476ec00147 meant to replace but did not.
+    strip.image->addNode(inkGroup, strip.image->root());
+    strip.image->addNode(ink, inkGroup);
     strip.activeInkLayer = ink;
 
     if (!strip.activeInkLayer) {

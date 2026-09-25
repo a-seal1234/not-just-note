@@ -128,9 +128,9 @@ KisPaintLayer *inkLayer(const KisImageSP &image)
 /// The STRIP's ink layer, found the way the plugin itself finds it: by name.
 ///
 /// PdfProjectBuilder::inkStrokeLayer() answers for a page document -- a root whose second layer
-/// is the Ink group -- and a strip image is built differently: a Desk, one paper layer per slot,
-/// then a single layer called "Ink" above all of them. Asking the page-shaped helper about a
-/// strip image hands back nothing, which is what this test hit on its first run.
+/// is the Ink group -- and a strip image is a Desk, one paper layer per slot, and an Ink group
+/// above all of them with the stroke layer inside it. Asking the page-shaped helper about a strip
+/// image hands back nothing, which is what this test hit on its first run.
 KisPaintLayer *stripInkLayer(const KisImageSP &image)
 {
     if (!image) {
@@ -138,8 +138,17 @@ KisPaintLayer *stripInkLayer(const KisImageSP &image)
     }
     for (quint32 i = 0; i < image->root()->childCount(); ++i) {
         KisNodeSP child = image->root()->at(i);
-        if (child->name() == QStringLiteral("Ink")) {
-            return qobject_cast<KisPaintLayer *>(child.data());
+        if (child->name() != QStringLiteral("Ink")) {
+            continue;
+        }
+        /// The group holds the stroke now; a bare paint layer of that name is the older shape.
+        if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
+            return layer;
+        }
+        for (quint32 c = 0; c < child->childCount(); ++c) {
+            if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child->at(c).data())) {
+                return layer;
+            }
         }
     }
     return nullptr;

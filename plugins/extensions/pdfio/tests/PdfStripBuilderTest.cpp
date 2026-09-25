@@ -91,7 +91,8 @@ void PdfStripBuilderTest::testEverySlotHasAPageAndAnInkGroup()
                                                                backend, QString(), &why);
     QVERIFY2(strip.image, qPrintable(why));
 
-    /// The desk, one layer of paper per page, and one ink layer over all of them.
+    /// The desk, one layer of paper per page, and one ink group over all of them with the stroke
+    /// layer inside it.
     QCOMPARE(strip.image->root()->childCount(), 5u);
     QCOMPARE(strip.image->root()->at(0)->name(), QStringLiteral("Desk"));
 
@@ -104,10 +105,34 @@ void PdfStripBuilderTest::testEverySlotHasAPageAndAnInkGroup()
         QVERIFY(background->userLocked());
     }
 
-    KisNodeSP ink = childNamed(strip.image, QStringLiteral("Ink"));
-    QVERIFY(ink);
+    KisNodeSP inkGroup = childNamed(strip.image, QStringLiteral("Ink"));
+    QVERIFY(inkGroup);
+    QVERIFY2(qobject_cast<KisGroupLayer *>(inkGroup.data()),
+             "the strip's Ink has to be a group, the same shape a single page has");
+    QCOMPARE(inkGroup->childCount(), 1u);
+
+    KisNodeSP ink = inkGroup->at(0);
+    QCOMPARE(ink->name(), QStringLiteral("Ink"));
     QVERIFY(qobject_cast<KisPaintLayer *>(ink.data()));
     QCOMPARE(KisNodeSP(ink), strip.activeInkLayer);
+
+    /// The tree itself, said out loud: the group is the root child, and the stroke is inside it
+    /// rather than a bare layer beside the papers.
+    QStringList tree;
+    for (quint32 i = 0; i < strip.image->root()->childCount(); ++i) {
+        KisNodeSP child = strip.image->root()->at(i);
+        if (child->name() == QStringLiteral("Ink")) {
+            tree.append(QStringLiteral("%1 [%2] -> %3")
+                            .arg(child->name())
+                            .arg(qobject_cast<KisGroupLayer *>(child.data()) ? QStringLiteral("group")
+                                                                            : QStringLiteral("layer"))
+                            .arg(child->childCount() > 0 ? child->at(0)->name()
+                                                         : QStringLiteral("(empty)")));
+        } else {
+            tree.append(child->name());
+        }
+    }
+    qInfo("strip root: %s", qPrintable(tree.join(QStringLiteral(", "))));
 }
 
 void PdfStripBuilderTest::testOnlyTheInkLayerIsPaintable()
@@ -131,9 +156,12 @@ void PdfStripBuilderTest::testOnlyTheInkLayerIsPaintable()
         QVERIFY(background->userLocked());
     }
 
-    KisNodeSP ink = childNamed(strip.image, QStringLiteral("Ink"));
-    QVERIFY(ink);
-    QVERIFY2(!ink->userLocked(), "the ink layer must be paintable");
+    KisNodeSP inkGroup = childNamed(strip.image, QStringLiteral("Ink"));
+    QVERIFY(inkGroup);
+    QVERIFY(qobject_cast<KisGroupLayer *>(inkGroup.data()));
+    QVERIFY2(!inkGroup->userLocked(), "the Ink group must not be locked");
+    QVERIFY(inkGroup->childCount() > 0);
+    QVERIFY2(!inkGroup->at(0)->userLocked(), "the ink stroke layer must be paintable");
 }
 
 void PdfStripBuilderTest::testPagesAreWhereTheLayoutSays()

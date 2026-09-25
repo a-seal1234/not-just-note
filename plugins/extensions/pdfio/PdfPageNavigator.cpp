@@ -118,10 +118,9 @@ void say(const QString &message)
 
 /// The root node the notebook calls "Ink": the group its content belongs in.
 ///
-/// A single page always has a KisGroupLayer there. The strip has its one managed paint layer of
-/// that name, because the group PdfStripBuilder.cpp makes is never added to the image (the ink
-/// layer goes to the root instead), so the rule below makes the group at the moment there is a
-/// layer to move into it rather than inventing one for a notebook that has nothing outside it.
+/// Both modes build one -- PdfProjectBuilder for a single page, PdfStripBuilder for the strip --
+/// so this is the group itself. A node of that name which is not a group is reported as "no group"
+/// by the caller rather than used as one.
 KisNodeSP inkNodeOf(const KisImageSP &image)
 {
     if (!image || !image->root()) {
@@ -142,10 +141,11 @@ KisNodeSP inkNodeOf(const KisImageSP &image)
  * "PDF page N" layers) stays where it is, and every other root layer -- one the user made, or one
  * the roll restored from an artifact under a name the strip did not have -- goes inside the group.
  *
- * The Ink node has to be a group to hold them, and the strip's is a paint layer, so the group is
- * made here and the managed layer moves into it together with the strays -- which is the shape
- * both modes are meant to have. a image by value: KisSharedPtr hands back a const KisImage
- * through a const smart pointer, and addNode()/moveNode() are not const methods.
+ * The group is the builders' to make, and both make it -- PdfProjectBuilder for a single page,
+ * PdfStripBuilder for the strip -- so this does not invent one: a notebook with no Ink group has
+ * nowhere to put content, and saying so is better than growing a second shape to keep in step.
+ * \a image by value: KisSharedPtr hands back a const KisImage through a const smart pointer, and
+ * addNode() and moveNode() are not const methods.
  *
  * How many content layers are still outside the group is reported, which is the measurable form of
  * the rule: zero once it has run.
@@ -157,6 +157,7 @@ int adoptContentIntoInk(KisImageSP image)
     }
 
     KisNodeSP ink = inkNodeOf(image);
+    const bool hasGroup = qobject_cast<KisGroupLayer *>(ink.data()) != nullptr;
 
     QList<KisNodeSP> strays;
     for (quint32 i = 0; i < image->root()->childCount(); ++i) {
@@ -167,24 +168,7 @@ int adoptContentIntoInk(KisImageSP image)
         strays.append(child);
     }
 
-    if (!strays.isEmpty()) {
-        if (!qobject_cast<KisGroupLayer *>(ink.data())) {
-            KisGroupLayerSP group = new KisGroupLayer(image, QStringLiteral("Ink"),
-                                                      OPACITY_OPAQUE_U8, image->colorSpace());
-            /// Above the managed layer, so the group lands where the content already was.
-            if (ink) {
-                image->addNode(group, image->root(), ink);
-            } else {
-                image->addNode(group, image->root());
-            }
-
-            /// The managed layer goes in first, so the strays keep the order they had above it.
-            if (ink && image->moveNode(ink, group, KisNodeSP())) {
-                say(QStringLiteral("moved layer \"%1\" into Ink").arg(ink->name()));
-            }
-            ink = group;
-        }
-
+    if (!strays.isEmpty() && hasGroup) {
         KisNodeSP above = ink->childCount() > 0 ? ink->lastChild() : KisNodeSP();
         for (KisNodeSP child : strays) {
             if (image->moveNode(child, ink, above)) {
@@ -192,6 +176,8 @@ int adoptContentIntoInk(KisImageSP image)
                 above = child;
             }
         }
+    } else if (!strays.isEmpty()) {
+        say(QStringLiteral("no Ink group to move %1 content layer(s) into").arg(strays.size()));
     }
 
     int outside = 0;
