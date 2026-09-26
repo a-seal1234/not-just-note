@@ -31,6 +31,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
 #include <QStandardPaths>
@@ -981,6 +982,31 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
     }
 
     PdfNotebookOpsDialog dialog(navigator->projectDir(), manifest, navigator->currentIndex());
+
+    /// A screenshot run can ask for one edit to be made before the capture -- "duplicate",
+    /// "delete_page", "turn_right" -- so what a pending change looks like (the legend, a struck
+    /// through row, an Apply that is on) is what ends up in the picture. Run-time switch, like the
+    /// probes around it; unset, this does nothing at all.
+    const QString probeEdit = qEnvironmentVariable("PDFIO_PROBE_OPS_SCREEN_EDIT");
+    if (!probeEdit.isEmpty()) {
+        QTimer::singleShot(2500, qApp, [probeEdit]() {
+            QWidget *screen = QApplication::activeModalWidget();
+            if (!screen) {
+                qWarning("[pdfio] PDFIO_PROBE_OPS_SCREEN_EDIT: no screen is up to edit");
+                return;
+            }
+            const QString name = QStringLiteral("pdfio_ops_") + probeEdit;
+            QPushButton *button = screen->findChild<QPushButton *>(name);
+            if (!button) {
+                qWarning("[pdfio] PDFIO_PROBE_OPS_SCREEN_EDIT: no button called %s",
+                         qPrintable(name));
+                return;
+            }
+            button->click();
+            qWarning("[pdfio] PDFIO_PROBE_OPS_SCREEN_EDIT: clicked %s", qPrintable(name));
+        });
+    }
+
     if (dialog.exec() != QDialog::Accepted) {
         /// Cancel is the whole promise: nothing was written, so there is nothing to undo.
         return;
