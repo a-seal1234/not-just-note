@@ -21,9 +21,11 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QListWidget>
 #include <QSpinBox>
 #include <QVBoxLayout>
 #include <QFileInfo>
@@ -907,6 +909,254 @@ void mergeNotebookFrom(const QString &sourceDir)
                            });
 }
 
+/**
+ * What the merge chooser answered.
+ */
+struct MergeTarget {
+    enum Kind {
+        None,      ///< the chooser was dismissed
+        Notebook,  ///< a recent notebook, by its own directory
+        File,      ///< a notebook file, to be unpacked
+        Folder,    ///< ask for a folder on this device
+    };
+    Kind kind = None;
+    /// The recent notebook's directory, for Kind::Notebook. Empty otherwise.
+    QString dir;
+};
+
+/**
+ * The one merge chooser, for the menu entry and for the Notebook ops screen's merge button.
+ *
+ * The recent notebooks come first, under their own names. That is what the user asked for ("when
+ * merging a note, why not look in the recent notes?") and on a tablet it is the only way a notebook
+ * can arrive whole: there is no filesystem to browse. "From a file..." sits beside them for a .pnb,
+ * and a folder picker is offered only where folders mean something -- never on Android, where the
+ * entry would open a dialog with nothing to show.
+ *
+ * A list with nothing in it says so on a disabled line of its own rather than standing empty: the
+ * file entry below it still works, and the reason the list is bare is visible rather than implied.
+ */
+MergeTarget chooseMergeTarget()
+{
+    MergeTarget target;
+
+    QDialog chooser(nullptr);
+    chooser.setWindowTitle(i18n("Merge a notebook in"));
+    auto *layout = new QVBoxLayout(&chooser);
+
+    auto *intro = new QLabel(
+        i18n("Merge the pages of another notebook into this one, after the page you are on."),
+        &chooser);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *list = new QListWidget(&chooser);
+    list->setObjectName(QStringLiteral("pdfio_merge_chooser_list"));
+    list->setMinimumWidth(420);
+
+    /// A notebook whose directory has gone is dropped rather than offered as a dead click, the same
+    /// rule the Recent notebooks menu follows.
+    const QStringList entries = recentNotebookEntries();
+    QStringList alive;
+    for (const QString &entry : entries) {
+        const QString dir = recentNotebookDir(entry);
+        if (dir.isEmpty() || !QFileInfo::exists(PdfSession::manifestPath(dir))) {
+            continue;
+        }
+        alive.append(entry);
+    }
+    if (alive != entries) {
+        writeRecentNotebooks(alive);
+    }
+
+    QListWidgetItem *defaultChoice = nullptr;
+    if (alive.isEmpty()) {
+        auto *empty = new QListWidgetItem(i18n("(no recent notebooks yet)"), list);
+        empty->setFlags(Qt::NoItemFlags);
+    } else {
+        for (const QString &entry : alive) {
+            const QString dir = recentNotebookDir(entry);
+            const QString name = entry.section(RecentSeparator, 1);
+            auto *item = new QListWidgetItem(name.isEmpty() ? dir : name, list);
+            item->setData(Qt::UserRole, int(MergeTarget::Notebook));
+            item->setData(Qt::UserRole + 1, dir);
+            item->setToolTip(dir);
+            if (!defaultChoice) {
+                defaultChoice = item;
+            }
+        }
+    }
+
+    auto *file = new QListWidgetItem(i18n("From a file..."), list);
+    file->setData(Qt::UserRole, int(MergeTarget::File));
+    if (!defaultChoice) {
+        defaultChoice = file;
+    }
+
+#if !defined(Q_OS_ANDROID)
+    auto *folder = new QListWidgetItem(i18n("From a folder on this device..."), list);
+    folder->setData(Qt::UserRole, int(MergeTarget::Folder));
+#endif
+
+    layout->addWidget(list, 1);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &chooser);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &chooser, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &chooser, &QDialog::reject);
+    layout->addWidget(buttons);
+    /// A double click is a choice, the way it is in every file dialog.
+    QObject::connect(list, &QListWidget::itemDoubleClicked, &chooser, &QDialog::accept);
+    list->setCurrentItem(defaultChoice);
+
+    if (chooser.exec() != QDialog::Accepted) {
+        return target;
+    }
+
+    QListWidgetItem *chosen = list->currentItem();
+    if (!chosen || chosen->flags() == Qt::NoItemFlags) {
+        return target;
+    }
+
+    target.kind = MergeTarget::Kind(chosen->data(Qt::UserRole).toInt());
+    target.dir = chosen->data(Qt::UserRole + 1).toString();
+    return target;
+}
+
+#if defined(Q_OS_ANDROID)
+/**
+ * Waits for the Android picker and hands back the local copy it made, or an empty string.
+ *
+ * The picker answers through an activity-result callback, and the screens that ask for a file ask
+ * the way a desktop file dialog answers: synchronously. The wait is a local event loop, which is
+ * exactly what a modal QFileDialog is on the desktop. What the ACTIVITY CALLBACK itself does stays
+ * the one thing it may do: it copies, stores what it was handed, and posts the wake-up. Opening the
+ * file, reading its pages and running the operation all happen after the callback has returned --
+ * the rule the crash in that callback taught us.
+ */
+QString pickedFileOnAndroid(const QString &mimeType, const QString &cacheFileName)
+{
+    QEventLoop loop;
+    QString picked;
+    QString why;
+
+    auto *picker = new AndroidDocumentPicker();
+    picker->pickFile(mimeType, cacheFileName,
+                     [&loop, &picked, &why](const QString &localPath, const QString &reason) {
+                         picked = localPath;
+                         why = reason;
+                         /// Woken from the event loop rather than from here, so that what follows
+                         /// the wait cannot run on the activity's own stack.
+                         QTimer::singleShot(0, &loop, [&loop]() { loop.quit(); });
+                     });
+    loop.exec();
+    picker->deleteLater();
+
+    if (picked.isEmpty()) {
+        say(QStringLiteral("the picker brought nothing back%1")
+                .arg(why.isEmpty() ? QString() : QStringLiteral(": ") + why));
+    }
+    return picked;
+}
+#endif
+
+/// The path of a PDF the user chose: the file dialog where there is one, the Android picker where
+/// there is not. The same terms slotInsertPages() uses -- a PDF is filtered, and what the picker
+/// copied is a real file the renderer can open.
+QString pickPdfFilePath()
+{
+#if defined(Q_OS_ANDROID)
+    return pickedFileOnAndroid(QStringLiteral("application/pdf"),
+                               QStringLiteral("pdfio-picked-pages.pdf"));
+#else
+    return QFileDialog::getOpenFileName(
+        nullptr, i18n("Insert pages from a PDF"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        i18n("PDF documents (*.pdf)"));
+#endif
+}
+
+/// The path of a notebook FILE the user chose.
+///
+/// A .pnb has no mime type worth filtering on, so the Android picker is asked for anything at all
+/// and what comes back is inspected: a file that is not a notebook is refused with a clear reason
+/// rather than half-read.
+QString pickNotebookFilePath()
+{
+#if defined(Q_OS_ANDROID)
+    return pickedFileOnAndroid(
+        QStringLiteral("*/*"),
+        QStringLiteral("pdfio-picked-notebook.") + PdfNotebookBundle::extension());
+#else
+    return QFileDialog::getOpenFileName(
+        nullptr, i18n("Merge a notebook in"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        PdfNotebookBundle::fileFilter());
+#endif
+}
+
+/// A notebook FOLDER on this device, or false when there is nothing to browse.
+///
+/// Android has no filesystem to browse and the chooser does not offer a folder there; this says so
+/// rather than opening a dialog that cannot work if it is somehow reached.
+bool pickNotebookFolderPath(QString *dir)
+{
+#if defined(Q_OS_ANDROID)
+    Q_UNUSED(dir);
+    QMessageBox::information(nullptr, i18n("Merge a notebook folder"),
+                             i18n("Merging a folder is not available on this device. Merge a "
+                                  "recent notebook, or a notebook file."));
+    return false;
+#else
+    const QString picked = QFileDialog::getExistingDirectory(
+        nullptr, i18n("Merge a notebook folder"), PdfSession::projectRoot());
+    if (picked.isEmpty()) {
+        return false;
+    }
+    *dir = picked;
+    return true;
+#endif
+}
+
+/// Unpacks the notebook file at \a picked into a directory of its own under the notebook folder.
+///
+/// Read before anything is written: inspect() says what the file holds and refuses what is not a
+/// notebook, without unpacking a byte. \a dir is set to the unpacked copy, which the caller owns and
+/// removes once the pages it carried are in the notebook's own files -- the .pnb is transport, and
+/// the merge itself works on a notebook directory.
+bool unpackNotebookFile(const QString &picked, QString *dir, QString *why)
+{
+    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(picked, why);
+    if (!info.isValid()) {
+        return false;
+    }
+
+    const QString unpacked =
+        QDir(QDir(PdfSession::projectRoot())
+                 .filePath(QStringLiteral(".merging-%1").arg(QCoreApplication::applicationPid())))
+            .filePath(PdfNotebookBundle::extractDirName(info.manifest));
+    QDir(unpacked).removeRecursively();
+    if (!PdfNotebookBundle::extract(picked, unpacked, why)) {
+        return false;
+    }
+
+    *dir = unpacked;
+    return true;
+}
+
+/// The picker's own copy, forgotten once it has been read.
+///
+/// Only Android makes one: the chosen content is copied into the application cache because a content
+/// URI is a stream and the formats here need a file. On the desktop \a path is the user's own file
+/// and is never touched.
+void forgetPickedCopy(const QString &path)
+{
+#if defined(Q_OS_ANDROID)
+    QFile::remove(path);
+#else
+    Q_UNUSED(path);
+#endif
+}
+
 /// Picks a notebook FILE and merges what is inside it in.
 void mergeNotebookFile()
 {
@@ -917,38 +1167,23 @@ void mergeNotebookFile()
         return;
     }
 
-    const QString picked = QFileDialog::getOpenFileName(
-        nullptr, i18n("Merge a notebook in"),
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
-        PdfNotebookBundle::fileFilter());
+    const QString picked = pickNotebookFilePath();
     if (picked.isEmpty()) {
         return;
     }
 
-    /// Read before anything is written: inspect() says what the file holds and refuses what is not
-    /// a notebook, without unpacking a byte.
     QString why;
-    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(picked, &why);
-    if (!info.isValid()) {
+    QString unpacked;
+    if (!unpackNotebookFile(picked, &unpacked, &why)) {
         say(QStringLiteral("that file cannot be merged in: %1").arg(why));
         QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+        forgetPickedCopy(picked);
         return;
     }
+    forgetPickedCopy(picked);
 
-    /// Unpacked into a directory of its own under the notebook folder, because the merge works on a
-    /// notebook directory -- the .pnb is the transport form. The copy is removed afterwards whether
-    /// or not the merge worked: by then the pages it carried are in the notebook's own files.
-    const QString unpacked =
-        QDir(QDir(PdfSession::projectRoot())
-                 .filePath(QStringLiteral(".merging-%1").arg(QCoreApplication::applicationPid())))
-            .filePath(PdfNotebookBundle::extractDirName(info.manifest));
-    QDir(unpacked).removeRecursively();
-    if (!PdfNotebookBundle::extract(picked, unpacked, &why)) {
-        say(QStringLiteral("the notebook file could not be unpacked: %1").arg(why));
-        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
-        return;
-    }
-
+    /// The copy is removed afterwards whether or not the merge worked: by then the pages it carried
+    /// are in the notebook's own files.
     mergeNotebookFrom(unpacked);
     QDir(unpacked).removeRecursively();
 }
@@ -963,23 +1198,54 @@ void mergeNotebookFolder()
         return;
     }
 
-    const QString picked = QFileDialog::getExistingDirectory(
-        nullptr, i18n("Merge a notebook folder"), PdfSession::projectRoot());
-    if (picked.isEmpty()) {
+    QString dir;
+    if (!pickNotebookFolderPath(&dir)) {
         return;
     }
 
-    mergeNotebookFrom(picked);
+    mergeNotebookFrom(dir);
+}
+
+/// The menu's merge entry: the one chooser, for a recent notebook or for a file.
+///
+/// The entry used to be the .pnb file dialog alone, which is a dead end on a tablet and misses the
+/// notebooks the user already has. It is now the same chooser the Notebook ops screen's merge button
+/// opens, so the two cannot drift into two different ideas of where a notebook comes from.
+void mergeNotebookChosen()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Merge a notebook in"),
+                                 i18n("No notebook is open."));
+        return;
+    }
+
+    const MergeTarget target = chooseMergeTarget();
+    switch (target.kind) {
+    case MergeTarget::None:
+        return;
+    case MergeTarget::Notebook:
+        /// A notebook already on this device is merged where it is: no unpacking, no copy.
+        mergeNotebookFrom(target.dir);
+        return;
+    case MergeTarget::File:
+        mergeNotebookFile();
+        return;
+    case MergeTarget::Folder:
+        mergeNotebookFolder();
+        return;
+    }
 }
 
 /// Picks a PDF for the screen's insert button and reads what the screen needs: the path and every
 /// page's displayed size, which is what the notebook records.
+///
+/// The pick is the same on both platforms -- pickPdfFilePath() is a file dialog on the desktop and
+/// the Android picker on the tablet -- so the screen's insert works the way the menu's does instead
+/// of opening nothing.
 bool pickPdfForScreen(PdfNotebookOpsDialog::PdfToAdd *pdf)
 {
-    const QString picked = QFileDialog::getOpenFileName(
-        nullptr, i18n("Insert pages from a PDF"),
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
-        i18n("PDF documents (*.pdf)"));
+    const QString picked = pickPdfFilePath();
     if (picked.isEmpty()) {
         return false;
     }
@@ -1000,50 +1266,65 @@ bool pickPdfForScreen(PdfNotebookOpsDialog::PdfToAdd *pdf)
     return !pdf->displayedSizes.isEmpty();
 }
 
-/// Picks a notebook FILE for the screen's merge button and hands over where its files are.
+/// Picks a notebook for the screen's merge button and hands over where its files are.
 ///
-/// A .pnb is unpacked into a directory of its own under the notebook folder; \a temporary is set to
-/// it so the caller can remove it once Apply has read every file out of it. The merge itself works
-/// on notebook files, and the unpacked copy is only transport.
+/// It opens the SAME chooser the menu's merge entry does -- the recent notebooks first, then a
+/// notebook file, and a folder where the platform has them -- so the screen and the menu cannot offer
+/// two different ideas of where a notebook comes from. A notebook already on this device is used
+/// where it is and \a temporary stays as it was: there is nothing of ours to remove. A .pnb is
+/// unpacked into a directory of its own under the notebook folder, and \a temporary is set to it so
+/// the caller can remove it once Apply has read every file out of it.
 bool pickNotebookForScreen(PdfNotebookOpsDialog::NotebookToMerge *notebook, QString *temporary)
 {
-    const QString picked = QFileDialog::getOpenFileName(
-        nullptr, i18n("Merge a notebook in"),
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
-        PdfNotebookBundle::fileFilter());
-    if (picked.isEmpty()) {
-        return false;
-    }
+    const MergeTarget target = chooseMergeTarget();
 
+    QString dir;
+    QString unpackedHere;
     QString why;
-    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(picked, &why);
-    if (!info.isValid()) {
-        say(QStringLiteral("that file cannot be merged in: %1").arg(why));
-        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+    switch (target.kind) {
+    case MergeTarget::None:
         return false;
+    case MergeTarget::Notebook:
+        dir = target.dir;
+        break;
+    case MergeTarget::Folder:
+        if (!pickNotebookFolderPath(&dir)) {
+            return false;
+        }
+        break;
+    case MergeTarget::File: {
+        const QString picked = pickNotebookFilePath();
+        if (picked.isEmpty()) {
+            return false;
+        }
+        if (!unpackNotebookFile(picked, &unpackedHere, &why)) {
+            say(QStringLiteral("that file cannot be merged in: %1").arg(why));
+            QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+            forgetPickedCopy(picked);
+            return false;
+        }
+        forgetPickedCopy(picked);
+        dir = unpackedHere;
+        break;
+    }
     }
 
-    const QString unpacked =
-        QDir(QDir(PdfSession::projectRoot())
-                 .filePath(QStringLiteral(".merging-%1").arg(QCoreApplication::applicationPid())))
-            .filePath(PdfNotebookBundle::extractDirName(info.manifest));
-    QDir(unpacked).removeRecursively();
-    if (!PdfNotebookBundle::extract(picked, unpacked, &why)) {
-        say(QStringLiteral("the notebook file could not be unpacked: %1").arg(why));
-        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
-        return false;
-    }
-
-    notebook->dir = unpacked;
-    notebook->manifest = PdfSession::openProject(unpacked, &why);
+    notebook->dir = dir;
+    notebook->manifest = PdfSession::openProject(dir, &why);
     if (!notebook->manifest.isValid()) {
-        say(QStringLiteral("the unpacked notebook cannot be read: %1").arg(why));
+        say(QStringLiteral("that notebook cannot be read: %1").arg(why));
         QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
-        QDir(unpacked).removeRecursively();
+        /// Only the transport copy this call made: an earlier pick's directory may still be what the
+        /// pending change is reading from.
+        if (!unpackedHere.isEmpty()) {
+            QDir(unpackedHere).removeRecursively();
+        }
         return false;
     }
 
-    *temporary = unpacked;
+    if (!unpackedHere.isEmpty()) {
+        *temporary = unpackedHere;
+    }
     return true;
 }
 
@@ -1395,15 +1676,22 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QObject::connect(extract, &QAction::triggered, ops, []() { extractPageRange(); });
 
     /// Merging is extraction's other direction: pages arrive from another notebook instead of
-    /// leaving for one. The file form is the one to reach for; the folder form is for a notebook
-    /// already on this device.
+    /// leaving for one. One chooser serves it -- the recent notebooks first, then a notebook file --
+    /// because that is what the user asked for, and on a tablet the recent list is the only place a
+    /// whole notebook can come from.
     QAction *merge = ops->addAction(i18n("Merge a notebook in..."));
     merge->setObjectName(QStringLiteral("pdfio_ops_merge"));
-    QObject::connect(merge, &QAction::triggered, ops, []() { mergeNotebookFile(); });
+    QObject::connect(merge, &QAction::triggered, ops, []() { mergeNotebookChosen(); });
 
+    /// The folder form is for a notebook already on this device, which means a desktop: Android has
+    /// no filesystem to browse, so the entry is not offered there at all rather than opening a
+    /// dialog that cannot work. The chooser above leaves it out there as well.
     QAction *mergeFolder = ops->addAction(i18n("Merge a notebook folder..."));
     mergeFolder->setObjectName(QStringLiteral("pdfio_ops_merge_folder"));
     QObject::connect(mergeFolder, &QAction::triggered, ops, []() { mergeNotebookFolder(); });
+#if defined(Q_OS_ANDROID)
+    mergeFolder->setVisible(false);
+#endif
 
     ops->addSeparator();
 
