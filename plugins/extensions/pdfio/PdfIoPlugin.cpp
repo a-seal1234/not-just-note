@@ -7,6 +7,7 @@
 #include <QCoreApplication>
 #include "AndroidDocumentPicker.h"
 #include "PdfIoDocker.h"
+#include "PdfIoNotebookActions.h"
 #include "PdfIoPlugin.h"
 #include "PdfIoProbe.h"
 #include "PdfNotebookOpsDialog.h"
@@ -188,6 +189,27 @@ void reloadDockerNames()
     }
 }
 
+/// Puts the notebook panel up when a notebook is opened.
+///
+/// The panel is where the notebook's pages are picked from: a notebook with no way to choose a page
+/// is a canvas with a title on it. A user who has not been to Settings > Dockers > Notebook would
+/// otherwise open a notebook and see none of it. Shown only while it is hidden, so closing it stays
+/// a choice -- it comes back when the next notebook is opened, the way the canvas does.
+void showNotebookPanel()
+{
+    KisMainWindow *window = KisPart::instance()->currentMainwindow();
+    if (!window) {
+        return;
+    }
+    const QList<PdfIoDocker *> dockers = window->findChildren<PdfIoDocker *>();
+    for (PdfIoDocker *docker : dockers) {
+        if (!docker->isVisible()) {
+            docker->show();
+            docker->raise();
+        }
+    }
+}
+
 QStringList recentNotebookEntries()
 {
     QSettings settings;
@@ -277,6 +299,7 @@ void notebookOpened(bool defaultTheName = true)
     }
     rememberRecentNotebook();
     reloadDockerNames();
+    showNotebookPanel();
 }
 
 /// Puts the notebook's name on the open document's tab; defined with the other name helpers below,
@@ -1030,6 +1053,28 @@ bool pickNotebookForScreen(PdfNotebookOpsDialog::NotebookToMerge *notebook, QStr
 /// rule every operation follows -- and then it works on a copy. On Apply the engine commits the
 /// whole change once (one journal entry, one manifest write) and the notebook is reloaded once, so
 /// the reader ends up on the page they were on rather than wherever the last edit happened to land.
+/// Shows the Notebook ops screen as a PAGE of the window rather than as a dialog on top of it.
+///
+/// It is given the rectangle the canvas had -- the main window's central area -- and a frame with no
+/// title bar, so opening it reads as the window turning to another page and Apply or Cancel reads as
+/// turning back. The menu, the toolbars, the status bar and the panels stay exactly where they were,
+/// and the notebook panel beside it keeps showing the notebook the list is describing.
+///
+/// It is still exec(): the page is a decision about the notebook's page list, and the canvas
+/// underneath must not be poked while that decision is being made.
+void showNotebookOpsPage(PdfNotebookOpsDialog &dialog)
+{
+    dialog.setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+
+    KisMainWindow *window = KisPart::instance()->currentMainwindow();
+    if (QWidget *central = window ? window->centralWidget() : nullptr) {
+        dialog.move(central->mapToGlobal(QPoint(0, 0)));
+        dialog.resize(central->size());
+    }
+
+    dialog.exec();
+}
+
 void openNotebookOpsScreen(PdfIoPlugin *plugin)
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
@@ -1076,7 +1121,9 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
     };
     dialog.setNotebookMerger(merger);
 
-    if (dialog.exec() != QDialog::Accepted) {
+    showNotebookOpsPage(dialog);
+
+    if (dialog.result() != QDialog::Accepted) {
         /// Cancel discards the pending page-list edits and removes any unpacked transport copy. It
         /// does not undo the preflight save prepareForNotebookChange() performs before this screen.
         if (!unpackedNotebook.isEmpty()) {
@@ -1166,6 +1213,20 @@ bool applyNotebookOperation(const QString &title,
     return true;
 }
 
+/// The confirmation before a page leaves the notebook, said the same way whether the operation was
+/// asked for from the submenu or from the panel: what happens to the page's notes, and what brings
+/// them back.
+bool confirmPageDelete(const QString &title)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    return QMessageBox::question(
+               nullptr, title,
+               i18n("Delete page %1 of %2? The page's notes are kept and can be brought back with "
+                    "\"Undo the last notebook change\".",
+                    navigator->currentIndex() + 1, navigator->pageCount()))
+        == QMessageBox::Yes;
+}
+
 /// Enables what the notebook can actually do right now.
 ///
 /// This is why the entries are plain QActions and not rows in PdfIoPlugin.action: "move up" means
@@ -1189,16 +1250,24 @@ void updateNotebookOpsActions(QMenu *ops)
         action->setEnabled(open && possible);
     };
 
+    /// The six page operations answer to the rule the panel's own buttons ask, so the submenu entry
+    /// and the button cannot disagree about what is possible on the page that is open. Together
+    /// with the runner above, that leaves one definition of each operation and one of each rule.
+    const auto quick = [index, pages](PdfNotebookQuicks::Action action) {
+        return PdfNotebookQuicks::available(action, pages, index, nullptr);
+    };
+
     set("pdfio_rename_notebook", true);
     set("pdfio_ops_insert", true);
-    set("pdfio_ops_move_up", index > 0);
-    set("pdfio_ops_move_down", index >= 0 && index < pages - 1);
+    set("pdfio_ops_move_up", quick(PdfNotebookQuicks::Action::MoveUp));
+    set("pdfio_ops_move_down", quick(PdfNotebookQuicks::Action::MoveDown));
     set("pdfio_ops_move_to", pages > 1);
-    set("pdfio_ops_duplicate", pages >= 1);
-    set("pdfio_ops_rotate_right", pages >= 1);
-    set("pdfio_ops_rotate_left", pages >= 1);
-    /// A notebook keeps at least one page, and the engine refuses to delete the last one.
-    set("pdfio_ops_delete", pages > 1);
+    set("pdfio_ops_duplicate", quick(PdfNotebookQuicks::Action::Duplicate));
+    set("pdfio_ops_rotate_right", quick(PdfNotebookQuicks::Action::TurnRight));
+    set("pdfio_ops_rotate_left", quick(PdfNotebookQuicks::Action::TurnLeft));
+    /// A notebook keeps at least one page, and the engine refuses to delete the last one -- which is
+    /// the same rule available() applies, so the entry cannot be offered where the engine says no.
+    set("pdfio_ops_delete", quick(PdfNotebookQuicks::Action::Delete));
     set("pdfio_ops_extract_range", pages >= 1);
     set("pdfio_ops_screen", open);
     set("pdfio_ops_merge", pages >= 1);
@@ -1263,17 +1332,13 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QAction *moveUp = ops->addAction(i18n("Move page up"));
     moveUp->setObjectName(QStringLiteral("pdfio_ops_move_up"));
     QObject::connect(moveUp, &QAction::triggered, ops, []() {
-        applyNotebookOperation(i18n("Move page up"), [](const QString &dir, int page) {
-            return PdfNotebookOps::movePage(dir, page, page - 1, page);
-        });
+        runPdfIoQuickAction(PdfNotebookQuicks::Action::MoveUp);
     });
 
     QAction *moveDown = ops->addAction(i18n("Move page down"));
     moveDown->setObjectName(QStringLiteral("pdfio_ops_move_down"));
     QObject::connect(moveDown, &QAction::triggered, ops, []() {
-        applyNotebookOperation(i18n("Move page down"), [](const QString &dir, int page) {
-            return PdfNotebookOps::movePage(dir, page, page + 1, page);
-        });
+        runPdfIoQuickAction(PdfNotebookQuicks::Action::MoveDown);
     });
 
     QAction *moveTo = ops->addAction(i18n("Move to page..."));
@@ -1299,9 +1364,7 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QAction *duplicate = ops->addAction(i18n("Duplicate page"));
     duplicate->setObjectName(QStringLiteral("pdfio_ops_duplicate"));
     QObject::connect(duplicate, &QAction::triggered, ops, []() {
-        applyNotebookOperation(i18n("Duplicate page"), [](const QString &dir, int page) {
-            return PdfNotebookOps::duplicatePage(dir, page, page);
-        });
+        runPdfIoQuickAction(PdfNotebookQuicks::Action::Duplicate);
     });
 
     /// Turning a page turns the paper AND the ink: the artifact is rotated through the same
@@ -1310,39 +1373,19 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QAction *rotateRight = ops->addAction(i18n("Rotate page right"));
     rotateRight->setObjectName(QStringLiteral("pdfio_ops_rotate_right"));
     QObject::connect(rotateRight, &QAction::triggered, ops, []() {
-        applyNotebookOperation(i18n("Rotate page right"), [](const QString &dir, int page) {
-            return PdfNotebookOps::rotatePages(dir, page, 1, 90, PdfPageRotator::rotateInto, page);
-        });
+        runPdfIoQuickAction(PdfNotebookQuicks::Action::TurnRight);
     });
 
     QAction *rotateLeft = ops->addAction(i18n("Rotate page left"));
     rotateLeft->setObjectName(QStringLiteral("pdfio_ops_rotate_left"));
     QObject::connect(rotateLeft, &QAction::triggered, ops, []() {
-        applyNotebookOperation(i18n("Rotate page left"), [](const QString &dir, int page) {
-            return PdfNotebookOps::rotatePages(dir, page, 1, -90, PdfPageRotator::rotateInto, page);
-        });
+        runPdfIoQuickAction(PdfNotebookQuicks::Action::TurnLeft);
     });
 
     QAction *removePage = ops->addAction(i18n("Delete page..."));
     removePage->setObjectName(QStringLiteral("pdfio_ops_delete"));
     QObject::connect(removePage, &QAction::triggered, ops, []() {
-        PdfPageNavigator *navigator = PdfPageNavigator::instance();
-        if (!navigator->hasNotebook()) {
-            return;
-        }
-        /// Said before it happens, and what "kept" means: the page leaves the notebook and its ink
-        /// goes into the journal, which is what the undo brings back.
-        if (QMessageBox::question(
-                nullptr, i18n("Delete page"),
-                i18n("Delete page %1 of %2? The page's notes are kept and can be brought back with "
-                     "\"Undo the last notebook change\".",
-                     navigator->currentIndex() + 1, navigator->pageCount()))
-            != QMessageBox::Yes) {
-            return;
-        }
-        applyNotebookOperation(i18n("Delete page"), [](const QString &dir, int page) {
-            return PdfNotebookOps::deletePages(dir, page, 1, page);
-        });
+        runPdfIoQuickAction(PdfNotebookQuicks::Action::Delete);
     });
 
     /// Extracting takes pages OUT of the notebook and into a new one, so it sits with the page
@@ -1401,6 +1444,59 @@ void addRecentNotebooksMenu(QMenu *menu)
 }
 
 } // namespace
+
+/// The application half of the pieces of the notebook panel and the submenu that are not widgets.
+/// Here rather than in the anonymous namespace above, which is where everything else in this file
+/// lives: these three are what PdfIoDocker.cpp calls, so they have to have external linkage.
+QString pdfIoQuickTitle(PdfNotebookQuicks::Action action)
+{
+    switch (action) {
+    case PdfNotebookQuicks::Action::MoveUp:
+        return i18n("Move page up");
+    case PdfNotebookQuicks::Action::MoveDown:
+        return i18n("Move page down");
+    case PdfNotebookQuicks::Action::Duplicate:
+        return i18n("Duplicate page");
+    case PdfNotebookQuicks::Action::Delete:
+        return i18n("Delete page");
+    case PdfNotebookQuicks::Action::TurnLeft:
+        return i18n("Rotate page left");
+    case PdfNotebookQuicks::Action::TurnRight:
+        return i18n("Rotate page right");
+    }
+
+    /// Not reachable, and empty rather than a guess: PdfNotebookQuicks::all() is the only source of
+    /// these values, and this switch covers every one of them.
+    return QString();
+}
+
+void runPdfIoQuickAction(PdfNotebookQuicks::Action action)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    const QString title = pdfIoQuickTitle(action);
+
+    /// Asked only for an operation the page can actually take, and once more underneath by
+    /// PdfNotebookQuicks::run. Both of this file's callers disable what is impossible, so a refusal
+    /// here is the application's own last word rather than the way a user finds out -- and it is
+    /// never a question about a page that does not exist.
+    const bool possible = PdfNotebookQuicks::available(
+        action, navigator->pageCount(), navigator->currentIndex(), nullptr);
+    if (possible && action == PdfNotebookQuicks::Action::Delete && !confirmPageDelete(title)) {
+        return;
+    }
+
+    /// One call into the same gate the rest of the notebook operations use, so the panel button and
+    /// the submenu entry cannot do different things: the open pages are written, the operation is
+    /// applied as one change, and the notebook is reloaded onto the page it answers with.
+    applyNotebookOperation(title, [action](const QString &dir, int page) {
+        return PdfNotebookQuicks::run(dir, action, page, PdfPageRotator::rotateInto);
+    });
+}
+
+void openPdfIoNotebookOpsScreen()
+{
+    openNotebookOpsScreen(nullptr);
+}
 
 void PdfIoPlugin::slotInsertPages()
 {

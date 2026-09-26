@@ -91,6 +91,10 @@ private Q_SLOTS:
     void testAnExtractedRangeOpensAsItsOwnNotebook();
     void testMergingANotebookInAddsItsPagesAndKeepsTheReader();
     void testTheScreenKeepsItsChangeUntilApply();
+
+    /// The page list's own gesture: a swipe turns the row it was made on, by the same quarter turn
+    /// the buttons use, and a movement that is not a swipe turns nothing.
+    void testSwipingAPageTurnsIt();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1921,6 +1925,74 @@ void PdfNavigatorIntegrationTest::testQuittingWritesTheInkToo()
     /// And the document is clean afterwards, so whatever closes it next has nothing to ask about.
     QCOMPARE(navigator()->currentDocument(), page);
     QVERIFY(!page->isModified());
+}
+
+/**
+ * A swipe across a page turns it, and the buttons and the gesture agree about what turning is.
+ *
+ * Turning a page is the common case on this screen and a button is a small thing to find on a
+ * tablet, so the gesture is the one worth having. What is asserted is that it is the SAME change:
+ * one quarter turn, recorded on the row that was swiped. A screen where two ways to turn a page
+ * disagree is worse than a screen with one, and a screen where a slipped click turns a page is worse
+ * than either.
+ */
+void PdfNavigatorIntegrationTest::testSwipingAPageTurnsIt()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("swipe"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QCOMPARE(manifest.pages.size(), 3);
+
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+
+    /// Shown, because a swipe is a position: a table that has never been laid out has no row under a
+    /// point, and the gesture would then be tested against a geometry the user never sees.
+    dialog.show();
+    QTest::qWait(50);
+
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY2(table, "the screen has no page list to swipe");
+    QWidget *viewport = table->viewport();
+    QVERIFY2(table->visualRect(table->model()->index(1, 0)).isValid(),
+             "the page list has no laid-out row to swipe");
+
+    const auto swipe = [table, viewport](int row, int dx, int dy) {
+        const QPoint from = table->visualRect(table->model()->index(row, 0)).center();
+        QTest::mousePress(viewport, Qt::LeftButton, Qt::KeyboardModifiers(), from);
+        QTest::mouseRelease(viewport, Qt::LeftButton, Qt::KeyboardModifiers(),
+                            from + QPoint(dx, dy));
+    };
+
+    /// A swipe to the right turns the page right, on the row it was made on and no other.
+    swipe(1, 90, 0);
+    QCOMPARE(dialog.edits().pages.at(1).extraRotation, 90);
+    QCOMPARE(dialog.edits().pages.at(0).extraRotation, 0);
+    QCOMPARE(dialog.edits().pages.at(2).extraRotation, 0);
+
+    /// The other direction is the other quarter turn, on the same row again.
+    swipe(0, -90, 0);
+    QCOMPARE(dialog.edits().pages.at(0).extraRotation, 270);
+
+    /// A movement too small to be a gesture is a slipped click: it selects, and turns nothing.
+    swipe(2, 10, 0);
+    QCOMPARE(dialog.edits().pages.at(2).extraRotation, 0);
+
+    /// Nor is a drag down the list, which is how a list is scrolled with a finger.
+    swipe(2, 10, 220);
+    QCOMPARE(dialog.edits().pages.at(2).extraRotation, 0);
+
+    /// And the button turns exactly what the gesture turns: one quarter turn, one place it happens.
+    table->selectRow(2);
+    QPushButton *turnRight =
+        dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_turn_right"));
+    QVERIFY2(turnRight, "the screen has no turn button to compare the gesture with");
+    turnRight->click();
+    QCOMPARE(dialog.edits().pages.at(2).extraRotation, 90);
 }
 
 int main(int argc, char *argv[])

@@ -6,6 +6,7 @@
 
 #include "backends/poppler/PopplerRenderBackend.h"
 #include "session/PdfNotebookOps.h"
+#include "session/PdfNotebookQuicks.h"
 #include "session/PdfSession.h"
 
 #include <QDir>
@@ -121,6 +122,10 @@ private Q_SLOTS:
     void testDuplicatingAPageCopiesItsArtifacts();
     void testAnOperationThatCannotCommitChangesNothing();
     void testUndoUndoesTheLastChangeOnly();
+
+    /// The one-click operations the submenu and the notebook panel share: one rule that both ask
+    /// before they offer an operation, and one call that both make when one is chosen.
+    void testQuickPageOperations();
 
     /// Inserting pages from a PDF: it becomes a source of the notebook (copied into the project
     /// once, reused after that), every inserted page gets its own artifact number, and nothing is
@@ -2369,6 +2374,129 @@ void PdfSessionTest::testPathInsideProject()
     QVERIFY(!PdfSession::isPathInsideProject(project, QString(), &why));
     /// The project directory itself is not a file inside it.
     QVERIFY(!PdfSession::isPathInsideProject(project, QStringLiteral("."), &why));
+}
+
+/**
+ * The one-click operations the submenu and the notebook panel share.
+ *
+ * What is under test is the RULE rather than a widget. available() is what both callers ask before
+ * they offer an operation, and run() is what both apply; the two of them -- a menu entry and a panel
+ * button -- reading one rule is the entire reason the class exists. A button that offers what the
+ * engine refuses, or one that refuses what the engine would do, is the failure these assertions
+ * stand for. The operations underneath are covered by the cases above.
+ */
+void PdfSessionTest::testQuickPageOperations()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    /// A notebook that is not open is no pages at all: every entry the panel draws starts disabled,
+    /// and run() refuses the same six for a caller that did not ask first.
+    QString why;
+    StubRotator untouched;
+    for (PdfNotebookQuicks::Action action : PdfNotebookQuicks::all()) {
+        QVERIFY2(!PdfNotebookQuicks::available(action, 0, -1, &why),
+                 "nothing is possible with no notebook open");
+        QVERIFY2(!why.isEmpty(), "a refused operation has to say why");
+        QVERIFY2(!PdfNotebookQuicks::run(project, action, -1, untouched.fn()).ok,
+                 "run() refuses what available() refuses");
+    }
+    QVERIFY2(untouched.calls.isEmpty(), "a refused operation must not reach the disk");
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
+
+    /// The edges are the whole rule. The first page has nowhere above it and the last has nowhere
+    /// below it, which is what both callers have to agree about.
+    const int pages = 3;
+    QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::MoveUp, pages, 0, &why));
+    QVERIFY2(why.contains(QStringLiteral("first page")), qPrintable(why));
+    QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::MoveUp, pages, 1, &why));
+    QVERIFY2(why.isEmpty(), qPrintable(why));
+    QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::MoveDown, pages, 1, &why));
+    QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::MoveDown, pages, 2, &why));
+    QVERIFY2(why.contains(QStringLiteral("last page")), qPrintable(why));
+
+    /// A notebook keeps at least one page -- the engine's own rule, said here once so that the entry
+    /// cannot be offered where the engine would refuse it.
+    QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Delete, 1, 0, &why));
+    QVERIFY2(why.contains(QStringLiteral("at least one page")), qPrintable(why));
+    QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Delete, 2, 0, &why));
+    QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Duplicate, 1, 0, &why));
+    QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Duplicate, 1, 1, &why));
+
+    /// The turns are the two that carry an angle, and left is the negative one so that the sign
+    /// means here what it means in the operation underneath.
+    QVERIFY(PdfNotebookQuicks::isTurn(PdfNotebookQuicks::Action::TurnLeft));
+    QVERIFY(PdfNotebookQuicks::isTurn(PdfNotebookQuicks::Action::TurnRight));
+    QCOMPARE(PdfNotebookQuicks::degrees(PdfNotebookQuicks::Action::TurnLeft), -90);
+    QCOMPARE(PdfNotebookQuicks::degrees(PdfNotebookQuicks::Action::TurnRight), 90);
+    QVERIFY(!PdfNotebookQuicks::isTurn(PdfNotebookQuicks::Action::Delete));
+    QCOMPARE(PdfNotebookQuicks::degrees(PdfNotebookQuicks::Action::MoveUp), 0);
+
+    /// A move is the manifest's: the records travel with their file names, and the reader follows
+    /// the page they were on rather than the position they were at.
+    const PdfNotebookOps::Outcome moved = PdfNotebookQuicks::run(
+        project, PdfNotebookQuicks::Action::MoveDown, 0, untouched.fn());
+    QVERIFY2(moved.ok, qPrintable(moved.why));
+    QCOMPARE(moved.anchorPage, 1);
+    const PdfSessionManifest afterMove = PdfSession::openProject(project, &why);
+    QVERIFY2(afterMove.isValid(&why), qPrintable(why));
+    QCOMPARE(afterMove.pages.at(0).kraFile, before.pages.at(1).kraFile);
+    QCOMPARE(afterMove.pages.at(1).kraFile, before.pages.at(0).kraFile);
+
+    /// Duplicating the page that is open adds a page of its own beside it.
+    const PdfNotebookOps::Outcome copied = PdfNotebookQuicks::run(
+        project, PdfNotebookQuicks::Action::Duplicate, 0, untouched.fn());
+    QVERIFY2(copied.ok, qPrintable(copied.why));
+    const PdfSessionManifest afterCopy = PdfSession::openProject(project, &why);
+    QCOMPARE(afterCopy.pages.size(), 4);
+    QCOMPARE(afterCopy.pages.at(0).kraFile, afterMove.pages.at(0).kraFile);
+    QVERIFY2(afterCopy.pages.at(1).kraFile != afterCopy.pages.at(0).kraFile,
+             "the copy has files of its own rather than sharing the original's");
+
+    /// A page that was never drawn on has no artifact, so its turn is the manifest's alone and the
+    /// rotator is never asked.
+    StubRotator manifestOnly;
+    const PdfNotebookOps::Outcome turned = PdfNotebookQuicks::run(
+        project, PdfNotebookQuicks::Action::TurnRight, 0, manifestOnly.fn());
+    QVERIFY2(turned.ok, qPrintable(turned.why));
+    QVERIFY2(manifestOnly.calls.isEmpty(), "there is nothing on disk to turn");
+    QCOMPARE(PdfSession::openProject(project, &why).pages.at(0).extraRotation, 90);
+
+    /// With ink on the page, the same entry hands the artifact to the rotator by the angle that
+    /// means left: the paper and the ink are turned by one operation.
+    writeBytes(QDir(project).filePath(afterCopy.pages.at(0).kraFile), QByteArrayLiteral("ink"));
+    StubRotator turning;
+    const PdfNotebookOps::Outcome back = PdfNotebookQuicks::run(
+        project, PdfNotebookQuicks::Action::TurnLeft, 0, turning.fn());
+    QVERIFY2(back.ok, qPrintable(back.why));
+    QCOMPARE(turning.calls.size(), 1);
+    /// Left is -90 as a rule and 270 as the quarter turn the operation hands the artifact: the
+    /// engine normalizes it, which is why this reads 270 rather than repeating the angle above.
+    QCOMPARE(turning.calls.at(0).degrees, 270);
+    /// The two turns cancel on the paper, which is what the reader sees.
+    QCOMPARE(PdfSession::openProject(project, &why).pages.at(0).extraRotation, 0);
+
+    /// Deleting the page that is open takes it out of the list and leaves the reader on the page
+    /// that took its place.
+    const PdfSessionManifest beforeDelete = PdfSession::openProject(project, &why);
+    const PdfNotebookOps::Outcome removed = PdfNotebookQuicks::run(
+        project, PdfNotebookQuicks::Action::Delete, 0, untouched.fn());
+    QVERIFY2(removed.ok, qPrintable(removed.why));
+    QCOMPARE(removed.anchorPage, 0);
+    const PdfSessionManifest afterDelete = PdfSession::openProject(project, &why);
+    QCOMPARE(afterDelete.pages.size(), 3);
+    QCOMPARE(afterDelete.pages.at(0).kraFile, beforeDelete.pages.at(1).kraFile);
+
+    /// Every one of them was one change the undo walks back, which is what makes a button that
+    /// applies immediately safe to offer at all.
+    QVERIFY(PdfNotebookOps::canUndo(project));
 }
 
 QTEST_MAIN(PdfSessionTest)

@@ -7,7 +7,11 @@
 #ifndef PDFIODOCKER_H
 #define PDFIODOCKER_H
 
+#include "session/PdfNotebookQuicks.h"
+
 #include <QDockWidget>
+#include <QList>
+#include <QPair>
 
 class QEvent;
 class QLabel;
@@ -41,6 +45,10 @@ private Q_SLOTS:
     void refresh(int index, int pageCount, const QString &label);
     void openSelected();
 
+    /// Enables the panel's operation buttons from the page that is open, and gives each one the
+    /// reason it cannot run as its tooltip. The submenu asks the same rule, which is the point.
+    void refreshQuickButtons();
+
     /// Asks for a thumbnail of every page the list is showing. Generation is queued and one at a
     /// time, so scrolling through a long notebook fills it in as it goes.
     void queueThumbnails();
@@ -64,6 +72,9 @@ protected:
     void showEvent(QShowEvent *event) override;
 
 private:
+    /// Runs one quick operation, out of the click handler that asked for it.
+    void runQuick(PdfNotebookQuicks::Action action);
+
     /// Recomputes the card size for the room the list has now.
     void refitCards();
 
@@ -78,6 +89,14 @@ private:
     QListWidget *m_pages = nullptr;
     QPushButton *m_previous = nullptr;
     QPushButton *m_next = nullptr;
+
+    /// The operation buttons the panel offers -- the turns, and only the turns -- each paired with
+    /// the action it runs. Built from PdfNotebookQuicks rather than from members, so the set, the
+    /// order and the enabling pass cannot disagree about which operations exist.
+    QList<QPair<PdfNotebookQuicks::Action, QPushButton *>> m_quicks;
+
+    /// The one entry the panel cannot serve itself: the screen, with its pickers and its one Apply.
+    QPushButton *m_manage = nullptr;
 };
 
 /// Registers the docker once per process; a view plugin is created per view.

@@ -11,6 +11,7 @@ set(kritapdfio_SOURCES
     session/PdfInkLoader.cpp
     session/PdfNotebookBundle.cpp
     session/PdfNotebookOps.cpp
+    session/PdfNotebookQuicks.cpp
     session/PdfPageRotator.cpp
     session/PdfPageSaver.cpp
     session/PdfPageWindow.cpp

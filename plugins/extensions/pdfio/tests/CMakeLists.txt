@@ -30,6 +30,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         PdfSessionTest.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../backends/poppler/PopplerRenderBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookOps.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookQuicks.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSession.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
         )

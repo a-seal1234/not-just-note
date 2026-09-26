@@ -10,11 +10,13 @@
 #include <QDialog>
 #include <QList>
 #include <QPair>
+#include <QPoint>
 #include <QSizeF>
 #include <QStringList>
 
 #include <functional>
 
+class QEvent;
 class QLabel;
 class QPushButton;
 class QTableWidget;
@@ -118,6 +120,9 @@ private:
     void deleteSelected();
     void keepSelected();
     void rotateSelected(int degrees);
+    /// Turns \a row by \a degrees. Both the buttons and the swipe come through here, so the two
+    /// cannot turn a page by different amounts or leave a different trail behind.
+    void turnRow(int row, int degrees);
     void dropThumbnail(Row &row);
     void insertPagesFromPdf();
     void mergeNotebookIn();
@@ -139,6 +144,16 @@ private:
     /// The additions in index order, and the assets another notebook carried.
     QList<Addition> m_additions;
     QStringList m_assets;
+
+    /**
+     * The page list's own gesture: a swipe left or right across a row turns that page.
+     *
+     * The buttons are still the way to do it with a mouse, but a page is turned far more often than
+     * a page is deleted, and on a tablet a button is a small thing to find while a list of pages is
+     * a large thing to swipe. One swipe is one quarter turn -- the unit the notebook records -- so
+     * the gesture cannot land the paper on an angle the ink was never turned to.
+     */
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
     int selectedRow() const;
     void selectRow(int row);
@@ -169,6 +184,10 @@ private:
     int m_nextNumber = 0;
 
     QTableWidget *m_table = nullptr;
+    /// Where a swipe started and which row it started on: the gesture acts on the row it was made
+    /// on, not on whatever was selected before it.
+    QPoint m_swipeFrom;
+    int m_swipeRow = -1;
     QLabel *m_summary = nullptr;
     QLabel *m_hint = nullptr;
     QPushButton *m_apply = nullptr;

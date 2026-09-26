@@ -6,12 +6,14 @@
 
 #include <QApplication>
 #include "PdfIoDocker.h"
+#include "PdfIoNotebookActions.h"
 #include "PdfPageNavigator.h"
 #include "session/PdfSession.h"
 
 #include <QDir>
 #include <QEvent>
 #include <QFileInfo>
+#include <QGridLayout>
 #include <QSignalBlocker>
 #include <QTimer>
 #include <QHBoxLayout>
@@ -93,6 +95,36 @@ PdfIoDocker::PdfIoDocker()
     buttons->addWidget(m_previous);
     buttons->addWidget(m_next);
     layout->addLayout(buttons);
+
+    /// Only the turns are here. The panel is on screen while reading, so turning the page under the
+    /// reader's hand is exactly what it is for. Everything else changes the page list -- how many
+    /// pages there are and in what order -- and that is a decision to make with the whole list in
+    /// front of you, on the Notebook ops page; a panel button that deletes a page is a button that
+    /// deletes a page by accident.
+    auto *quick = new QGridLayout();
+    int quickRow = 0;
+    int quickColumn = 0;
+    for (PdfNotebookQuicks::Action action : PdfNotebookQuicks::all()) {
+        if (!PdfNotebookQuicks::isTurn(action)) {
+            continue;
+        }
+
+        auto *button = new QPushButton(pdfIoQuickTitle(action), content);
+        connect(button, &QPushButton::clicked, this, [this, action]() { runQuick(action); });
+        quick->addWidget(button, quickRow, quickColumn);
+        m_quicks.append(qMakePair(action, button));
+        if (++quickColumn == 2) {
+            quickColumn = 0;
+            ++quickRow;
+        }
+    }
+    layout->addLayout(quick);
+
+    /// The way to the page the rest of the operations live on. Below the turns rather than beside
+    /// them: it is a door, not a page operation.
+    m_manage = new QPushButton(QStringLiteral("Manage pages..."), content);
+    connect(m_manage, &QPushButton::clicked, this, []() { openPdfIoNotebookOpsScreen(); });
+    layout->addWidget(m_manage);
 
     setWidget(content);
 
@@ -204,6 +236,10 @@ void PdfIoDocker::showEvent(QShowEvent *event)
     /// viewport's was reached with the final width, and the cards stayed at the construction size.
     refitCards();
     QTimer::singleShot(0, this, &PdfIoDocker::refitCards);
+
+    /// The panel can be shown long after a notebook was opened, so its buttons are enabled from the
+    /// state the notebook is in now rather than from the last page this signal carried.
+    refreshQuickButtons();
 }
 
 QString PdfIoDocker::notebookName()
@@ -294,6 +330,7 @@ void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
     m_previous->setEnabled(index > 0);
     m_next->setEnabled(index >= 0 && index + 1 < pageCount);
 
+    refreshQuickButtons();
 }
 
 void PdfIoDocker::queueThumbnails()
@@ -355,6 +392,51 @@ void PdfIoDocker::openSelected()
             qWarning() << "pdfio: cannot open that page:" << why;
         }
     });
+}
+
+void PdfIoDocker::refreshQuickButtons()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+
+    /// A reload takes the page list out from under these buttons for a moment, and nothing they
+    /// could ask for in it is possible while the notebook is being rebuilt.
+    const bool busy = navigator->reloadPending();
+
+    for (const auto &entry : m_quicks) {
+        QString why;
+        const bool possible =
+            !busy && PdfNotebookQuicks::available(entry.first, navigator->pageCount(),
+                                                  navigator->currentIndex(), &why);
+        QPushButton *button = entry.second;
+        button->setEnabled(possible);
+        /// The reason and not only the grey: a button that cannot do anything says why, the same way
+        /// the screen's hint line does, instead of standing there mute.
+        button->setToolTip(possible ? pdfIoQuickTitle(entry.first) : why);
+    }
+
+    if (m_manage) {
+        m_manage->setEnabled(navigator->hasNotebook() && !busy);
+    }
+}
+
+void PdfIoDocker::runQuick(PdfNotebookQuicks::Action action)
+{
+    /// Asked again here rather than trusted from the last repaint: a click can arrive after the page
+    /// turned underneath it, and the rule is one call away. The application asks it once more before
+    /// it writes anything, so this is the earliest of three asks rather than the only one.
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    QString why;
+    if (!PdfNotebookQuicks::available(action, navigator->pageCount(), navigator->currentIndex(),
+                                      &why)) {
+        qWarning() << "pdfio: that page operation is not possible:" << why;
+        refreshQuickButtons();
+        return;
+    }
+
+    /// Deferred out of the click handler for the reason openSelected() is: an operation writes the
+    /// open page, applies a manifest and closes the view that is showing it, so the whole
+    /// application reacts while this button is still inside its own signal.
+    QTimer::singleShot(0, this, [action]() { runPdfIoQuickAction(action); });
 }
 
 void registerPdfIoDocker()

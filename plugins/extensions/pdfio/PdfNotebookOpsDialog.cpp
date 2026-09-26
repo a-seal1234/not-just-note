@@ -16,6 +16,7 @@
 #include <QHeaderView>
 #include <QIcon>
 #include <QLabel>
+#include <QMouseEvent>
 #include <QPixmap>
 #include <QPushButton>
 #include <QTableWidget>
@@ -36,6 +37,20 @@ enum Column {
     InkColumn,
     ColumnCount,
 };
+
+/// How far sideways a swipe has to go before it is a turn rather than a slipped click.
+constexpr int SwipeTurnPixels = 60;
+
+/// Where a mouse event happened, in the widget's own coordinates. Qt 6 renamed the accessor and
+/// deprecated the old one, and this file is built against both.
+QPoint mousePosition(const QMouseEvent *event)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return event->position().toPoint();
+#else
+    return event->pos();
+#endif
+}
 
 QString sizeLabel(const PdfPageRecord &record)
 {
@@ -88,7 +103,8 @@ void PdfNotebookOpsDialog::buildUi()
 
     auto *intro = new QLabel(
         i18n("Notebook \"%1\" has %2 page(s). Change the list here; nothing is written until you "
-             "press Apply, and then the whole change is one step you can undo.",
+             "press Apply, and then the whole change is one step you can undo. Swipe a page left "
+             "or right to turn it.",
              m_original.displayName(), m_rows.size()),
         this);
     intro->setWordWrap(true);
@@ -108,6 +124,9 @@ void PdfNotebookOpsDialog::buildUi()
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->setMinimumWidth(560);
     connect(m_table, &QTableWidget::itemSelectionChanged, this, [this]() { refreshFooter(); });
+    /// On the viewport rather than on the table: the viewport is the widget the press and the
+    /// release actually arrive at, and it sees them before the view turns them into a selection.
+    m_table->viewport()->installEventFilter(this);
     middle->addWidget(m_table, 1);
 
     auto *buttons = new QVBoxLayout;
@@ -391,9 +410,8 @@ void PdfNotebookOpsDialog::keepSelected()
     m_table->selectRow(row);
 }
 
-void PdfNotebookOpsDialog::rotateSelected(int degrees)
+void PdfNotebookOpsDialog::turnRow(int row, int degrees)
 {
-    const int row = m_table->currentRow();
     if (row < 0 || row >= m_rows.size() || m_rows.at(row).removed) {
         return;
     }
@@ -406,6 +424,42 @@ void PdfNotebookOpsDialog::rotateSelected(int degrees)
 
     refresh();
     m_table->selectRow(row);
+}
+
+void PdfNotebookOpsDialog::rotateSelected(int degrees)
+{
+    turnRow(m_table->currentRow(), degrees);
+}
+
+bool PdfNotebookOpsDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (m_table && watched == m_table->viewport()) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            const QPoint at = mousePosition(static_cast<QMouseEvent *>(event));
+            m_swipeFrom = at;
+            /// Selected on the press rather than on the release: the gesture is about the row it was
+            /// made on, and every control on this screen acts on the selection.
+            m_swipeRow = m_table->rowAt(at.y());
+            if (m_swipeRow >= 0) {
+                m_table->selectRow(m_swipeRow);
+            }
+        } else if (event->type() == QEvent::MouseButtonRelease) {
+            const QPoint at = mousePosition(static_cast<QMouseEvent *>(event));
+            const int dx = at.x() - m_swipeFrom.x();
+            const int dy = at.y() - m_swipeFrom.y();
+            const int row = m_swipeRow;
+            m_swipeRow = -1;
+
+            /// Sideways and far enough, and not a drag down the list. A swipe to the right turns the
+            /// page right, which is the way the paper goes; one swipe is one quarter turn, which is
+            /// the only amount the notebook records.
+            if (row >= 0 && qAbs(dx) >= SwipeTurnPixels && qAbs(dx) > qAbs(dy)) {
+                turnRow(row, dx > 0 ? 90 : -90);
+            }
+        }
+    }
+
+    return QDialog::eventFilter(watched, event);
 }
 
 void PdfNotebookOpsDialog::dropThumbnail(Row &row)
