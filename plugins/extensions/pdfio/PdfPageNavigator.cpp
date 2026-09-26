@@ -861,6 +861,16 @@ QSize PdfPageNavigator::previewBoxFor(const PdfPageRecord &record, const QSize &
     return page.scaled(room, Qt::KeepAspectRatio);
 }
 
+QString PdfPageNavigator::thumbnailPathFor(const QString &projectDir, const PdfPageRecord &record)
+{
+    /// An empty name is "no preview yet", not the project directory: joining it would hand every
+    /// caller the directory, and QFileInfo::exists() would then say the page has a picture.
+    if (projectDir.isEmpty() || record.thumbFile.isEmpty()) {
+        return QString();
+    }
+    return QDir(projectDir).filePath(record.thumbFile);
+}
+
 void PdfPageNavigator::ensureThumbnail(int index)
 {
     if (!hasNotebook() || index < 0 || index >= m_manifest.pages.size()) {

@@ -305,6 +305,24 @@ public:
     static QSize previewBoxFor(const PdfPageRecord &record, const QSize &room);
 
     /**
+     * Where \a record's preview lives inside \a projectDir, or an empty string when the record
+     * names none.
+     *
+     * THE one place a preview's file name is read off a record, for the same reason previewBoxFor()
+     * is the one place its shape is: a caller that GUESSES the name -- "page 1 is thumbs/p0001.png"
+     * -- is wrong twice. The names are handed out by the notebook's allocator and travel with the
+     * page, so a moved page's preview is not at the position it now sits at; and a guessed name that
+     * happens to be absent is indistinguishable, on screen, from a page that has no preview at all.
+     * The Start screen's Recent Images column showed a plain folder icon for exactly that reason.
+     *
+     * An empty answer means "this page records no preview", and the caller must NOT join it onto
+     * the directory: PdfPageRecord::thumbFile says an empty name is legal, and the project
+     * directory is not a picture. Whether the file is THERE is the caller's question -- a stored
+     * name whose file is missing is a different thing, and the two have to be told apart in words.
+     */
+    static QString thumbnailPathFor(const QString &projectDir, const PdfPageRecord &record);
+
+    /**
      * Whether panning past the edge of a page turns to the next one.
      *
      * Off is a reasonable choice: the gesture that turns a page is the same one used to look at

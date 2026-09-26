@@ -599,17 +599,90 @@ void applyNotebookNameToTab()
                                      .arg(navigator->pageCount()));
 }
 
+/// The reason last logged for a notebook's missing page-1 preview, so one state is said once and
+/// not on every rebuild of the entries.
+QHash<QString, QString> &lastStartScreenReason()
+{
+    static QHash<QString, QString> reasons;
+    return reasons;
+}
+
+/// Asks for the one preview a Start-screen entry shows, and only for the notebook that is OPEN.
+///
+/// A recent entry is usually a notebook the navigator does not have open, and making its preview
+/// would mean opening its source PDF and rendering a page as a side effect of building the Start
+/// screen -- once per recent entry, on the startup path, which is not a cost a screen may impose.
+/// The folder icon is the honest answer there, and refreshWelcomePageEntries() says in the log
+/// which page it was and which of the two reasons it was.
+///
+/// The notebook that IS open needs no such machinery: its sources are parsed, one page is a
+/// bounded render, and the ask goes through the notebook's own queue -- the same ask the docker
+/// and the ops screen already make -- so a missing page-1 preview comes back without the user
+/// having to do anything. The caller asks only when the file is MISSING, so this queues exactly one
+/// render for the one page the entry shows.
+void askForStartScreenPreview(const QString &dir)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook() || navigator->projectDir().isEmpty()) {
+        return;
+    }
+    if (QFileInfo(navigator->projectDir()).absoluteFilePath()
+        != QFileInfo(dir).absoluteFilePath()) {
+        return;
+    }
+    navigator->ensureThumbnail(0);
+}
+
+/// Once per process: the Start screen can be built while a page's preview is missing -- the entries
+/// are rebuilt on the way out of the very open that asks for the new one -- and page 1 is the only
+/// page a recent entry shows. So a page-1 preview landing is the moment to rebuild the entries.
+///
+/// The rebuild only asks when the file is MISSING, so an ask cannot answer immediately and the
+/// signal cannot come straight back here; refreshWelcomePageEntries() drops a nested call as well,
+/// for the case where the navigator's own record differs from the one on disk.
+void hookStartScreenPreviewOnce()
+{
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
+
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    QObject::connect(navigator, &PdfPageNavigator::thumbnailReady, navigator, [](int index) {
+        if (index == 0) {
+            refreshWelcomePageEntries();
+        }
+    });
+}
+
 /// Puts the notebook list on the Start screen's Recent Images list.
 ///
 /// Krita's own recent documents are left alone: the welcome page appends these beside them through
 /// a proxy of its own, and a click comes back here as the project directory. A notebook whose
 /// directory or manifest is gone is dropped on this pass, so it disappears from the screen on the
-/// next refresh rather than lingering as a dead row; one with no thumbnail yet gets a plain icon.
+/// next refresh rather than lingering as a dead row; one with no page-1 preview gets a plain icon,
+/// and that plain icon has two causes which only the log can tell apart -- see below.
 void refreshWelcomePageEntries()
 {
+    /// A nested call is dropped: asking the navigator for a preview can answer immediately when the
+    /// file is already there, and that answer arrives back here as a refresh of the list this call
+    /// is still building. The outer call's entries are the ones that describe the disk.
+    static bool refreshing = false;
+    if (refreshing) {
+        return;
+    }
+    refreshing = true;
+
+    hookStartScreenPreviewOnce();
+
     QList<KisWelcomePageWidget::ExtraRecentEntry> entries;
+    /// The directories this pass really looked at, so a reason remembered for a notebook that has
+    /// left the recent list is forgotten with it.
+    QStringList looked;
     for (const QString &entry : recentNotebookEntries()) {
         const QString dir = recentNotebookDir(entry);
+        looked << dir;
         QString why;
         const PdfSessionManifest manifest =
             PdfSessionManifest::readFrom(PdfSession::manifestPath(dir), &why);
@@ -622,10 +695,42 @@ void refreshWelcomePageEntries()
         if (extra.name.isEmpty()) {
             extra.name = manifest.displayName();
         }
-        const QString thumbnail = QDir(dir).filePath(QStringLiteral("thumbs/p0001.png"));
-        extra.thumbnailPath = QFileInfo::exists(thumbnail) ? thumbnail : QString();
+
+        /// The picture comes from PAGE 1'S OWN RECORD, never from a name guessed out of the page's
+        /// position. A preview's name is handed out by the notebook's allocator and travels with
+        /// the page, so "thumbs/p0001.png" is the shape of the names this build happens to write and
+        /// not a rule the manifest obeys. Worse, a guessed path that is absent and a page that
+        /// records no preview are the SAME folder icon on screen -- which is how a notebook whose
+        /// preview was dropped came to look like a notebook that never had one. The two are told
+        /// apart here, in the log, because the icon cannot say it.
+        const PdfPageRecord &first = manifest.pages.first();
+        const QString thumbnail = PdfPageNavigator::thumbnailPathFor(dir, first);
+        const bool present = !thumbnail.isEmpty() && QFileInfo::exists(thumbnail);
+        if (!present) {
+            /// Which of the two causes it is, said ONCE per state rather than on every rebuild: a
+            /// page-1 save rebuilds these entries too, and a line repeated for every rebuild is a
+            /// line nobody reads. The state is the pair (this notebook, this reason), and it is
+            /// cleared when the picture is there, so losing it again is said again.
+            const QString reason = first.thumbFile.isEmpty()
+                ? QStringLiteral("page 1 records no preview name yet")
+                : QStringLiteral("page 1's recorded preview %1 is not on disk").arg(first.thumbFile);
+            if (lastStartScreenReason().value(dir) != reason) {
+                lastStartScreenReason().insert(dir, reason);
+                say(QStringLiteral("Start screen: %1 shows the plain icon: %2").arg(dir, reason));
+            }
+            askForStartScreenPreview(dir);
+        } else {
+            lastStartScreenReason().remove(dir);
+        }
+        extra.thumbnailPath = present ? thumbnail : QString();
         extra.token = dir;
         entries.append(extra);
+    }
+
+    for (const QString &known : lastStartScreenReason().keys()) {
+        if (!looked.contains(known)) {
+            lastStartScreenReason().remove(known);
+        }
     }
 
     KisWelcomePageWidget::setExtraRecentEntries(
@@ -642,6 +747,8 @@ void refreshWelcomePageEntries()
             /// was extracted from.
             openProjectDirReplacing(projectDir, 6);
         });
+
+    refreshing = false;
 }
 
 /// Writes \a entered into the open notebook's manifest as its name, with the same rejection the

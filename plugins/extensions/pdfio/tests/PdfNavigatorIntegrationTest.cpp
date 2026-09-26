@@ -145,6 +145,14 @@ private Q_SLOTS:
     /// A page that records no preview at all -- which is what an edit used to leave behind -- is
     /// given a durable name when the notebook is adopted, so it can be pictured again.
     void testAPageThatRecordsNoPreviewIsGivenOneOnOpen();
+    /// A preview's FILE NAME is read off the page's own record, never guessed from its position:
+    /// the Start screen's Recent Images column asked for thumbs/p0001.png and could not tell a page
+    /// whose preview is gone from one that never had one.
+    void testAPreviewsPathComesFromTheRecordNotThePosition();
+    /// The Start screen's entry for a notebook whose page-1 preview is gone heals when the notebook
+    /// is opened: the repair names the page, the ask makes the picture, and the entry reads the
+    /// record's name rather than a guess -- even when a file with the guessed name is sitting there.
+    void testAStartScreenEntryHealsWhenItsNotebookIsOpened();
     /// Deleting a notebook: the open one is closed for real, its folder goes, and the recent list
     /// forgets it. A real fixture notebook, not a hand-made directory.
     void testDeletingANotebookClosesItAndRemovesItsFolder();
@@ -3903,6 +3911,118 @@ void PdfNavigatorIntegrationTest::testAPageThatRecordsNoPreviewIsGivenOneOnOpen(
     const QSizeF display = repaired.pages.at(0).displaySizePt();
     QVERIFY2(qAbs(qreal(written.width()) / written.height() - display.width() / display.height()) < 0.01,
              qPrintable(QStringLiteral("the page's preview is %1x%2, where displaySizePt() says %3x%4")
+                            .arg(written.width()).arg(written.height())
+                            .arg(display.width()).arg(display.height())));
+}
+
+/**
+ * A preview's file name is read off the page's own record, never guessed from its position.
+ *
+ * The Start screen's Recent Images column asked for "thumbs/p0001.png" -- the shape of the names
+ * this build happens to hand out -- and read the absent file as "this notebook has no preview",
+ * which is why a notebook whose page-1 preview had been dropped looked exactly like one that never
+ * had a picture. A preview's name travels with its page: a page moved into slot 1 keeps the file it
+ * was made under, and a page whose record names none is a different thing again. One place answers
+ * the question, and it answers it from the record.
+ */
+void PdfNavigatorIntegrationTest::testAPreviewsPathComesFromTheRecordNotThePosition()
+{
+    const QString project = m_dir.filePath(QStringLiteral("thumb-path-unit"));
+
+    /// A row that names its preview is where the entry looks: the record's own name, not the name a
+    /// page sitting in that position would have been given.
+    PdfPageRecord named;
+    named.thumbFile = QStringLiteral("thumbs/p0007.png");
+    QCOMPARE(PdfPageNavigator::thumbnailPathFor(project, named),
+             QDir(project).filePath(QStringLiteral("thumbs/p0007.png")));
+    QVERIFY2(PdfPageNavigator::thumbnailPathFor(project, named)
+                 != QDir(project).filePath(QStringLiteral("thumbs/p0001.png")),
+             "the path is still guessed from the page's position");
+
+    /// And a row that names none has NO path: an empty name means "no preview yet", and it is not
+    /// the project directory -- joining it there is what made a missing picture look present.
+    PdfPageRecord nameless;
+    QVERIFY2(PdfPageNavigator::thumbnailPathFor(project, nameless).isEmpty(),
+             "a page that records no preview was given a path anyway");
+    QVERIFY2(!PdfPageNavigator::thumbnailPathFor(project, nameless).startsWith(project),
+             "an empty preview name was joined onto the project directory");
+
+    /// And nothing to join onto is nothing, too.
+    QVERIFY(PdfPageNavigator::thumbnailPathFor(QString(), named).isEmpty());
+}
+
+/**
+ * The Start screen's entry for a notebook whose page-1 preview is gone heals when it is opened.
+ *
+ * This is the device's split: one notebook's page 1 recorded no preview at all (the name went with
+ * the picture), so Recent Images had nothing to show and fell back to the folder icon, while a
+ * notebook that still had its file showed a page. Opening the notebook heals the NAME -- the
+ * adoption repair settles it, on disk as well as in memory -- and the ask, bounded to the one page
+ * the entry shows, turns that name into the picture. What the entry must NOT do is look for a name
+ * it guessed: the test writes a decoy at the position-derived name, and the record names no such
+ * file, so an entry that shows the decoy is showing a page the notebook does not describe.
+ */
+void PdfNavigatorIntegrationTest::testAStartScreenEntryHealsWhenItsNotebookIsOpened()
+{
+    const QString project = m_dir.filePath(QStringLiteral("start-screen-heal"));
+
+    /// One page at a time: this is about one page's picture.
+    navigator()->setScope(1);
+
+    PopplerRenderBackend backend;
+    PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this test needs could not be made");
+    QVERIFY(manifest.pages.size() >= 2);
+
+    /// The shape the device is in: page 1 records no preview at all.
+    manifest.pages[0].thumbFile.clear();
+    QString why;
+    QVERIFY2(manifest.writeTo(PdfSession::manifestPath(project), &why), qPrintable(why));
+
+    /// The decoy: a picture at the name a position-based reader would guess. A reader that guesses
+    /// finds it and shows it -- a picture of a page whose record names nothing -- so finding it here
+    /// is the failure, not the fix.
+    const QString decoy = QDir(project).filePath(QStringLiteral("thumbs/p0001.png"));
+    QVERIFY(QDir().mkpath(QFileInfo(decoy).absolutePath()));
+    QImage picture(180, 256, QImage::Format_ARGB32_Premultiplied);
+    picture.fill(Qt::white);
+    QVERIFY2(picture.save(decoy, "PNG"), qPrintable(decoy));
+
+    /// What the Start screen reads before the notebook is opened: no name, so no picture. The
+    /// folder icon is the honest answer here -- decoy and all.
+    QVERIFY2(PdfPageNavigator::thumbnailPathFor(project, manifest.pages.at(0)).isEmpty(),
+             "the entry found a preview for a page that records none");
+
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+
+    /// The open heals the name, and it is not the guessed one.
+    const PdfPageRecord healed = navigator()->manifest().pages.at(0);
+    QVERIFY2(!healed.thumbFile.isEmpty(), "opening the notebook gave page 1 no preview name");
+    QVERIFY2(healed.thumbFile != QStringLiteral("thumbs/p0001.png"),
+             "the repair named the page's preview after the page's position");
+
+    const QString healedPath = PdfPageNavigator::thumbnailPathFor(project, healed);
+    QVERIFY2(!healedPath.isEmpty(), "the healed name has no path");
+    QVERIFY2(healedPath != decoy, "the entry would show the decoy the record does not name");
+
+    /// On disk as well: the entry reads the manifest, not the navigator's memory.
+    const PdfSessionManifest onDisk =
+        PdfSessionManifest::readFrom(PdfSession::manifestPath(project), &why);
+    QVERIFY2(onDisk.isValid(), qPrintable(why));
+    QCOMPARE(onDisk.pages.at(0).thumbFile, healed.thumbFile);
+
+    /// And the ask -- what the welcome page makes for the open notebook -- turns that name into the
+    /// picture the entry shows, at the page's own shape.
+    QVERIFY2(!QFileInfo::exists(healedPath), qPrintable(healedPath));
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(healedPath), 30000);
+
+    const QImage written(healedPath);
+    QVERIFY2(!written.isNull(), qPrintable(healedPath));
+    const QSizeF display = healed.displaySizePt();
+    QVERIFY2(qAbs(qreal(written.width()) / written.height() - display.width() / display.height()) < 0.01,
+             qPrintable(QStringLiteral("the entry's picture is %1x%2, where displaySizePt() says %3x%4")
                             .arg(written.width()).arg(written.height())
                             .arg(display.width()).arg(display.height())));
 }
