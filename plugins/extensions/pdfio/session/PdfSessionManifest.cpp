@@ -15,6 +15,7 @@
 #include <QJsonParseError>
 #include <QSaveFile>
 #include <QStringList>
+#include <QtMath>
 
 namespace {
 
@@ -25,16 +26,17 @@ bool &failBeforeCommitForTests()
     return fail;
 }
 
-/// The value a rotation normalizes to: 450 is 90, -90 is 270.
-int normalizedQuarterTurn(int degrees)
+/// The value a rotation normalizes to: 450 is 90, -90 is 270, 397 is 37.
+int normalizedTurn(int degrees)
 {
     return ((degrees % 360) + 360) % 360;
 }
 
-/// Whether \a degrees is one of the four turns this manifest accepts.
-bool isQuarterTurn(int degrees)
+/// Whether \a degrees is the normalized form of an angle this manifest accepts: any whole degree, so
+/// that a page can be turned by an amount that is not a right angle.
+bool isTurn(int degrees)
 {
-    return degrees == 0 || degrees == 90 || degrees == 180 || degrees == 270;
+    return degrees >= 0 && degrees < 360;
 }
 
 /// The highest number a "pages/pNNNN.kra" name in \a pages uses, or 0 for none. The names
@@ -132,11 +134,24 @@ QString PdfSessionManifest::displayName() const
 
 QSizeF PdfPageRecord::displaySizePt() const
 {
-    /// A quarter turn swaps the sheet's sides, which is what the reader sees; sizePt stays what
-    /// the file declares so the record survives a renderer change.
-    return (extraRotation == 90 || extraRotation == 270)
-        ? QSizeF(sizePt.height(), sizePt.width())
-        : sizePt;
+    /// A right angle swaps the sheet's sides exactly, and that is worth keeping exact: the strip
+    /// layout, the page image, the artifact and the exporter all compare sizes, and a quarter turn
+    /// that came back as 595.0000000000001 would not match the page it describes. sizePt itself
+    /// stays what the file declares, so the record survives a renderer change.
+    if (extraRotation == 0 || extraRotation == 180) {
+        return sizePt;
+    }
+    if (extraRotation == 90 || extraRotation == 270) {
+        return QSizeF(sizePt.height(), sizePt.width());
+    }
+
+    /// Any other angle shows the whole sheet inside the rectangle that holds it when it is turned,
+    /// which is the rectangle the renderer turns the paper into and the artifact is saved in.
+    const qreal radians = qDegreesToRadians(qreal(extraRotation));
+    const qreal cosine = qAbs(qCos(radians));
+    const qreal sine = qAbs(qSin(radians));
+    return QSizeF(sizePt.width() * cosine + sizePt.height() * sine,
+                  sizePt.width() * sine + sizePt.height() * cosine);
 }
 
 int PdfSessionManifest::sourceCount() const
@@ -282,8 +297,9 @@ bool PdfSessionManifest::isValid(QString *why) const
                           .arg(page.index + 1).arg(page.source));
             return false;
         }
-        if (!isQuarterTurn(page.extraRotation)) {
-            fail(why, QStringLiteral("page %1 has an extra rotation of %2 degrees, which is not a quarter turn")
+        if (!isTurn(page.extraRotation)) {
+            fail(why, QStringLiteral("page %1 has an extra rotation of %2 degrees, which is not an angle "
+                                     "between 0 and 359")
                           .arg(page.index + 1).arg(page.extraRotation));
             return false;
         }
@@ -421,7 +437,7 @@ PdfSessionManifest PdfSessionManifest::fromJson(const QJsonObject &object, QStri
         page.thumbFile = pageObject.value(QStringLiteral("thumb")).toString();
         page.generation = pageObject.value(QStringLiteral("generation")).toInt();
         page.source = pageObject.value(QStringLiteral("source")).toInt();
-        page.extraRotation = normalizedQuarterTurn(pageObject.value(QStringLiteral("extraRotation")).toInt());
+        page.extraRotation = normalizedTurn(pageObject.value(QStringLiteral("extraRotation")).toInt());
         manifest.pages.append(page);
     }
 

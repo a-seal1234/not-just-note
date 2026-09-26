@@ -56,7 +56,7 @@ public:
 
     /**
      * \a page's page inside its source, rendered at \a dpi and turned by the notebook's own
-     * quarter turn: what the reader sees, which is what the paper under the ink has to be.
+     * rotation: what the reader sees, which is what the paper under the ink has to be.
      */
     QImage renderPage(const PdfSessionManifest &manifest, const QString &projectDir,
                       int page, qreal dpi, QString *why = nullptr);

@@ -44,7 +44,7 @@ class PdfNotebookOps
 {
 public:
     /**
-     * Turns the artifact at the first path into the second, by the given quarter turn.
+     * Turns the artifact at the first path into the second, by the given angle.
      *
      * PdfPageRotator::rotateInto is what the plugin passes. It is a parameter rather than a call so
      * that the operations here stay free of Krita: the engine decides WHAT is turned, when and in
@@ -117,8 +117,9 @@ public:
     static QString sourceFileNameFor(const QString &pdfPath);
 
     /**
-     * Turns \a count pages starting at \a first by \a degrees, which has to be a quarter turn
-     * (90, 180 or 270; a negative value is the same turn the other way, normalized).
+     * Turns \a count pages starting at \a first by \a degrees: any angle, normalized, and a
+     * negative value is the same turn the other way. A right angle swaps the sheet's sides; any
+     * other angle leaves the page inside the rectangle that holds the turned sheet.
      *
      * The paper is turned by the manifest -- the record's extraRotation, and the size the reader
      * sees follows from displaySizePt() -- and the ink is turned by the artifact: \a rotator turns

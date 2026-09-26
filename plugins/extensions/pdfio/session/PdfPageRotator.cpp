@@ -6,6 +6,8 @@
 
 #include "session/PdfPageRotator.h"
 
+#include <QtMath>
+
 #include "session/PdfInkLoader.h"
 #include "session/PdfPageSaver.h"
 
@@ -99,10 +101,30 @@ void removeDestination(const QString &destinationKra)
 
 } // namespace
 
-bool PdfPageRotator::isQuarterTurn(int degrees)
+bool PdfPageRotator::isRightAngle(int degrees)
 {
     const int turn = ((degrees % 360) + 360) % 360;
-    return turn == 90 || turn == 180 || turn == 270;
+    return turn == 0 || turn == 90 || turn == 180 || turn == 270;
+}
+
+/// The bounds a \a size rectangle has once it is turned by \a degrees. The same arithmetic as
+/// PdfPageRecord::displaySizePt(), in pixels rather than points, because this is what the turned
+/// artifact has to measure for its ink to be lying on the page it was drawn on.
+QSize turnedSizeOf(const QSize &size, int degrees)
+{
+    const int turn = ((degrees % 360) + 360) % 360;
+    if (turn == 0 || turn == 180) {
+        return size;
+    }
+    if (turn == 90 || turn == 270) {
+        return QSize(size.height(), size.width());
+    }
+
+    const qreal radians = qDegreesToRadians(qreal(turn));
+    const qreal cosine = qAbs(qCos(radians));
+    const qreal sine = qAbs(qSin(radians));
+    return QSize(qRound(size.width() * cosine + size.height() * sine),
+                 qRound(size.width() * sine + size.height() * cosine));
 }
 
 bool PdfPageRotator::rotateInto(const QString &sourceKra, const QString &destinationKra,
@@ -112,11 +134,6 @@ bool PdfPageRotator::rotateInto(const QString &sourceKra, const QString &destina
         /// A page that was never drawn on has no artifact: nothing to turn, and nothing to say.
         return true;
     }
-    if (!isQuarterTurn(degrees)) {
-        fail(why, QStringLiteral("%1 degrees is not a quarter turn").arg(degrees));
-        return false;
-    }
-
     const QSize pageSize = PdfInkLoader::artifactSize(sourceKra, why);
     if (pageSize.isEmpty()) {
         fail(why, QStringLiteral("the artifact %1 has no page in it").arg(sourceKra));
@@ -157,13 +174,21 @@ bool PdfPageRotator::rotateInto(const QString &sourceKra, const QString &destina
     image->rotateImage(degrees * M_PI / 180.0);
     image->waitForDone();
 
+    /// The turned artifact has to measure what the page says it measures, or the ink is no longer
+    /// lying on the paper it was drawn on. Compared against the shape the turn implies rather than
+    /// against the size it started at: a square page turned a right angle keeps its size, which is
+    /// correct, and was refused as "a turn that did not happen" while a quarter turn was the only
+    /// turn there was.
     const QSize turned = image->bounds().size();
-    if (turned.isEmpty() || turned == pageSize) {
-        /// A quarter turn of a page that is not square changes its shape. A size that came back the
-        /// same is a turn that did not happen, and writing the artifact anyway would leave the paper
-        /// turned under upright ink.
-        fail(why, QStringLiteral("turning %1 by %2 degrees left it %3x%4, the size it already had")
-                      .arg(sourceKra).arg(degrees).arg(turned.width()).arg(turned.height()));
+    const QSize expected = turnedSizeOf(pageSize, degrees);
+    const auto closeEnough = [](int a, int b) { return qAbs(a - b) <= 1; };
+    if (turned.isEmpty() || !closeEnough(turned.width(), expected.width())
+        || !closeEnough(turned.height(), expected.height())) {
+        fail(why, QStringLiteral("turning %1 by %2 degrees left it %3x%4, where the page's own shape "
+                                 "says %5x%6")
+                      .arg(sourceKra).arg(degrees)
+                      .arg(turned.width()).arg(turned.height())
+                      .arg(expected.width()).arg(expected.height()));
         return false;
     }
 

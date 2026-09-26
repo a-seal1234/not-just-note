@@ -593,13 +593,33 @@ void PdfSessionTest::testDisplaySizeFollowsTheNotebooksOwnRotation()
     /// would drift and the record would stop surviving a renderer change.
     QCOMPARE(page.sizePt, QSizeF(595, 842));
 
-    /// Only quarter turns are legal: anything else is a manifest this code refuses rather than a
-    /// size it guesses.
+    /// An angle that is not a right angle shows the whole sheet inside the rectangle that holds it
+    /// once it is turned: 45 degrees of a 595x842 sheet is the square that just contains it, to the
+    /// nearest point. It is bigger than the page in both directions, which is what "the page grew"
+    /// means and is the price of setting a sheet down at an angle.
+    page.extraRotation = 45;
+    const QSizeF atAnAngle = page.displaySizePt();
+    QCOMPARE(qRound(atAnAngle.width()), 1016);
+    QCOMPARE(qRound(atAnAngle.height()), 1016);
+    QVERIFY(atAnAngle.width() > page.sizePt.width() && atAnAngle.height() > page.sizePt.height());
+
+    /// Any angle in range is a manifest this code accepts -- a page can be set down at 37 degrees --
+    /// and one it records survives being written and read back, which is the whole point of storing
+    /// an angle rather than turning the paper and forgetting how.
     PdfSessionManifest manifest = baseManifest();
-    manifest.pages[0].extraRotation = 45;
+    manifest.pages[0].extraRotation = 37;
     QString why;
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    const PdfSessionManifest read = PdfSessionManifest::fromJson(manifest.toJson(), &why);
+    QVERIFY2(read.isValid(&why), qPrintable(why));
+    QCOMPARE(read.pages.at(0).extraRotation, 37);
+
+    /// A value that is not an angle at all is still refused: this is the boundary the record has to
+    /// stay inside, and it is checked here rather than trusted from wherever the number came from.
+    manifest.pages[0].extraRotation = 360;
     QVERIFY(!manifest.isValid(&why));
-    QVERIFY2(why.contains(QStringLiteral("quarter turn")), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("0 and 359")), qPrintable(why));
 }
 
 /**

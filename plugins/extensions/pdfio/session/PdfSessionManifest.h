@@ -63,16 +63,21 @@ struct PdfPageRecord {
     int source = 0;
 
     /**
-     * A quarter turn the NOTEBOOK applies on top of the source's own /Rotate: 0, 90, 180 or 270.
+     * A turn the NOTEBOOK applies on top of the source's own /Rotate, in whole degrees: 0 to 359.
      *
      * Kept apart from \c rotation, which is what the file declares: the source is immutable, so a
      * page the user rotates is a turn this manifest records rather than one the PDF is rewritten
      * with. \c sizePt stays the source's displayed size and displaySizePt() is what the user sees,
      * so the two cannot drift apart.
+     *
+     * Any angle is allowed, not only a right angle: a page can be set down at 37 degrees. What that
+     * costs is a bigger page -- see displaySizePt() -- because the sheet is shown inside the
+     * rectangle that holds it once it is turned.
      */
     int extraRotation = 0;
 
-    /// The size the user sees: sizePt with extraRotation applied.
+    /// The size the user sees: sizePt with extraRotation applied. A right angle swaps the sides
+    /// exactly; any other angle gives the rectangle the turned sheet fits in.
     QSizeF displaySizePt() const;
 };
 

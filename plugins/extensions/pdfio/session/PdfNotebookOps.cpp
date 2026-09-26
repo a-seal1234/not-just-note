@@ -944,8 +944,8 @@ PdfNotebookOps::Outcome PdfNotebookOps::rotatePages(const QString &projectDir, i
     /// the angle the artifact is turned by. A left turn of 90 degrees is a right turn of 270, with
     /// the same result.
     const int turn = ((degrees % 360) + 360) % 360;
-    if (turn != 90 && turn != 180 && turn != 270) {
-        return refused(QStringLiteral("%1 degrees is not a quarter turn").arg(degrees));
+    if (turn == 0) {
+        return refused(QStringLiteral("that is no turn at all"));
     }
     if (currentPage < 0 || currentPage >= pages) {
         currentPage = first;
@@ -1255,11 +1255,6 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
         const int turn = ((page.extraRotation - from) % 360 + 360) % 360;
         if (turn == 0) {
             continue;
-        }
-        if (turn != 90 && turn != 180 && turn != 270) {
-            return refused(QStringLiteral("page %1 would be turned by %2 degrees, which is not a "
-                                          "quarter turn")
-                               .arg(page.kraFile).arg(turn));
         }
         Plan::Rotation rotation;
         rotation.kraFile = page.kraFile;

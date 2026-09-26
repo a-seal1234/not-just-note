@@ -12,8 +12,8 @@
 /**
  * Turns a page artifact on disk, so that the ink is turned with the paper.
  *
- * Rotating a page is a quarter turn the notebook records (PdfPageRecord::extraRotation), and the
- * paper comes back turned because a render is turned before it is drawn. The ink does not: it lives
+ * Rotating a page is a turn the notebook records (PdfPageRecord::extraRotation), and the paper
+ * comes back turned because a render is turned before it is drawn. The ink does not: it lives
  * in the artifact as pixels, and a page whose paper turned while its ink did not is a page whose
  * notes are suddenly on the wrong lines. So the artifact's layers are turned by the same angle,
  * about the same centre.
@@ -41,8 +41,14 @@ public:
     static bool rotateInto(const QString &sourceKra, const QString &destinationKra, int degrees,
                            QString *why = nullptr);
 
-    /// Whether \a degrees is one of the three turns a page can have: 90, 180 or 270 (or -90/-180/-270).
-    static bool isQuarterTurn(int degrees);
+    /**
+     * Whether \a degrees is a whole number of right angles: 90, 180 or 270 (or -90/-180/-270, and 0).
+     *
+     * Not a restriction -- any angle can be turned -- but the difference between the two kinds of
+     * turn is real: a right angle is exactly a transpose of the pixels, while any other angle has to
+     * be resampled, and the paper is turned with the filter that choice implies.
+     */
+    static bool isRightAngle(int degrees);
 
 private:
     PdfPageRotator() = delete;
