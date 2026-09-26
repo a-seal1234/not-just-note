@@ -32,9 +32,10 @@ class PdfRowDropIndicator;
 /**
  * \a source prepared for a widget that draws it into \a logicalSize at \a devicePixelRatio.
  *
- * A saved preview is small: an A4 page's is 180x256 pixels. A card is 46x62 LOGICAL pixels, which on
- * a 2-2.5x tablet is 115x155 DEVICE pixels -- and handing Qt the 180-pixel picture for a 46-pixel
- * box, to be stretched by the screen's ratio in the painter, is what made the thumbnails look
+ * A saved preview is fitted into a 1152 box: an A4 page's is 814x1152 pixels. A card is 46x62 LOGICAL
+ * pixels, which on a 2-2.5x tablet is 115x155 DEVICE pixels -- and handing Qt a picture smaller than
+ * the box it is drawn into, to be stretched by the screen's ratio in the painter, is what made the
+ * thumbnails look
  * pixelated. The scale is done here instead, to the device size, and the result is TAGGED with the
  * ratio, so Qt draws the pixels it was given, one for one, rather than stretching them again.
  *

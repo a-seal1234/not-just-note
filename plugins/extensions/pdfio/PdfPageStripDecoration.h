@@ -7,7 +7,11 @@
 #ifndef PDFPAGESTRIPDECORATION_H
 #define PDFPAGESTRIPDECORATION_H
 
+#include <QDateTime>
+#include <QHash>
+#include <QPixmap>
 #include <QPointer>
+#include <QString>
 
 #include <kis_canvas_decoration.h>
 #include <kis_types.h>
@@ -23,6 +27,9 @@ class KisView;
  * the image without breaking the one invariant everything else rests on -- that the image is the
  * page. Painted in widget space over the canvas, they cost a scaled pixmap each instead of a
  * document, and the areas they occupy are not part of the image, so they cannot be drawn on.
+ *
+ * Each neighbour's pixmap is decoded once and kept until the file it came from changes. This is a
+ * paint callback, so reading the PNG in it re-decoded up to 3.7 MB per neighbour per repaint.
  *
  * The thumbnails are the ones written when a page is saved. The page that has never been drawn on
  * has none yet, and shows as an empty sheet.
@@ -54,6 +61,36 @@ private:
     /// How much of the neighbouring page is shown before the strip is cut off. A page taller than
     /// this would otherwise push the strip past the widget and be mostly wasted.
     static constexpr int MaxNeighbourHeight = 1400;
+
+    /// One neighbour's decoded preview, and what the file looked like when it was decoded.
+    struct CachedPreview {
+        QPixmap pixmap;
+        QDateTime modified;
+        qint64 bytes = 0;
+    };
+
+    /**
+     * The preview at \a path, decoded only when it is not here already or the file has changed.
+     *
+     * drawDecoration() is a paint callback: it used to call QPixmap(path) for both neighbours on
+     * every repaint of the canvas, which is 184 KB of PNG decode per neighbour per frame at the old
+     * preview size and about 3.7 MB at the new one, on a tablet. What is left per frame is one stat
+     * per neighbour; the decode happens when the path changes, or when the file's modification time
+     * or size does. A preview rewritten within the same second and with a byte-identical size is
+     * served from the cache for that frame -- the filesystem's timestamp resolution is the limit
+     * here, and this strip is a hint around the open page rather than the page itself.
+     */
+    QPixmap previewFor(const QString &path);
+
+    /**
+     * The previews of the pages beside this one, keyed by path.
+     *
+     * The decoration draws exactly two neighbours, so this is pruned to the ones the last paint
+     * actually drew: a tablet holds two decoded pages and not the whole notebook's worth. The
+     * decoration itself is built once per document (PdfPageNavigator::showImage), so a notebook
+     * change is a new decoration with an empty map.
+     */
+    QHash<QString, CachedPreview> m_previews;
 };
 
 #endif // PDFPAGESTRIPDECORATION_H

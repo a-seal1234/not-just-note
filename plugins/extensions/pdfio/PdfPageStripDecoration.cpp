@@ -10,6 +10,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QSet>
 #include <QWidget>
 #include <QPainter>
 #include <QPixmap>
@@ -74,6 +75,9 @@ void PdfPageStripDecoration::drawDecoration(QPainter &gc,
 
     const QDir project(navigator->projectDir());
 
+    /// Which previews this paint actually used, so the cache can be pruned to them at the end.
+    QSet<QString> drawnPreviews;
+
     for (int direction : { -1, 1 }) {
         const int other = index + direction;
         if (other < 0 || other >= manifest.pages.size()) {
@@ -101,7 +105,8 @@ void PdfPageStripDecoration::drawDecoration(QPainter &gc,
         }
 
         const QString thumbPath = project.filePath(manifest.pages.at(other).thumbFile);
-        const QPixmap thumbnail(thumbPath);
+        const QPixmap thumbnail = previewFor(thumbPath);
+        drawnPreviews.insert(thumbPath);
 
         if (thumbnail.isNull()) {
             /// Never drawn on, so there is nothing to show: an empty sheet, so the strip still
@@ -119,4 +124,36 @@ void PdfPageStripDecoration::drawDecoration(QPainter &gc,
                     Qt::AlignTop | Qt::AlignLeft,
                     QStringLiteral("Page %1").arg(other + 1));
     }
+
+    /// And forget the previews of the pages that are no longer beside this one. The decoration
+    /// draws two neighbours, so anything else held here is a decoded page a tablet should not be
+    /// carrying: turning through a notebook would otherwise keep two more per page.
+    for (auto it = m_previews.begin(); it != m_previews.end();) {
+        if (drawnPreviews.contains(it.key())) {
+            ++it;
+        } else {
+            it = m_previews.erase(it);
+        }
+    }
+}
+
+QPixmap PdfPageStripDecoration::previewFor(const QString &path)
+{
+    const QFileInfo info(path);
+    const QDateTime modified = info.lastModified();
+    const qint64 bytes = info.size();
+
+    const auto known = m_previews.constFind(path);
+    if (known != m_previews.constEnd() && known->modified == modified && known->bytes == bytes) {
+        return known->pixmap;
+    }
+
+    CachedPreview entry;
+    /// A null pixmap is cached too, for a page that has never been drawn on: the caller draws an
+    /// empty sheet for it, and re-reading the missing file on every frame would buy nothing.
+    entry.pixmap = QPixmap(path);
+    entry.modified = modified;
+    entry.bytes = bytes;
+    m_previews.insert(path, entry);
+    return entry.pixmap;
 }

@@ -246,13 +246,30 @@ constexpr int ReloadSettleMs = 700;
 /// The gap the strip decoration leaves between pages, in widget pixels.
 constexpr qreal GapWidgetPixels = 16;
 
-/// How wide a generated thumbnail is. The docker shows it smaller still; the extra is there so it
-/// stays sharp when the interface is scaled up.
-constexpr int ThumbnailPixels = 256;
+/// The box a saved preview is fitted into, in pixels -- an A4 page comes out 814x1152.
+///
+/// It was 256, which is 180x256 for A4, and the tablet draws a page card up to 320x452 LOGICAL px
+/// on a 3K panel, a device ratio of 2-2.5: up to 800x1130 device pixels, so the 180x256 file was
+/// stretched 4.4x and the user reported "thumbnail too pixellated". 1152 covers that need with a
+/// little margin, and it is a multiple of 64 for the texture caches.
+///
+/// The cost is small, and measured rather than guessed: a page of text saved at 814x1152 is 24.6 KB
+/// against 11.1 KB at 181x256 (Qt PNG, a rendered page with headings and 45 lines), so an 18 page
+/// notebook pays about 230 KB more in total. The render before it is NOT the bottleneck -- it is at
+/// 96 dpi or more -- so this only stops throwing the pixels away at the last step.
+constexpr int ThumbnailPixels = 1152;
 
 /// The coarsest a page is rendered at on its way to a thumbnail. Below this, text stops being
 /// recognisable and the thumbnail stops being useful for choosing a page.
 constexpr qreal ThumbnailRenderDpi = 96;
+
+/// Whether a roll should behave as if its document went away after the write phase. Set by a test
+/// only; see PdfPageNavigator::setDocumentGoneAfterWritesForTests().
+bool &documentGoneAfterWritesForTests()
+{
+    static bool gone = false;
+    return gone;
+}
 
 } // namespace
 
@@ -602,7 +619,24 @@ void PdfPageNavigator::makeOneThumbnail()
     }
 
     const int index = m_thumbnailQueue.takeFirst();
-    if (index < 0 || index >= m_manifest.pages.size()) {
+    if (index < 0) {
+        return;
+    }
+
+    /// The manifest the notebook is on DISK, not the one held in memory.
+    ///
+    /// A turn is written to the manifest and to the artifact on disk before the navigator is
+    /// reloaded, and ensureThumbnail() goes on answering from the in-memory record until it is. A
+    /// preview generated in that window would show the page the wrong way up -- and, because
+    /// ensureThumbnail() returns early once the file exists, it would never be redone. Reading it
+    /// here is one small JSON file per generated preview; a manifest that cannot be read falls back
+    /// to the one we have rather than leaving the page with no preview at all.
+    PdfSessionManifest manifest =
+        PdfSessionManifest::readFrom(PdfSession::manifestPath(m_projectDir), nullptr);
+    if (!manifest.isValid()) {
+        manifest = m_manifest;
+    }
+    if (index >= manifest.pages.size()) {
         return;
     }
 
@@ -610,29 +644,62 @@ void PdfPageNavigator::makeOneThumbnail()
     /// whose source went away gets no thumbnail, which is the same answer the rest of the notebook
     /// gives, rather than a picture of whatever file happened to be first.
 
-    /// Rendered coarser than the page but never as coarse as the thumbnail's own pixel count
-    /// suggests. Asking for exactly 256 pixels of an A4 page means about 31 dpi, and text at 31 dpi
-    /// is a grey smear: the thumbnail was unreadable. Rendering at 96 and shrinking costs a
-    /// megapixel and looks like a page.
-    const PdfPageInfo info = m_sourceRenderers.pageInfo(m_manifest, m_projectDir, index, nullptr);
+    /// Rendered coarser than the page but never as coarse as the preview's own pixel count
+    /// suggests. Asking for exactly the preview's pixels of an A4 page means about 31 dpi, and text
+    /// at 31 dpi is a grey smear: the thumbnail was unreadable. So the render is aimed at the
+    /// preview box between a floor and a ceiling: 96 dpi is the coarsest a page is ever rendered at
+    /// on its way to a preview and 200 the finest, and a BIGGER preview raises the dpi between them
+    /// rather than lowering it.
+    const PdfPageInfo info = m_sourceRenderers.pageInfo(manifest, m_projectDir, index, nullptr);
     const qreal widthPt = qMax(qreal(1), info.sizePt.width());
     const qreal dpi = qBound(ThumbnailRenderDpi, ThumbnailPixels * 72.0 / widthPt, qreal(200));
 
-    const QImage page = m_sourceRenderers.renderPage(m_manifest, m_projectDir, index, dpi, nullptr);
+    const QImage page = m_sourceRenderers.renderPage(manifest, m_projectDir, index, dpi, nullptr);
     if (page.isNull()) {
         return;
     }
 
-    const QImage thumbnail = page.scaled(ThumbnailPixels, ThumbnailPixels,
-                                         Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    const QString path = QDir(m_projectDir).filePath(m_manifest.pages.at(index).thumbFile);
+    /// The page's ink, which the render alone does not have.
+    ///
+    /// The preview used to be the source render and nothing else, so the moment one was GENERATED
+    /// rather than written by a save -- which is every page a turn has just dropped -- a page that
+    /// had been drawn on came back as blank paper. The artifact holds the ink page-local at
+    /// whatever dpi it was written, while the render is at this preview's dpi, so each layer is
+    /// scaled onto the render. Read from the PNG sidecar, which opens no document at all; a page
+    /// with no artifact has no ink, and nothing is composited.
+    QImage composed = page;
+    const QString kraPath = QDir(m_projectDir).filePath(manifest.pages.at(index).kraFile);
+    const QList<QPair<QString, QImage>> ink =
+        PdfInkLoader::loadInkLayersFromSidecar(kraPath, nullptr);
+    if (!ink.isEmpty()) {
+        QPainter painter(&composed);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        for (const QPair<QString, QImage> &layer : ink) {
+            if (layer.second.isNull()) {
+                continue;
+            }
+            painter.drawImage(QRect(QPoint(0, 0), composed.size()), layer.second);
+        }
+    }
+
+    /// Fitted into the preview box, and never blown up: a page whose render is smaller than the box
+    /// -- a narrow sheet the 200 dpi ceiling caps below it -- is saved at the pixels it really has
+    /// rather than at a size invented for it.
+    const QSize box = composed.size().scaled(QSize(ThumbnailPixels, ThumbnailPixels),
+                                             Qt::KeepAspectRatio);
+    const QImage thumbnail = (composed.width() > box.width() || composed.height() > box.height())
+        ? composed.scaled(box, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+        : composed;
+
+    const QString path = QDir(m_projectDir).filePath(manifest.pages.at(index).thumbFile);
     QDir().mkpath(QFileInfo(path).absolutePath());
     if (!thumbnail.save(path, "PNG")) {
         return;
     }
 
-    say(QStringLiteral("thumbnail for page %1 written (%2x%3)")
-            .arg(index + 1).arg(thumbnail.width()).arg(thumbnail.height()));
+    say(QStringLiteral("thumbnail for page %1 written (%2x%3, rendered at %4 dpi%5)")
+            .arg(index + 1).arg(thumbnail.width()).arg(thumbnail.height()).arg(dpi)
+            .arg(ink.isEmpty() ? QString() : QStringLiteral(", ink included")));
     Q_EMIT thumbnailReady(index);
 }
 
@@ -931,6 +998,11 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     return showImage(strip.image, strip.activeInkLayer, index, strip.layout, why);
 }
 
+void PdfPageNavigator::setDocumentGoneAfterWritesForTests(bool gone)
+{
+    documentGoneAfterWritesForTests() = gone;
+}
+
 bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool keepTheReadingPage)
 {
     /// A roll that does not get far must not leave the canvas anchored to a point from a window
@@ -1003,9 +1075,21 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     const bool wasSaving = m_savingPages;
     m_savingPages = true;
 
-    const auto stripIsClean = [this]() {
+    /// The document this roll is for, and the window it is writing, both taken BEFORE the nested
+    /// loops below.
+    ///
+    /// A reload queued behind a notebook change runs inside them, and it replaces the document and
+    /// clears the window: iterating m_stripPages while something inside a save clears it would be
+    /// a range-for over a list that changed under it, and the roll would go on to repaint the new
+    /// document with the old window's rectangles. The copy makes the loop write the window this
+    /// roll was started for, and the guard after drainWrites() refuses if the document is not that
+    /// one any more.
+    KisDocument *const documentThisRollIsFor = m_document;
+    const QList<int> pagesToWrite = m_stripPages;
+
+    const auto stripIsClean = [this, &pagesToWrite]() {
         for (int page : m_window.dirtyPages()) {
-            if (m_stripPages.contains(page)) {
+            if (pagesToWrite.contains(page)) {
                 return false;
             }
         }
@@ -1015,7 +1099,7 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     int saved = 0;
     constexpr int MaxSavePasses = 3;
     for (int pass = 1;; ++pass) {
-        for (int page : m_stripPages) {
+        for (int page : pagesToWrite) {
             if (page < 0) {
                 continue;
             }
@@ -1049,6 +1133,30 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     /// queued behind the ones just made would have those reads waiting on a file it has not
     /// finished yet.
     drainWrites(nullptr);
+
+    /// The document is asked about again, because everything from here down reads it.
+    ///
+    /// The write phase above runs nested event loops -- one inside every page write, and one inside
+    /// drainWrites() -- and anything the application queued runs inside them. A reload queued
+    /// behind a notebook change is exactly that, and it takes this document away: m_document is a
+    /// QPointer and goes NULL the moment its document is destroyed, and a reload REPLACES it with
+    /// another, which is just as bad, because the rest of this function would repaint the new
+    /// document with the old window's rectangles and then write this notebook's slot bookkeeping
+    /// over it. Either way the roll is not what should happen now: m_savingPages is given back,
+    /// the reason is said, and the window is left where it is. A refusal is an answer the callers
+    /// already know: the queued roll logs it and the follow carries on, and showPage() falls
+    /// through to building the strip.
+    ///
+    /// The test-only flag at the head reaches the same branch without the timing: it is the seam
+    /// that proves this refusal, and nothing in the plugin sets it.
+    if (documentGoneAfterWritesForTests() || m_document.data() != documentThisRollIsFor
+        || !m_document || !m_document->image()) {
+        m_savingPages = wasSaving;
+        fail(why, QStringLiteral("the document went away while the window was being written; "
+                                 "the strip is unchanged"));
+        say(QStringLiteral("strip: roll refused: the document is not the one this roll started for"));
+        return false;
+    }
 
     /// Phase two: redraw the WHOLE window from what was just written -- every slot, paper and
     /// ink alike, whether its page changed bands or not. Nothing on screen comes from before the
@@ -2368,7 +2476,7 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
         /// The picture is the page as it looks -- paper, ink and all -- in the page's own shape.
         /// No square canvas and no margins: a thumbnail is a small page, and the page it stands for
         /// is a portrait sheet of paper, not a square. The other renderer in this file has always
-        /// produced exactly this shape (measured on the tablet as 197x256 for A4).
+        /// produced exactly this shape (an A4 page comes out 814x1152 from the preview box above).
         const QImage thumb =
             projection->createThumbnailUncached(scaled.width(), scaled.height(), thumbArea);
         if (!thumb.isNull()) {

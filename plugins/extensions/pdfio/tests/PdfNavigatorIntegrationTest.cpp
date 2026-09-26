@@ -117,9 +117,16 @@ private Q_SLOTS:
     void testAPreviewIsPreparedForTheScreensDeviceRatio();
     /// The canvas asks the navigator for a fresh preview rather than stretching a small one.
     void testTheCanvasAsksTheNavigatorForAFreshPreview();
+    /// The generated preview itself: enough pixels for the screen that draws it, and the page's ink
+    /// in it rather than blank paper.
+    void testAGeneratedPreviewIsSavedBigEnoughForTheScreen();
+    void testAGeneratedPreviewCarriesTheInk();
     /// A window that holds a freely rotated page and one that does not, rolled between and back:
     /// the image is the same size by design, and part of the strip that was there used to stay.
     void testRollingBackToARotatedPageLeavesNoStripBehind();
+    /// A roll whose document goes away between its writes and its redraw refuses cleanly, which is
+    /// the state a reload landing inside the write phase's event loops reaches.
+    void testARollRefusesWhenItsDocumentGoesAway();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -2879,7 +2886,7 @@ void PdfNavigatorIntegrationTest::testADropOnTheSamePositionIsANoOp()
 /**
  * A preview is prepared for the screen, not for the file.
  *
- * The saved preview of an A4 page is 180x256 pixels; the card it goes into is 46x62 LOGICAL pixels,
+ * A preview a notebook already holds can be as small as 180x256 for A4; the card it goes into is 46x62 LOGICAL pixels,
  * which on a 2-2.5x tablet is 115x155 DEVICE pixels, and the canvas wants several times that again.
  * Handing Qt the file's size for the box and letting the painter stretch it by the screen's ratio is
  * what the user saw as pixelation. What is asserted here is the arithmetic of the fix at the ratios
@@ -2909,7 +2916,7 @@ void PdfNavigatorIntegrationTest::testAPreviewIsPreparedForTheScreensDeviceRatio
     QVERIFY(pdfioPreviewForDisplay(file, QSize(), 2.5).isNull());
 
     /// And now the screen's own two surfaces, which is where the numbers have to be real. The
-    /// preview on disk is the size a real one is: 180x256 for an A4 page.
+    /// preview on disk is a small one, of the kind an older notebook holds: 180x256 for an A4 page.
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
     const QString project = dir.filePath(QStringLiteral("dense-preview"));
@@ -2965,7 +2972,7 @@ void PdfNavigatorIntegrationTest::testAPreviewIsPreparedForTheScreensDeviceRatio
 /**
  * The canvas asks the navigator for a fresh preview instead of stretching a small one.
  *
- * The file a page's preview is saved in is small -- 180x256 for A4 -- and a 3K tablet's pane wants
+ * A page's preview file can be as small as the 180x256 an older notebook holds, and a 3K tablet's pane wants
  * several times those pixels. When the pane is about to draw at a size its row's preview cannot
  * fill, the page is asked for again rather than the small picture stretched. The ask has to go to
  * the navigator, and this is that: a notebook the navigator itself has open, its preview deleted, and
@@ -3005,6 +3012,227 @@ void PdfNavigatorIntegrationTest::testTheCanvasAsksTheNavigatorForAFreshPreview(
     const QImage written(preview);
     QVERIFY2(!written.isNull(), qPrintable(preview));
     QCOMPARE(pane.sourcePixels, written.size());
+}
+
+/**
+ * A generated preview is saved with enough pixels for the screen that draws it.
+ *
+ * The tablet's page card is up to 320x452 LOGICAL px and the panel runs at a device ratio of 2-2.5,
+ * so the card is drawn from up to 800x1130 DEVICE pixels. The file used to be fitted into a 256 box
+ * -- 180x256 for A4 -- and stretched 4.4x to fill that, which is the "thumbnail too pixellated" the
+ * user reported. It is now fitted into a 1152 box, and the render is aimed at the same number
+ * between its 96 dpi floor and its 200 dpi ceiling, so a bigger file does not mean a coarser page.
+ */
+void PdfNavigatorIntegrationTest::testAGeneratedPreviewIsSavedBigEnoughForTheScreen()
+{
+    QVERIFY(useNotebook(QStringLiteral("preview-size")));
+
+    const PdfSessionManifest manifest = navigator()->manifest();
+    QVERIFY2(!manifest.pages.at(0).thumbFile.isEmpty(), "the page records no preview name");
+    const QString preview = QDir(navigator()->projectDir()).filePath(manifest.pages.at(0).thumbFile);
+
+    /// The GENERATED path and only it: whatever was there is dropped, and nothing but the
+    /// navigator's own ask writes the file back.
+    QFile::remove(preview);
+    QVERIFY2(!QFileInfo::exists(preview), qPrintable(preview));
+
+    /// The FILE is what is waited for, not the signal. Opening the notebook also queued a preview
+    /// for the NEIGHBOURING page (showImage asks for index + 1), so thumbnailReady fires for page 2
+    /// about 40 ms after the open and quite possibly before page 1's file exists: a wait on any
+    /// signal returns on that one and reads a file that is not there yet.
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(preview), 30000);
+
+    const QImage written(preview);
+    QVERIFY2(!written.isNull(), qPrintable(preview));
+    qInfo("page 1's preview is %dx%d (%s bytes)", written.width(), written.height(),
+          qPrintable(QString::number(QFileInfo(preview).size())));
+
+    /// The worst card the tablet draws, in device pixels.
+    QVERIFY2(written.width() >= 800 && written.height() >= 1130,
+             qPrintable(QStringLiteral("the preview is %1x%2, too small for a 320x452 card at a 2.5 "
+                                       "ratio (800x1130 device pixels)")
+                            .arg(written.width()).arg(written.height())));
+
+    /// And it is the whole preview box, which it can only be because the render was not lowered to
+    /// get there: a 595 pt page saved 1152 px high was rendered at about 139 dpi, well above the
+    /// 96 dpi floor text needs to stay readable.
+    QCOMPARE(written.height(), 1152);
+}
+
+/**
+ * A generated preview carries the page's ink.
+ *
+ * Generating a preview rather than writing one from an open page is what happens to every page a
+ * turn has just dropped the preview of, and the generated one used to be the source render alone:
+ * a page that had been drawn on came back as blank paper, which in the panel and on the ops card is
+ * the page's identity. The ink is composited from the artifact's PNG sidecar, scaled from the
+ * artifact's own pixels onto the render's.
+ */
+void PdfNavigatorIntegrationTest::testAGeneratedPreviewCarriesTheInk()
+{
+    QVERIFY(useNotebook(QStringLiteral("preview-ink")));
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisPaintLayer *layer = inkLayer(document->image());
+    QVERIFY2(layer, "the page has no ink layer to draw on");
+
+    /// A block of a colour a page of black text cannot produce, so finding it in the preview is
+    /// finding the ink and not the paper's own printing.
+    const QRect mark(300, 300, 200, 200);
+    layer->paintDevice()->fill(mark, KoColor(QColor(255, 0, 0), document->image()->colorSpace()));
+    document->setModified(true);
+    Q_EMIT document->image()->sigImageModified();
+
+    /// Turning away writes the artifact -- and a preview of its own, from the open page. That one
+    /// is deleted below, so what is read back here is the GENERATED preview.
+    QString why;
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QVERIFY2(waitForInk(artifactFor(0)), qPrintable(artifactFor(0)));
+
+    const PdfSessionManifest manifest = navigator()->manifest();
+    const QString preview = QDir(navigator()->projectDir()).filePath(manifest.pages.at(0).thumbFile);
+    QFile::remove(preview);
+    QVERIFY2(!QFileInfo::exists(preview), qPrintable(preview));
+
+    /// The FILE is what is waited for, not the signal. Opening the notebook also queued a preview
+    /// for the NEIGHBOURING page (showImage asks for index + 1), so thumbnailReady fires for page 2
+    /// about 40 ms after the open and quite possibly before page 1's file exists: a wait on any
+    /// signal returns on that one and reads a file that is not there yet.
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(preview), 30000);
+
+    const QImage written(preview);
+    QVERIFY2(!written.isNull(), qPrintable(preview));
+
+    int red = 0;
+    QRect where;
+    for (int y = 0; y < written.height(); ++y) {
+        for (int x = 0; x < written.width(); ++x) {
+            const QColor at = written.pixelColor(x, y);
+            if (at.red() > 200 && at.green() < 60 && at.blue() < 60) {
+                ++red;
+                const QRect pixel(QPoint(x, y), QSize(1, 1));
+                where = where.isNull() ? pixel : where.united(pixel);
+            }
+        }
+    }
+
+    qInfo("the generated preview is %dx%d and carries %d red pixels, around %d,%d",
+          written.width(), written.height(), red, where.center().x(), where.center().y());
+
+    /// The block is about a hundredth of the page, so a few thousand preview pixels. A preview of
+    /// blank paper has none of them.
+    QVERIFY2(red > 3000, "the generated preview has no ink in it");
+    /// And it is where the page put it: the block is in the page's top left quarter.
+    QVERIFY2(where.center().x() < written.width() / 2 && where.center().y() < written.height() / 2,
+             "the ink came back in the wrong part of the page");
+}
+
+/**
+ * A roll whose document goes away between its writes and its redraw refuses, and refuses cleanly.
+ *
+ * The write phase runs nested event loops -- one inside every page write -- and a reload queued
+ * behind a notebook change runs inside them and takes the document away. This is the SIGSEGV from
+ * the real session: merge 50 pages into a 36 page notebook, scroll the strip, crash during a roll.
+ * m_document is a QPointer and goes null when its document is destroyed; a reload REPLACES it with
+ * another one, which is worse, because a null check alone would let the roll repaint the new
+ * document with the old window's rectangles and then write the new notebook's slot bookkeeping
+ * over it. The guard therefore compares the document with the one the roll started for.
+ *
+ * That state is reached in the real world only by timing no test can promise, so this reaches it
+ * through setDocumentGoneAfterWritesForTests(): the write phase runs for real and the guard fires
+ * where a reload would have left it.
+ */
+void PdfNavigatorIntegrationTest::testARollRefusesWhenItsDocumentGoesAway()
+{
+    /// A source long enough that a five page window has somewhere to roll to.
+    const QString usualFixture = m_fixture;
+    m_fixture = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(m_fixture), qPrintable(m_fixture));
+    QVERIFY(useNotebook(QStringLiteral("roll-gone"), 5));
+    m_fixture = usualFixture;
+
+    QVERIFY(navigator()->pageCount() >= 8);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *const document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisImageSP strip = document->image();
+    QVERIFY(strip);
+
+    /// The paper layers' names, in strip order, are what the window holds: a roll that moved
+    /// repaints and renames them, so their staying put is the window staying put.
+    const auto paperNames = [](const KisImageSP &image) {
+        QStringList names;
+        if (!image) {
+            return names;
+        }
+        for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+            const QString name = image->root()->at(i)->name();
+            if (name != QStringLiteral("Desk") && name != QStringLiteral("Ink")) {
+                names << name;
+            }
+        }
+        return names;
+    };
+    const QStringList before = paperNames(strip);
+    QCOMPARE(before.size(), 5);
+
+    /// Page 5 is already in the window, so asking for it activates its slot -- and it is the last
+    /// slot, so the screen queues a roll to re-centre the window. That queued roll is the one the
+    /// report crashed in.
+    QString why;
+    QVERIFY2(navigator()->showPage(4, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 4);
+
+    {
+        /// The seam, for this block only. Whatever happens below, the flag goes back: a test that
+        /// leaves it set would disarm the guard for every test after it.
+        struct DocumentGoneForTests {
+            DocumentGoneForTests() { PdfPageNavigator::setDocumentGoneAfterWritesForTests(true); }
+            ~DocumentGoneForTests() { PdfPageNavigator::setDocumentGoneAfterWritesForTests(false); }
+        } goneForTests;
+
+        /// The queued roll writes every page of the window first, and that is what makes the
+        /// artifacts appear; the guard then fires before a single pixel is repainted.
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(artifactFor(0)), 30000);
+
+        /// Generously longer than the drain and the guard that follow the last write. The waits
+        /// cannot make this pass by themselves: with the seam set the repaint cannot happen at all,
+        /// and with the seam broken the repaint renames the papers within this window and the
+        /// comparison below fails.
+        QTest::qWait(1500);
+
+        KisDocument *const stillOpen = navigator()->currentDocument();
+        QVERIFY2(stillOpen, "the roll took the document with it");
+        QVERIFY(stillOpen->image());
+        const QStringList after = paperNames(stillOpen->image());
+        QVERIFY2(after == before,
+                 qPrintable(QStringLiteral("the window moved: the strip holds papers [%1] where it "
+                                           "held [%2]")
+                                .arg(after.join(QStringLiteral(", ")),
+                                     before.join(QStringLiteral(", ")))));
+    }
+
+    /// The honest assertions: refused, still open, and the page where it was.
+    QVERIFY(navigator()->currentDocument());
+    QVERIFY(navigator()->currentDocument()->image());
+    QCOMPARE(navigator()->currentDocument(), document);
+    QCOMPARE(navigator()->currentIndex(), 4);
+
+    /// And the tab is closed the way the other tests that leave one open close it, with the queued
+    /// work drained on both sides of the close.
+    navigator()->currentDocument()->setModified(false);
+    navigator()->setScope(1);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
 }
 
 int main(int argc, char *argv[])

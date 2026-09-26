@@ -222,8 +222,8 @@ QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, 
  *
  * The picture is prepared for the pane at the screen's own device pixel ratio, so the pane is drawn
  * from the pixels it will put on the glass rather than from a small file stretched by the painter.
- * When that still asks for more pixels than the row's preview holds -- a saved preview is 180x256
- * for an A4 page, and a 3K tablet's pane is several times that -- the widget says so through \c
+ * When that still asks for more pixels than the row's preview holds -- a saved preview is fitted into
+ * a 1152 box, and a 3K tablet's pane wants more than that -- the widget says so through \c
  * needsPreview rather than stretching: the dialog asks the navigator for a fresh one.
  */
 class PdfPageCanvas : public QWidget

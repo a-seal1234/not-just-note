@@ -178,6 +178,14 @@ public:
     int currentIndex() const;
     QString projectDir() const;
 
+    /**
+     * Whether a roll should behave as if its document had gone away between its write phase and its
+     * redraw. The only caller is a test, and it is what proves the guard that otherwise can only be
+     * reached by a reload landing inside the write phase's nested event loops -- timing no test can
+     * promise. Nothing in the plugin calls it.
+     */
+    static void setDocumentGoneAfterWritesForTests(bool gone);
+
 Q_SIGNALS:
     /// Emitted whenever the open page or the notebook itself changes, so a navigator widget can
     /// follow along without polling.
