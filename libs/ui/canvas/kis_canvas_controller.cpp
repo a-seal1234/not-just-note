@@ -500,6 +500,16 @@ void KisCanvasController::syncOnImageResolutionChange()
 
 void KisCanvasController::syncOnImageSizeChange(const QPointF &oldStillPoint, const QPointF &newStillPoint)
 {
+    /// KisView calls this when the image's size changes, and a view being closed can still receive
+    /// one: the strip's resize lands after its canvas has been unset, and then there is no
+    /// coordinates converter to move (the crash seen on the desktop harness was
+    /// KisCoordinatesConverter::setImageBounds with this == 0, reached from here). A controller with
+    /// no canvas has nothing to keep still, and its state is read back below from the same empty
+    /// converter, so leaving early is the honest answer rather than a crash.
+    if (!m_d->coordinatesConverter) {
+        return;
+    }
+
     const KisCanvasState oldCanvasState = canvasState();
 
     KisImageSP image = m_d->view->image();
@@ -529,6 +539,16 @@ void KisCanvasController::updateCanvasZoomInternal(KoZoomMode::Mode mode, qreal 
 
 KisCanvasState KisCanvasController::canvasState() const
 {
+    /// A controller whose canvas has gone has no coordinates converter -- setCanvas(nullptr) drops
+    /// it -- and this is called while a view is being torn down: the crash seen on the desktop
+    /// harness was KoViewConverter::zoom() with this == 0, reached from here through
+    /// KisCanvasState::fromConverter. A controller with no converter has no state to report, and
+    /// the default one is what the callers already treat as "nothing": the alternative is a crash
+    /// on the way out of a document.
+    if (!m_d->coordinatesConverter) {
+        return KisCanvasState();
+    }
+
     return KisCanvasState::fromConverter(*m_d->coordinatesConverter);
 }
 

@@ -130,7 +130,14 @@ QString notebookNameFromDisk(const QString &projectDir)
     QString why;
     const PdfSessionManifest manifest =
         PdfSessionManifest::readFrom(PdfSession::manifestPath(projectDir), &why);
-    return manifest.isValid() ? manifest.displayName() : QString();
+    if (!manifest.isValid()) {
+        return QString();
+    }
+
+    /// Through the one rule, never through displayName() alone: that falls back to the source file's
+    /// base name, which on Android is the picker's cache copy -- the name this used to put on the
+    /// Start screen, in the tab and in every export suggestion.
+    return PdfPageNavigator::usableNotebookName(manifest.name);
 }
 
 /// A name that can also be offered as a file name: printable, without path separators, bounded.
@@ -154,13 +161,15 @@ QString nameForFile(const QString &name)
     return clean;
 }
 
-/// The name the export dialog should offer: the notebook's own name when it has one, the source
-/// file's as the fallback, and "notebook" when neither gives anything usable.
+/// The name the export dialog should offer: the notebook's own name, and the human default when the
+/// manifest cannot be read. Never the source file's name -- on Android that is the picker's cache
+/// copy, and suggesting "pdfio-picked-notes.pdf" is how a name nobody chose reaches a file the user
+/// hands to someone else.
 QString exportSuggestion(PdfPageNavigator *navigator)
 {
     QString base = notebookNameFromDisk(navigator->projectDir());
     if (base.isEmpty()) {
-        base = QFileInfo(navigator->manifest().sourceFile).completeBaseName();
+        base = PdfPageNavigator::defaultNotebookName();
     }
     base = nameForFile(base);
     if (base.isEmpty()) {
@@ -235,7 +244,10 @@ void rememberRecentNotebook()
     const QString dir = QFileInfo(navigator->projectDir()).absoluteFilePath();
     QString name = notebookNameFromDisk(navigator->projectDir());
     if (name.isEmpty()) {
-        name = QFileInfo(navigator->manifest().sourceFile).completeBaseName();
+        /// An unreadable manifest. The human default, never the source file's name: on Android that
+        /// is the picker's cache copy, and a Recent entry reading "pdfio-picked" is the bug this
+        /// rule exists to stop.
+        name = PdfPageNavigator::defaultNotebookName();
     }
 
     QStringList entries = recentNotebookEntries();
@@ -251,53 +263,31 @@ void rememberRecentNotebook()
     refreshWelcomePageEntries();
 }
 
-/// Gives a notebook its name the first time it is opened: the source PDF's own name, which is what
-/// the user picked the file by. A notebook that already has one is left alone. On a platform whose
-/// picker copies the file under a cache name this falls back to that name, which is the honest
-/// answer until the provider's own name can be asked for -- see the note on the import path.
-void ensureNotebookName()
-{
-    PdfPageNavigator *navigator = PdfPageNavigator::instance();
-    if (!navigator->hasNotebook()) {
-        return;
-    }
+/// Puts the notebook's name on the open document's tab; defined with the other name helpers below.
+/// Declared HERE, above notebookOpened(), which calls it: the declaration used to sit below that call
+/// and the compiler was right to refuse it.
+void applyNotebookNameToTab();
 
-    const QString path = PdfSession::manifestPath(navigator->projectDir());
-    QString why;
-    PdfSessionManifest manifest = PdfSessionManifest::readFrom(path, &why);
-    if (!manifest.isValid() || !manifest.name.isEmpty()) {
-        return;
-    }
-
-    manifest.name = manifest.displayName();
-    if (!manifest.writeTo(path, &why)) {
-        say(QStringLiteral("could not write the notebook's name: %1").arg(why));
-        return;
-    }
-    say(QStringLiteral("the notebook is named \"%1\"").arg(manifest.name));
-}
-
-/// What every successful open does, and nothing more: name the notebook if it has no name,
-/// remember it, and put its name on the docker. Deliberately called after the open -- the picker's
-/// copy step stays exactly where it is, and nothing here runs inside an activity callback.
+/// What every successful open does, and nothing more: settle the notebook's name, remember it, and
+/// put its name on the docker and the tab. Deliberately called after the open -- the picker's copy
+/// step stays exactly where it is, and nothing here runs inside an activity callback.
 ///
-/// \a defaultTheName is false only on Android's picker path, where the provider's own name is
-/// asked for straight afterwards: writing the cache name first would make the notebook look named
-/// and the provider's answer would then have to overwrite it. With no name written, the manifest
-/// reader falls back to the cache name anyway.
+/// \a defaultTheName is false only on Android's picker path, where the provider's own name is asked
+/// for straight afterwards: a default written first would make the notebook look named and the
+/// provider's answer would then be refused. The rule itself -- what counts as a name a person chose,
+/// and what a notebook is called when it has none -- lives in the navigator, one place for every
+/// reader and writer: PdfPageNavigator::ensureNotebookName().
 void notebookOpened(bool defaultTheName = true)
 {
-    if (defaultTheName) {
-        ensureNotebookName();
+    QString namedWhy;
+    if (!PdfPageNavigator::instance()->ensureNotebookName(defaultTheName, &namedWhy)) {
+        say(QStringLiteral("the notebook's name could not be settled: %1").arg(namedWhy));
     }
     rememberRecentNotebook();
     reloadDockerNames();
+    applyNotebookNameToTab();
     showNotebookPanel();
 }
-
-/// Puts the notebook's name on the open document's tab; defined with the other name helpers below,
-/// and declared here because the Android provider-name path is defined above them and uses it.
-void applyNotebookNameToTab();
 
 /// Puts the notebook list on the Start screen; defined with the open helpers below, and declared
 /// here because the recent-list bookkeeping above it refreshes that screen.
@@ -307,9 +297,10 @@ void refreshWelcomePageEntries();
 /// Asks the provider for the name of the PDF that was just imported, on the event loop and after
 /// the notebook is open -- never inside the activity callback, which is where that query crashed.
 ///
-/// It is written only while the notebook still has no name of its own, so a name the user set with
-/// "Rename notebook..." is never overwritten, and every failure (no URI, no provider, no column, no
-/// value) leaves the cache name in place.
+/// It is written only while the notebook still has no name a person chose, so a name the user set
+/// with "Rename notebook..." is never overwritten -- and when the provider cannot answer (no URI, no
+/// provider, no column, no value) the notebook is given the human default rather than the cache name
+/// the picker copied the PDF under, which is what it used to keep.
 void adoptProviderName(const QString &contentUri)
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
@@ -317,16 +308,16 @@ void adoptProviderName(const QString &contentUri)
         return;
     }
 
-    if (contentUri.isEmpty()) {
-        say(QStringLiteral("no content URI was remembered; the notebook keeps \"%1\"")
-                .arg(notebookNameFromDisk(navigator->projectDir())));
-        return;
-    }
-
-    const QString providerName = AndroidDocumentPicker::displayNameForContentUri(contentUri);
+    const QString providerName = contentUri.isEmpty()
+        ? QString()
+        : AndroidDocumentPicker::displayNameForContentUri(contentUri);
     if (providerName.isEmpty()) {
-        say(QStringLiteral("the provider gave no name; the notebook keeps \"%1\"")
-                .arg(notebookNameFromDisk(navigator->projectDir())));
+        /// Nothing to borrow: settle a name a person can live with, through the one rule.
+        QString namedWhy;
+        if (!navigator->ensureNotebookName(true, &namedWhy)) {
+            say(QStringLiteral("the provider gave no name and the default could not be written: %1")
+                    .arg(namedWhy));
+        }
         return;
     }
 
@@ -337,11 +328,11 @@ void adoptProviderName(const QString &contentUri)
         say(QStringLiteral("cannot read the notebook's manifest: %1").arg(why));
         return;
     }
-    /// A picker name may replace the auto-default -- the cache name ensureNotebookName() writes --
-    /// because that is not a name the user chose. A name typed with "Rename notebook..." is never
-    /// touched.
-    const QString cacheName = QFileInfo(manifest.sourceFile).completeBaseName();
-    if (!manifest.name.isEmpty() && manifest.name != cacheName) {
+
+    /// A name a provider gave may replace one the application made up for a cache copy -- that is not
+    /// a name the user chose -- and never a name typed with "Rename notebook...". The rule is the
+    /// navigator's, one place, so this cannot drift into a string comparison of its own.
+    if (!manifest.name.isEmpty() && !PdfPageNavigator::isInternalNotebookName(manifest.name)) {
         say(QStringLiteral("the notebook already has the name \"%1\"; the provider's \"%2\" was left alone")
                 .arg(manifest.name, providerName));
         return;
@@ -355,7 +346,12 @@ void adoptProviderName(const QString &contentUri)
         clean.chop(4);
     }
     if (clean.isEmpty()) {
-        say(QStringLiteral("the provider's name has no usable characters; the notebook keeps the cache name"));
+        /// The provider answered, but with nothing a file name can carry. Same rule as no answer.
+        QString namedWhy;
+        if (!navigator->ensureNotebookName(true, &namedWhy)) {
+            say(QStringLiteral("the provider's name was unusable and the default could not be written: %1")
+                    .arg(namedWhy));
+        }
         return;
     }
 
@@ -565,9 +561,7 @@ void applyNotebookNameToTab()
     }
 
     const QString name = notebookNameFromDisk(navigator->projectDir());
-    const QString shown = name.isEmpty()
-        ? QFileInfo(navigator->manifest().sourceFile).completeBaseName()
-        : name;
+    const QString shown = name.isEmpty() ? PdfPageNavigator::defaultNotebookName() : name;
     document->setUntitledCaption(QStringLiteral("%1 - page %2/%3")
                                      .arg(shown)
                                      .arg(navigator->currentIndex() + 1)
@@ -1801,6 +1795,102 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     updateNotebookOpsActions(ops);
 }
 
+/// The two sentences every entry of the memory-budget menu and the typed dialog carries: what the
+/// budget is spent on, and what it costs the ink. One string, so the menu and the dialog cannot drift
+/// into telling the user two different things about the same setting.
+QString memoryBudgetCaveat()
+{
+    return i18n(
+        "This is spent on the whole window that is up -- every page in it plus the gaps, across "
+        "every full-size layer the strip has -- so the page size it buys depends on how many pages "
+        "are open and how big they are: a window of five slides buys a smaller page than a window of "
+        "five A4 sheets.\n\n"
+        "The budget is the pages' rendered resolution, which is also the resolution the pen's ink is "
+        "stored at from then on, and lowering it is not freely reversible. The source PDF and "
+        "everything already stored are untouched.");
+}
+
+/// The typed memory budget: a number of megabytes, and under it, live, what that number buys for the
+/// notebook that is open.
+///
+/// The live line is the whole reason a typed value is worth having. The presets name round numbers
+/// and the menu names the page size each of them buys; a dialog that only took a number would ask the
+/// user to guess what it costs in quality and show them afterwards. So every change asks the
+/// navigator the same question the menu label asks -- longestPagePixelsForBudget() -- through the
+/// same derivation, and shows the memory the window really costs beside it, which is NOT always the
+/// number typed: a budget above what 200 dpi already costs does not spend itself.
+///
+/// No Q_OBJECT: it has no signals or slots of its own, so it needs no moc.
+class PdfMemoryBudgetDialog : public QDialog
+{
+public:
+    PdfMemoryBudgetDialog(int current, QWidget *parent)
+        : QDialog(parent)
+    {
+        setWindowTitle(i18n("Rendered page memory"));
+
+        auto *intro = new QLabel(i18n("What the strip's rendered pages may cost, in megabytes:"), this);
+        intro->setWordWrap(true);
+
+        m_value = new QSpinBox(this);
+        m_value->setObjectName(QStringLiteral("pdfio_memory_budget_value"));
+        /// The range the setter holds a typed value to, asked of the navigator rather than written
+        /// down again here, so the spin box cannot offer what the setter would refuse.
+        m_value->setRange(PdfPageNavigator::minMemoryBudgetMb(),
+                          PdfPageNavigator::maxMemoryBudgetMb());
+        m_value->setSuffix(QStringLiteral(" MB"));
+        /// A spin box on purpose: it is tapped on a tablet, and the +/- buttons are how the value is
+        /// raised as well as lowered -- the knob the user wants is finer than three presets and goes
+        /// in both directions. 50 MB is a visible step at this scale: ten taps cover 200 to 700 MB.
+        m_value->setSingleStep(50);
+        m_value->setValue(qBound(PdfPageNavigator::minMemoryBudgetMb(), current,
+                                 PdfPageNavigator::maxMemoryBudgetMb()));
+        m_value->setToolTip(memoryBudgetCaveat());
+
+        m_preview = new QLabel(this);
+        m_preview->setObjectName(QStringLiteral("pdfio_memory_budget_preview"));
+        m_preview->setWordWrap(true);
+
+        auto *sentences = new QLabel(memoryBudgetCaveat(), this);
+        sentences->setWordWrap(true);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+        auto *layout = new QVBoxLayout(this);
+        layout->addWidget(intro);
+        layout->addWidget(m_value);
+        layout->addWidget(m_preview);
+        layout->addWidget(sentences);
+        layout->addWidget(buttons);
+
+        const auto update = [this]() {
+            PdfPageNavigator *navigator = PdfPageNavigator::instance();
+            if (!navigator->hasNotebook()) {
+                m_preview->setText(i18n("No notebook is open: the page size a budget buys depends on "
+                                        "the window that is up."));
+                return;
+            }
+
+            const int megabytes = m_value->value();
+            m_preview->setText(i18n("About %1 px on the longest page of the window that is open, in "
+                                    "a window that costs about %2 MB.",
+                                    navigator->longestPagePixelsForBudget(megabytes),
+                                    navigator->windowCostMbForBudget(megabytes)));
+        };
+        QObject::connect(m_value, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                         [update](int) { update(); });
+        update();
+    }
+
+    int megabytes() const { return m_value->value(); }
+
+private:
+    QSpinBox *m_value = nullptr;
+    QLabel *m_preview = nullptr;
+};
+
 /// What the strip's rendered pages may cost, and the resolution that buys.
 ///
 /// A page can be LANDSCAPE, so a bound on the longest side buys a different amount of memory for
@@ -1853,24 +1943,58 @@ void addMemoryBudgetMenu(QMenu *menu)
     QAction *mb400 = addBudget(400, QStringLiteral("pdfio_memory_budget_400"));
     QAction *mb800 = addBudget(800, QStringLiteral("pdfio_memory_budget_800"));
 
+    /// The typed value. Its own action rather than a preset with a sentinel: it is not a budget that
+    /// can be applied, it is a dialog, so it must not go through the "set this number" connection.
+    QAction *custom = budgets->addAction(QString());
+    custom->setObjectName(QStringLiteral("pdfio_memory_budget_custom"));
+    custom->setCheckable(true);
+    custom->setData(-1);
+    group->addAction(custom);
+    QObject::connect(custom, &QAction::triggered, budgets, [budgets]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+
+        /// Opens on the value in force. "No limit" has no number to open on, so it opens on what the
+        /// window costs at 200 dpi -- the no-limit case, which is the most the dialog can usefully
+        /// offer -- and a notebook with nothing open opens on the first preset.
+        int current = navigator->memoryBudgetMb();
+        if (current <= 0) {
+            current = navigator->windowCostMbForBudget(0);
+        }
+        if (current <= 0) {
+            current = 200;
+        }
+
+        PdfMemoryBudgetDialog dialog(current, budgets->parentWidget());
+        if (dialog.exec() == QDialog::Accepted) {
+            /// The same setter the presets use: the persistence, the resize through the roll, the
+            /// modified flag and the one derivation are shared, not re-implemented here.
+            navigator->setMemoryBudgetMb(dialog.megabytes());
+        }
+    });
+
     /// Filled every time the submenu opens: the mark is the navigator's own setting, and the page
     /// size beside each budget is what THAT budget would produce for the notebook that is open now.
     /// With nothing open there is no page size to name, and the label is the budget alone.
-    const auto refresh = [unlimited, mb200, mb400, mb800]() {
+    const auto refresh = [unlimited, mb200, mb400, mb800, custom]() {
         PdfPageNavigator *navigator = PdfPageNavigator::instance();
         const bool open = navigator->hasNotebook();
-
-        const QString caveat = i18n(
-            "This is spent on the whole window that is up -- every page in it plus the gaps, across "
-            "every full-size layer the strip has -- so the page size it buys depends on how many "
-            "pages are open and how big they are: a window of five slides buys a smaller page than "
-            "a window of five A4 sheets.\n\n"
-            "The budget is the pages' rendered resolution, which is also the resolution the pen's "
-            "ink is stored at from then on, and lowering it is not freely reversible. The source "
-            "PDF and everything already stored are untouched.");
+        const QString caveat = memoryBudgetCaveat();
 
         const auto fill = [navigator, open, &caveat](QAction *action) {
             const int megabytes = action->data().toInt();
+
+            if (megabytes < 0) {
+                /// The typed entry names the value in force when it is not one of the presets, so a
+                /// value the user typed is visible on the menu rather than only in the document's
+                /// title, and it is the one that gets the mark.
+                const int current = navigator->memoryBudgetMb();
+                const bool typed = current > 0 && current != 200 && current != 400 && current != 800;
+                action->setText(typed ? i18n("Custom... (%1 MB)", current) : i18n("Custom..."));
+                action->setToolTip(caveat);
+                action->setChecked(typed);
+                return;
+            }
+
             const QString label = megabytes > 0 ? i18n("Up to %1 MB", megabytes)
                                                 : i18n("No limit (the 200 dpi it always used)");
 
@@ -1886,6 +2010,7 @@ void addMemoryBudgetMenu(QMenu *menu)
         fill(mb200);
         fill(mb400);
         fill(mb800);
+        fill(custom);
     };
 
     QObject::connect(budgets, &QMenu::aboutToShow, budgets, refresh);
@@ -2587,7 +2712,7 @@ QString PdfIoPlugin::bundleSuggestion() const
         /// name -- measured on the desktop, "bundle suggestion after rename: text-fixture.pnb".
         base = notebookNameFromDisk(navigator->projectDir());
         if (base.isEmpty()) {
-            base = QFileInfo(navigator->manifest().sourceFile).completeBaseName();
+            base = PdfPageNavigator::defaultNotebookName();
         }
     }
     if (base.isEmpty()) {

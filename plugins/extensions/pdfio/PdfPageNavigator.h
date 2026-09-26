@@ -147,7 +147,21 @@ public:
      * its slot rather than building anything. See docs/PDFIO-DESIGN-STRIP.md.
      */
     int scope() const;
+
+    /**
+     * Sets how many pages the strip holds: 1 turns it off (design A), three or more is a strip of
+     * that many pages centred on the active one.
+     *
+     * Persisted -- the page count and whether the strip is on are kept apart, under
+     * pdfio/stripPages and pdfio/stripOn, so turning the strip OFF does not forget how many pages it
+     * had -- and applied to what is on screen through the roll's own resize path. A different page
+     * count is a different WINDOW, not a different notebook: the per-slot bands are re-cut inside the
+     * roll and the document is resized to the new window, rather than the document being rebuilt.
+     */
     void setScope(int scope);
+
+    /// The device's physical memory in megabytes, as Krita itself reports it (0 when it cannot say).
+    static int deviceRamMb();
 
     /**
      * What the rendered page of the strip is allowed to cost, in megabytes, or 0 for no limit.
@@ -189,7 +203,34 @@ public:
     int longestPagePixelsForBudget(int megabytes) const;
 
     /**
-     * Sets the budget and applies it to what is on screen.
+     * What the window that is up would cost at \a megabytes, in megabytes: the pixels the layout
+     * really has at the dpi that budget buys, across every full-size layer.
+     *
+     * What a TYPED budget is worth is not the number typed: a budget above what 200 dpi already costs
+     * does not spend itself, and this is the figure that says so. Shown beside the page size in the
+     * dialog, so a typed number never hides either half of what it buys.
+     */
+    int windowCostMbForBudget(int megabytes) const;
+
+    /**
+     * The same two figures for a window of \a scope pages, which is what the strip-size menu shows
+     * beside each choice: what that many pages would cost at the budget in force, and how big the
+     * longest page in it would be. The layer count is the shape the builder would make for that
+     * window -- one band per slot plus Ink -- because the bands of a window that does not exist yet
+     * cannot be counted.
+     */
+
+    /**
+     * The floor and the ceiling a typed budget is held between, so a dialog and the setter cannot
+     * disagree about what may be asked for. 0 is deliberately not in the range: it is how "no limit"
+     * is asked for, and it is its own entry on the menu.
+     */
+    static int minMemoryBudgetMb();
+    static int maxMemoryBudgetMb();
+
+    /**
+     * Sets the budget and applies it to what is on screen. A typed value is held between
+     * minMemoryBudgetMb() and maxMemoryBudgetMb(); 0 means no limit and is left alone.
      *
      * Persisted under pdfio/memoryBudgetMb, so the choice survives a restart, and applied
      * immediately through the roll's own resize path -- the one mechanism that can change the
@@ -220,6 +261,49 @@ public:
 
     /// What the export needs to walk the notebook and find its source.
     const PdfSessionManifest &manifest() const;
+
+    /**
+     * Whether \a name is one of the INTERNAL names this application makes for a notebook, rather
+     * than a name a person chose.
+     *
+     * Android's picker copies the chosen file into the app's cache under a name the app itself
+     * supplies -- "pdfio-picked.pdf" for an import, "pdfio-picked-pages.pdf" for an insert,
+     * "pdfio-picked-notebook.pnb" for a notebook bundle, "pdfio-picked-image.png" for an image --
+     * and an earlier build produced "pdfio-picked-notes". Those are paths, not titles, and one of
+     * them reaching the manifest is how a notebook came to be called "pdfio-picked.pdf" on the Start
+     * screen. The stems are a LIST, matched exactly (with the file extension and the "(2)" a copy
+     * gets removed first): the names we write are ours and finite, while a name that merely starts
+     * the same way -- "pdfio-picked-up-the-wrong-file" -- is one only a person would type, and a name
+     * a person typed is never rewritten.
+     *
+     * ONE place: every reader and every writer of a notebook's name asks this, so the rule cannot
+     * drift into a string comparison at each call site.
+     */
+    static bool isInternalNotebookName(const QString &name);
+
+    /// The name a notebook is given when it has none a person chose: a human default that says what
+    /// it is and when it arrived, never a path and never one of the internal names.
+    static QString defaultNotebookName();
+
+    /// The name to SHOW for a manifest that holds \a name: the name itself when a person chose it,
+    /// \ref defaultNotebookName() when it is empty or internal. The reader half of
+    /// \ref isInternalNotebookName().
+    static QString usableNotebookName(const QString &name);
+
+    /**
+     * Settles the open notebook's name in its manifest, and says so in the log.
+     *
+     * A name a person chose is never touched; an internal one is replaced with the human default, and
+     * -- when \a nameWhenEmpty -- so is a manifest with no name at all. \a nameWhenEmpty is false on
+     * Android's picker path, where the provider's own name is asked for straight afterwards: a
+     * default written first would look like a chosen name and the provider's answer would then be
+     * refused. The replacement of an INTERNAL name happens either way, because an internal name is
+     * never a name a person chose.
+     *
+     * The manifest is the one place worth fixing: the tab, the Start screen, the recent list and the
+     * export suggestion all read the notebook's name from it.
+     */
+    bool ensureNotebookName(bool nameWhenEmpty = true, QString *why = nullptr);
 
     /// Which pages are open, and what the policy has had to do to keep that bounded. Exposed so
     /// the page selector can show the window and so the counters are observable without a debugger.
@@ -407,6 +491,28 @@ private:
 
     /// The longest side, in points, of the longest page the window around \a activePage holds.
     qreal longestSidePtInWindow(int activePage) const;
+
+    /**
+     * Clears the open document's modified flag: a strip is a view of the notebook, not a document to
+     * write.
+     *
+     * cropImage()/resizeImage() run through KisProcessingApplicator, which pushes an undo command and
+     * marks the document modified -- and Krita then autosaves it. On the tablet the tab gained an
+     * asterisk and the status bar said "Saving Document... 76%", writing a .kra of a 400 MB strip
+     * nobody asked for, and that save is the prime suspect for the memory the user watched climb.
+     * Nothing is lost by clearing it: every page of the window was written before any of this ran,
+     * and which pages still carry ink is the page window's own dirty set, not this flag.
+     *
+     * ONE helper, called from every path that changes the strip's pixels -- where the resize makes the
+     * mark, at the end of a roll (after the layer adoption, which can mark it again), after the
+     * budget is applied from the menu or a typed value, and on the closes. A path that forgets it is
+     * a strip Krita autosaves, and that is the memory the user paid for.
+     */
+    void clearModifiedFlag();
+
+    /// The layers a budget is divided by for \a window: the document's own count when one is open, or
+    /// the shape the builder is about to make.
+    int layersForBudget(const PdfStripLayout &window) const;
 
     /**
      * How many full-size layers the document that is open holds: the per-slot bands, the ink layer

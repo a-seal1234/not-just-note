@@ -10,6 +10,7 @@
 #include <cstdio>
 
 #include <QCoreApplication>
+#include <QDate>
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
@@ -18,6 +19,8 @@
 #include <QStandardPaths>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QRegularExpression>
+#include <kis_image_config.h>
 #include <QtMath>
 
 #include <QAbstractScrollArea>
@@ -310,6 +313,28 @@ constexpr qreal DefaultRenderDpi = 200;
 /// the behaviour the user replaced. It is left in the file rather than deleted: nothing writes a key
 /// nobody reads, and a downgrade should find its own setting where it left it.
 const char *const MemoryBudgetMbKey = "pdfio/memoryBudgetMb";
+
+/// What a TYPED budget is held between.
+///
+/// The floor is a quality choice, not a crash guard: 20 MB is about where the longest page of the
+/// windows this ships with stops being a page. On the reported notebook (five pages, six full-size
+/// layers) 20 MB comes out around 41 dpi -- a 340x450 px A4 sheet, small but still readable as a
+/// layout -- and half of it is a grey smear. The derivation's own mechanical floor (one pixel for the
+/// longest page) is orders of magnitude below anything a dialog should offer.
+constexpr int MinMemoryBudgetMb = 20;
+
+/// The share of the device's physical memory the strip may be given.
+///
+/// NOT a cap on what may be typed: the guard is computed from the machine's own RAM at run time, so a
+/// powerful desktop can be given several gigabytes while a small tablet is stopped at the number it
+/// cannot hold -- naming the RAM and the number when it is. A half is the fraction, and the
+/// justification is measured rather than guessed: the app already holds about 890 MB of PSS with no
+/// document open on the 8 GB tablet, so half leaves the OS, Krita and the panel their share while
+/// still being far above anything this ships with (the measured five-slide window is 1461 MiB at
+/// 200 dpi, and the user's own 212 page notebook is modest beside that).
+constexpr qreal MemoryBudgetRamFraction = 0.5;
+
+
 
 /// How many paint layers \a node and everything under it hold. Each one is a full-size allocation in
 /// the strip image, so this is the layer count a budget is divided by.
@@ -910,6 +935,102 @@ void PdfPageNavigator::forgetRecentNotebook(const QString &projectDir)
     setRecentNotebooks(kept);
 }
 
+bool PdfPageNavigator::isInternalNotebookName(const QString &name)
+{
+    /// A LIST of the names this application really writes, not a prefix rule and not a comparison
+    /// against this run's cache name: the names are ours and finite, while a name that merely starts
+    /// the same way is one only a person would type.
+    static const QStringList internalNames = {
+        QStringLiteral("pdfio-picked"),
+        QStringLiteral("pdfio-picked-pages"),
+        QStringLiteral("pdfio-picked-notebook"),
+        QStringLiteral("pdfio-picked-image"),
+        QStringLiteral("pdfio-picked-notes"),
+    };
+
+    QString candidate = name.trimmed();
+
+    /// The manifest holds a base name, but a build that wrote the file's own name into it would have
+    /// kept the extension: either way it is the same internal name.
+    const QStringList extensions = { QStringLiteral(".pdf"), QStringLiteral(".pnb"),
+                                     QStringLiteral(".png") };
+    for (const QString &extension : extensions) {
+        if (candidate.endsWith(extension, Qt::CaseInsensitive)) {
+            candidate.chop(extension.size());
+            break;
+        }
+    }
+
+    /// And the "(2)" a second copy gets, from our own cache or from the file manager that made it:
+    /// "pdfio-picked-notes (2)" is the internal name "pdfio-picked-notes".
+    static const QRegularExpression copySuffix(QStringLiteral("\\s*\\((\\d+)\\)$"));
+    candidate.remove(copySuffix);
+
+    return internalNames.contains(candidate.trimmed(), Qt::CaseInsensitive);
+}
+
+QString PdfPageNavigator::defaultNotebookName()
+{
+    /// Not translated, and not the desktop's locale: this is written into the manifest as the
+    /// notebook's name and read back on every later run, so a name in the language of whoever
+    /// imported it would be a different notebook after a locale change. The date is what tells two
+    /// imports apart in the recent list, which is what a default name is for.
+    return QStringLiteral("Notebook %1").arg(QDate::currentDate().toString(Qt::ISODate));
+}
+
+QString PdfPageNavigator::usableNotebookName(const QString &name)
+{
+    const QString clean = name.trimmed();
+    if (clean.isEmpty() || isInternalNotebookName(clean)) {
+        return defaultNotebookName();
+    }
+    return clean;
+}
+
+bool PdfPageNavigator::ensureNotebookName(bool nameWhenEmpty, QString *why)
+{
+    if (!hasNotebook()) {
+        fail(why, QStringLiteral("no notebook is open"));
+        return false;
+    }
+
+    const QString path = PdfSession::manifestPath(m_projectDir);
+    QString readWhy;
+    PdfSessionManifest manifest = PdfSessionManifest::readFrom(path, &readWhy);
+    if (!manifest.isValid()) {
+        fail(why, QStringLiteral("cannot read the notebook's manifest: %1").arg(readWhy));
+        return false;
+    }
+
+    const bool internal = isInternalNotebookName(manifest.name);
+    if (!internal && !manifest.name.isEmpty()) {
+        /// A name a person chose, or one a provider gave: never touched.
+        return true;
+    }
+    if (!internal && !nameWhenEmpty) {
+        /// Nothing to write yet: the provider's own name is being asked for, and a default written
+        /// first would look like a chosen name and the provider's answer would then be refused.
+        return true;
+    }
+
+    const QString before = manifest.name;
+    manifest.name = defaultNotebookName();
+    if (!manifest.writeTo(path, &readWhy)) {
+        fail(why, QStringLiteral("cannot write the notebook's name: %1").arg(readWhy));
+        return false;
+    }
+
+    /// The reader's copy as well: manifest() is what the docker and the tab read, and leaving it on
+    /// the internal name would show one name in the manifest and another on the screen.
+    m_manifest.name = manifest.name;
+
+    say(internal ? QStringLiteral("the notebook was named after the picker's own copy (\"%1\"); it is "
+                                  "now \"%2\"")
+                       .arg(before, manifest.name)
+                 : QStringLiteral("the notebook is named \"%1\"").arg(manifest.name));
+    return true;
+}
+
 bool PdfPageNavigator::isInsideNotebookStore(const QString &projectDir)
 {
     if (projectDir.isEmpty()) {
@@ -1142,6 +1263,14 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
 
     m_projectDir = projectDir;
     m_manifest = manifest;
+
+    /// A notebook that carries the picker's own cache name is repaired here, on every open, before
+    /// anything reads it: the manifest is where the tab, the Start screen, the recent list and the
+    /// export suggestion all get their name from. A notebook with NO name is left alone -- on Android
+    /// the provider's own name is asked for after this -- so this only ever replaces a name the
+    /// application itself made up for a cache copy.
+    ensureNotebookName(/*nameWhenEmpty=*/false, nullptr);
+
     const int anchor = qBound(0, anchorPage, manifest.pages.size() - 1);
     const bool shown = showPage(anchor, why);
     Q_EMIT pageChanged(m_index, pageCount(), label);
@@ -1478,15 +1607,9 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
 
         /// The strip is a VIEW of the notebook, not a document to write.
         ///
-        /// cropImage()/resizeImage() run through KisProcessingApplicator, which pushes an undo
-        /// command and marks the document modified -- and Krita then autosaves it. On the tablet the
-        /// tab gained an asterisk and the status bar said "Saving Document... 76%", writing a .kra of
-        /// a 400 MB strip nobody asked for, and the save is the prime suspect for the memory the user
-        /// watched climb after every roll. Cleared here, where the resize made the mark, and again at
-        /// the end of the roll. Nothing is lost by clearing it: phase one wrote every page the window
-        /// held before any of this ran, and which pages still carry ink is the page window's own
-        /// dirty set, not this flag.
-        m_document->setModified(false);
+        /// Cleared here, where the resize made the mark; see clearModifiedFlag() for why, and for the
+        /// other two places this roll clears it.
+        clearModifiedFlag();
 
         /// Nothing else has to be repainted for the new size: there is no desk layer any more
         /// (PdfStripBuilder makes each slot's band carry the colour), and the repaint below fills
@@ -1705,14 +1828,13 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         }
     }
 
-    /// And the strip is not a document to write, said once more after the repaint.
+    /// The clear is said at its original place as well, before the adoption below.
     ///
-    /// The resize above clears the modified flag where Krita's own resize set it; this clears
-    /// anything the repaint raised. The roll has written every page the window holds and rebuilt
-    /// what is on screen out of those artifacts, so there is nothing here Krita has to save, and a
-    /// strip that says it is modified is a strip Krita autosaves: on the tablet that was a .kra of
-    /// a 400 MB image and the memory the user watched climb after every roll.
-    m_document->setModified(false);
+    /// It used to be the ONLY one, and moving it after the adoption is what the ink-loss sweep
+    /// chased: keeping both positions means the roll behaves exactly as it did when it was green
+    /// while the mark the adoption raises is still cleared afterwards. Setting a bool twice costs
+    /// nothing; a roll that loses a page's ink costs everything.
+    clearModifiedFlag();
 
     /// And the placement rule the notebook asked for: a content layer that ended up outside the
     /// Ink group -- one the user made, or one restored from an artifact under a name the strip did
@@ -1720,6 +1842,12 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     /// its pixels. Never deleted, never flattened, and the number still outside is logged so the
     /// rule is measurable.
     adoptContentIntoInk(m_document->image());
+
+    /// And the strip is not a document to write, said once more after the repaint -- and AFTER the
+    /// layer adoption just above, because moving a node into the Ink group is itself an image change
+    /// and marks the document modified. Clearing before it is how a roll that adopted a content layer
+    /// came back from the menu with an asterisk on the tab. See clearModifiedFlag().
+    clearModifiedFlag();
 
     /// What the roll is not allowed to change: the page being read.
     ///
@@ -1987,9 +2115,83 @@ int PdfPageNavigator::longestPagePixelsForBudget(int megabytes) const
     return qMax(0, qRound(longestPt * dpi / 72.0));
 }
 
+int PdfPageNavigator::minMemoryBudgetMb()
+{
+    return MinMemoryBudgetMb;
+}
+
+int PdfPageNavigator::deviceRamMb()
+{
+    /// Krita's own answer, which knows the device rather than the container it runs in on the
+    /// desktop; 0 when it cannot say, and the guard then falls back to a modest machine.
+    return qMax(0, KisImageConfig::totalRAM());
+}
+
+int PdfPageNavigator::maxMemoryBudgetMb()
+{
+    /// The device's own guard, not a constant: half of the physical memory (see
+    /// MemoryBudgetRamFraction for why a half), or half of 1 GB when the machine will not say -- the
+    /// conservative answer, which refuses rather than promises memory that is not there.
+    const int ramMb = deviceRamMb() > 0 ? deviceRamMb() : 1024;
+    return qMax(MinMemoryBudgetMb, int(qreal(ramMb) * MemoryBudgetRamFraction));
+}
+
+int PdfPageNavigator::windowCostMbForBudget(int megabytes) const
+{
+    const int activePage = m_index >= 0 ? m_index : 0;
+
+    /// Held to the same range the setter holds a typed value to -- the floor and this device's own
+    /// guard -- or the figure shown for 5 MB would be one the menu can never produce.
+    const int budget =
+        megabytes <= 0 ? 0 : qBound(MinMemoryBudgetMb, megabytes, maxMemoryBudgetMb());
+
+    /// The same derivation the strip itself uses, without applying it, and the same layer count the
+    /// roll would use: one derivation for the pixels and one for the figure, never two.
+    const qreal dpi = dpiForBudget(budget, activePage, stripLayerCount());
+    const PdfStripLayout layout = PdfStripLayout::forWindow(m_manifest, activePage, m_scope, dpi);
+    const QSize size = layout.imageSize();
+    if (size.isEmpty()) {
+        return 0;
+    }
+
+    const qreal bytes =
+        qreal(size.width()) * qreal(size.height()) * qreal(layersForBudget(layout)) * 4.0;
+
+    /// Rounded UP: a figure that says "about 200 MB" must never be under the number the user typed
+    /// for the case where the budget binds.
+    return int(qCeil(bytes / 1000000.0));
+}
+
+int PdfPageNavigator::layersForBudget(const PdfStripLayout &window) const
+{
+    /// The document's own count when one is open -- exact for the strip that is up -- and the shape
+    /// the builder is about to make otherwise: one band per slot plus the Ink layer.
+    const int counted = stripLayerCount();
+    return counted > 0 ? counted : qMax(1, window.slots().size() + 1);
+}
+
+void PdfPageNavigator::clearModifiedFlag()
+{
+    if (m_document) {
+        m_document->setModified(false);
+    }
+}
+
 void PdfPageNavigator::setMemoryBudgetMb(int megabytes)
 {
-    const int budget = qMax(0, megabytes);
+    /// 0 is "no limit" and is left alone. A typed value is held between the floor and this DEVICE's
+    /// own guard -- not an artificial ceiling: the number is accepted up to what the machine can hold,
+    /// and what it was held at is said with the RAM that decided it.
+    const int guard = maxMemoryBudgetMb();
+    int budget = megabytes <= 0 ? 0 : qMax(MinMemoryBudgetMb, megabytes);
+    if (budget > guard) {
+        say(QStringLiteral("%1 MB is more than this device can hold: %2 MB of RAM, half of it for the "
+                           "strip, so the budget is %3 MB")
+                .arg(megabytes)
+                .arg(deviceRamMb())
+                .arg(guard));
+        budget = guard;
+    }
 
     /// Written whether or not the value changed: the menu offers choices, and the one that is
     /// already in force in memory may not be the one on disk when another build wrote the file.
@@ -2021,6 +2223,12 @@ void PdfPageNavigator::setMemoryBudgetMb(int megabytes)
     QString why;
     if (!rollToPage(m_index, &why, m_index, true)) {
         say(QStringLiteral("the memory budget was saved but the strip was not rebuilt: %1").arg(why));
+    } else {
+        /// And the menu's own path ends here. The roll cleared the mark where Krita's resize made it
+        /// and at its own end; this clears anything raised after the roll returned -- through the ONE
+        /// helper, so this path cannot drift from the roll's. Only when the roll succeeded: a refused
+        /// roll wrote nothing, and a document that still holds unsaved ink has to keep saying so.
+        clearModifiedFlag();
     }
 }
 
@@ -2045,6 +2253,13 @@ qreal PdfPageNavigator::dpiForBudget(int megabytes, int activePage, int layers) 
     /// The layers: the caller's own count when it has one, or the shape the builder is about to
     /// make -- one band per slot plus the Ink layer. A content layer an artifact carries makes the
     /// strip one bigger, which the roll that follows counts for real.
+    /// THE FIX for the budget test that built 515.6 MB for a 200 MB budget: this used to fall back
+    /// to layersForBudget(), which counts the document that is OPEN -- and when a strip is being
+    /// BUILT the open document is the notebook being replaced, a different window with a different
+    /// number of layers (a single page has two). The derivation then divided the budget by two
+    /// instead of six and produced a window two and a half times over it. The shape the builder is
+    /// about to make is the only honest count for a window that does not exist yet; a roll, where the
+    /// open document IS the strip, passes its real count in.
     const int counted = layers > 0 ? layers : qMax(1, reference.slots().size() + 1);
     const qreal budgetBytes = qreal(megabytes) * 1000.0 * 1000.0;
     const qreal targetArea = budgetBytes / (4.0 * qreal(counted));
@@ -2660,7 +2875,7 @@ bool PdfPageNavigator::prepareForClose()
 
     /// Only now. The document stayed dirty until its ink was written, which is what kept the page
     /// window's own rule -- a dirty page is never dropped -- honest while the write was in flight.
-    m_document->setModified(false);
+    clearModifiedFlag();
     say(QStringLiteral("closing: page %1 of %2 written through the notebook, nothing for Krita to ask about")
             .arg(m_index + 1).arg(m_manifest.pages.size()));
     return true;
@@ -2764,9 +2979,7 @@ bool PdfPageNavigator::prepareForNotebookChange(QString *why)
     /// Only now, and only because every page above reached its artifact: leaving the document
     /// modified would have Krita ask whether to save it while the notebook is being closed under
     /// it -- and the answer would be "save the old page list".
-    if (m_document) {
-        m_document->setModified(false);
-    }
+    clearModifiedFlag();
     return true;
 }
 

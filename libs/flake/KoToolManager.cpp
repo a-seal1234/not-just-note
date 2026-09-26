@@ -472,17 +472,28 @@ void KoToolManager::Private::disconnectActiveTool()
 {
     if (canvasData->activeTool) {
         {
-            KoCanvasResourceProvider *resourceManager = canvasData->canvas->canvas()->resourceManager();
+            // A canvas that is already detached has no canvas widget and no resource provider, and
+            // this is reachable: KisView's destructor calls removeCanvasController -> detachCanvas
+            // -> here, and in the crash seen on the desktop harness both the canvas and its
+            // provider came back null (KoCanvasResourceProvider::hasDerivedResourceConverter with
+            // this == 0). There is nothing to take off a provider that is not there, and the tool
+            // is being deactivated either way.
+            KoCanvasResourceProvider *resourceManager =
+                canvasData->canvas && canvasData->canvas->canvas()
+                ? canvasData->canvas->canvas()->resourceManager()
+                : nullptr;
 
-            const QList<int> abstractKeys = canvasData->activeTool->toolAbstractResources().keys();
-            const QList<int> derivedKeys = canvasData->activeTool->toolConverters().keys();
-            for (int key : abstractKeys) {
-                if (resourceManager->hasAbstractResource(key))
-                    resourceManager->removeAbstractResource(key);
-            }
-            for (int key : derivedKeys) {
-                if (resourceManager->hasDerivedResourceConverter(key))
-                    resourceManager->removeDerivedResourceConverter(key);
+            if (resourceManager) {
+                const QList<int> abstractKeys = canvasData->activeTool->toolAbstractResources().keys();
+                const QList<int> derivedKeys = canvasData->activeTool->toolConverters().keys();
+                for (int key : abstractKeys) {
+                    if (resourceManager->hasAbstractResource(key))
+                        resourceManager->removeAbstractResource(key);
+                }
+                for (int key : derivedKeys) {
+                    if (resourceManager->hasDerivedResourceConverter(key))
+                        resourceManager->removeDerivedResourceConverter(key);
+                }
             }
         }
 

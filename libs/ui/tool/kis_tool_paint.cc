@@ -143,7 +143,18 @@ void KisToolPaint::tryRestoreOpacitySnapshot()
      * state before and after.
      */
 
-    KisCanvasResourceProvider *provider = qobject_cast<KisCanvas2*>(canvas())->viewManager()->canvasResourceProvider();
+    // A tool can be deactivated while its view is being torn down: KisView's destructor runs
+    // KoToolManager::removeCanvasController -> detachCanvas -> disconnectActiveTool -> deactivate()
+    // -> here, and by then the canvas widget and the view manager may already be gone. There is no
+    // provider to snapshot the preset from, and this is a heuristic on the brush preset rather than
+    // anything the page needs, so it is skipped. The crash seen on the desktop harness was
+    // KisViewManager::canvasResourceProvider() with a null view manager.
+    KisCanvas2 *canvasWidget = qobject_cast<KisCanvas2*>(canvas());
+    KisViewManager *viewManager = canvasWidget ? canvasWidget->viewManager() : nullptr;
+    KisCanvasResourceProvider *provider = viewManager ? viewManager->canvasResourceProvider() : nullptr;
+    if (!provider) {
+        return;
+    }
 
     KisPaintOpPresetSP newPreset = provider->currentPreset();
 
