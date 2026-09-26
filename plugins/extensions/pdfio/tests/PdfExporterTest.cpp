@@ -10,6 +10,8 @@
 
 #include <QElapsedTimer>
 #include <QFile>
+#include <QTransform>
+#include <QtMath>
 #include <QtTest>
 
 /**
@@ -48,6 +50,12 @@ private Q_SLOTS:
     void testPageWithoutReadableMediaBoxStillExports();
     void testRefusesInkWithoutAlpha();
     void testMediaBoxCases();
+
+    /// The notebook's own page turn, on top of whatever /Rotate the source declares: the paper has
+    /// to come out turned and the ink has to stay on it.
+    void testNotebookQuarterTurnTurnsPaperAndInk();
+    void testNotebookHalfTurnTurnsPaperAndInk();
+    void testNotebookFreeAngleTurnsPaperAndInk();
 
     /// The guard that makes a notebook whose pages are no longer the PDF's own order refuse to
     /// export, rather than write a file whose ink is on the wrong pages.
@@ -198,6 +206,37 @@ private:
                                   .arg(bounds.right()).arg(bounds.bottom());
         QVERIFY2(bounds.isValid() && qAbs(bounds.left() - 10) <= 4 && qAbs(bounds.top() - 10) <= 4,
                  qPrintable(where));
+    }
+
+    /// Whether two rectangles line up within \a tolerance pixels on every side. Used to compare
+    /// where the turned paper's own content came back without depending on a vector render being
+    /// pixel identical to a raster that was resampled rather than drawn by the renderer.
+    bool rectsClose(const QRect &a, const QRect &b, int tolerance) const
+    {
+        return a.isValid() && b.isValid() && qAbs(a.left() - b.left()) <= tolerance
+            && qAbs(a.top() - b.top()) <= tolerance && qAbs(a.right() - b.right()) <= tolerance
+            && qAbs(a.bottom() - b.bottom()) <= tolerance;
+    }
+
+    /// The paper as the notebook shows it: the page's render turned by the notebook's own rotation.
+    ///
+    /// PdfSourceRenderers::turnedForDisplay() is exactly this call, but that .cpp is not linked
+    /// into this test target, so the two lines are repeated here. The test measures the exporter
+    /// against the same QTransform turn the reader is built on, which is the point: the exported
+    /// page has to show what the notebook showed.
+    QImage turnedForDisplay(const QImage &rendered, int extraRotation) const
+    {
+        if (rendered.isNull() || extraRotation == 0) {
+            return rendered;
+        }
+        const int turn = ((extraRotation % 360) + 360) % 360;
+        const bool rightAngle = turn % 90 == 0;
+        /// An ARGB32 copy first, so that a free-angle turn's exposed corners come back transparent
+        /// instead of the black an opaque raster is filled with there. A corner of the bounding box
+        /// is not page content, and darkBounds() must not report the whole page because of it.
+        const QImage source = rendered.convertToFormat(QImage::Format_ARGB32);
+        return source.transformed(QTransform().rotate(extraRotation),
+                                  rightAngle ? Qt::FastTransformation : Qt::SmoothTransformation);
     }
 
     /// Peak resident set of this process, from /proc. Zero where the kernel does not report it.
@@ -944,6 +983,260 @@ void PdfExporterTest::testMediaBoxCases()
                  qPrintable(QStringLiteral("page %1: expected \"%2\", got \"%3\"")
                                 .arg(i + 1).arg(headings.at(i)).arg(exported.pageText(i))));
     }
+}
+
+/**
+ * A notebook page the user turned a quarter turn exports with the paper AND the ink turned.
+ *
+ * PDF /Rotate can name 90 degrees, so the source page's own box is untouched and /Rotate becomes
+ * the source's own rotation plus the notebook's. Before this fix extraRotation was not read at all:
+ * /Rotate stayed 0, the paper came out upright at 595x842, and the display-space ink was squeezed
+ * into the source box -- a 50x50 mark at (10,10) came back 35x71 at (7,14). The mark and the paper
+ * are measured separately here so "both turned" is a statement about pixels and not about intent.
+ */
+void PdfExporterTest::testNotebookQuarterTurnTurnsPaperAndInk()
+{
+    const QString source = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(source));
+    QCOMPARE(backend.pageInfo(0).rotation, 0);
+    QCOMPARE(backend.pageInfo(0).sizePt, QSizeF(595, 842));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    manifest.pages[0].extraRotation = 90;
+    const QSizeF display = manifest.pages[0].displaySizePt();
+    QCOMPARE(display, QSizeF(842, 595));
+
+    const QImage sourceRender = backend.renderPage(0, 72.0);
+    QVERIFY(!sourceRender.isNull());
+
+    /// The ink the user drew on the turned page, in display space: a red square at (10,10).
+    QHash<int, QImage> ink;
+    ink.insert(0, inkWithRedMark(QSize(qRound(display.width()), qRound(display.height()))));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString withInk = dir.filePath(QStringLiteral("quarter-turn.pdf"));
+    const QString paperOnly = dir.filePath(QStringLiteral("quarter-turn-paper.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), paperOnly, &why),
+             qPrintable(why));
+
+    /// The paper, on an export with no ink: the page measures what displaySizePt() says, /Rotate
+    /// carries the whole quarter turn, and the page's own content came out turned with it.
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(paperOnly));
+    QCOMPARE(clean.pageInfo(0).sizePt, display);
+    QCOMPARE(clean.pageInfo(0).rotation, 90);
+    const QImage cleanPage = clean.renderPage(0, 72.0);
+    QVERIFY(!cleanPage.isNull());
+    QCOMPARE(cleanPage.size(), sourceRender.size().transposed());
+
+    const QImage expectedPaper = turnedForDisplay(sourceRender, 90);
+    const QRect paperWhere = darkBounds(cleanPage);
+    const QRect paperExpected = darkBounds(expectedPaper);
+    QVERIFY2(rectsClose(paperWhere, paperExpected, 4),
+             qPrintable(QStringLiteral("the paper came back at (%1,%2)-(%3,%4), where the turned "
+                                       "page puts it at (%5,%6)-(%7,%8)")
+                            .arg(paperWhere.left()).arg(paperWhere.top())
+                            .arg(paperWhere.right()).arg(paperWhere.bottom())
+                            .arg(paperExpected.left()).arg(paperExpected.top())
+                            .arg(paperExpected.right()).arg(paperExpected.bottom())));
+
+    /// The ink, on the export with it: where it was drawn in the turned page's own space, at its
+    /// drawn size.
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    QCOMPARE(exported.pageInfo(0).sizePt, display);
+    const QImage rendered = exported.renderPage(0, 72.0);
+    QVERIFY(!rendered.isNull());
+    const QRect mark = redMarkBounds(rendered);
+    QVERIFY2(mark.isValid(), "the mark is not on the exported page");
+    const QString where = QStringLiteral("the mark came back at (%1,%2) measuring %3x%4, expected "
+                                         "50x50 at (10,10)")
+                              .arg(mark.left()).arg(mark.top()).arg(mark.width()).arg(mark.height());
+    QVERIFY2(qAbs(mark.left() - 10) <= 3 && qAbs(mark.top() - 10) <= 3
+                 && qAbs(mark.width() - 50) <= 3 && qAbs(mark.height() - 50) <= 3,
+             qPrintable(where));
+
+    /// The page's own text is still there, and still selectable.
+    QVERIFY2(exported.pageText(0).contains(QStringLiteral("Rotation zero")),
+             qPrintable(exported.pageText(0)));
+}
+
+/**
+ * A notebook page turned half way round exports with the paper and the ink both upside down.
+ *
+ * The page used here already declares /Rotate 90, so the notebook's half turn has to be ADDED to
+ * it: the new page object must be written with /Rotate 270, replacing the source's own value.
+ * Writing only a missing /Rotate -- what an insert would do -- would leave the source's 90 in place
+ * and export the page a quarter turn out. A half turn keeps the page's displayed size, so only the
+ * paper's own content can say which way up it is: the ink at (10,10) comes back at (10,10) either
+ * way, because a raster turned 180 and then looked at 180 degrees later looks the same.
+ */
+void PdfExporterTest::testNotebookHalfTurnTurnsPaperAndInk()
+{
+    const QString source = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(source));
+    QCOMPARE(backend.pageInfo(1).rotation, 90);
+    QCOMPARE(backend.pageInfo(1).sizePt, QSizeF(842, 595));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    manifest.pages[1].extraRotation = 180;
+    const QSizeF display = manifest.pages[1].displaySizePt();
+    QCOMPARE(display, QSizeF(842, 595));
+
+    const QImage sourceRender = backend.renderPage(1, 72.0);
+    QVERIFY(!sourceRender.isNull());
+
+    QHash<int, QImage> ink;
+    ink.insert(1, inkWithRedMark(QSize(qRound(display.width()), qRound(display.height()))));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString withInk = dir.filePath(QStringLiteral("half-turn.pdf"));
+    const QString paperOnly = dir.filePath(QStringLiteral("half-turn-paper.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), paperOnly, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(paperOnly));
+    QCOMPARE(clean.pageInfo(1).sizePt, display);
+    QCOMPARE(clean.pageInfo(1).rotation, 270);
+    const QImage cleanPage = clean.renderPage(1, 72.0);
+    QVERIFY(!cleanPage.isNull());
+    QCOMPARE(cleanPage.size(), sourceRender.size());
+
+    const QImage expectedPaper = turnedForDisplay(sourceRender, 180);
+    const QRect paperWhere = darkBounds(cleanPage);
+    const QRect paperExpected = darkBounds(expectedPaper);
+    QVERIFY2(rectsClose(paperWhere, paperExpected, 4),
+             qPrintable(QStringLiteral("the paper came back at (%1,%2)-(%3,%4), where the turned "
+                                       "page puts it at (%5,%6)-(%7,%8)")
+                            .arg(paperWhere.left()).arg(paperWhere.top())
+                            .arg(paperWhere.right()).arg(paperWhere.bottom())
+                            .arg(paperExpected.left()).arg(paperExpected.top())
+                            .arg(paperExpected.right()).arg(paperExpected.bottom())));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    QCOMPARE(exported.pageInfo(1).sizePt, display);
+    QCOMPARE(exported.pageInfo(1).rotation, 270);
+    const QImage rendered = exported.renderPage(1, 72.0);
+    QVERIFY(!rendered.isNull());
+    const QRect mark = redMarkBounds(rendered);
+    QVERIFY2(mark.isValid(), "the mark is not on the exported page");
+    const QString where = QStringLiteral("the mark came back at (%1,%2) measuring %3x%4, expected "
+                                         "50x50 at (10,10)")
+                              .arg(mark.left()).arg(mark.top()).arg(mark.width()).arg(mark.height());
+    QVERIFY2(qAbs(mark.left() - 10) <= 3 && qAbs(mark.top() - 10) <= 3
+                 && qAbs(mark.width() - 50) <= 3 && qAbs(mark.height() - 50) <= 3,
+             qPrintable(where));
+
+    QVERIFY2(exported.pageText(1).contains(QStringLiteral("Rotation ninety")),
+             qPrintable(exported.pageText(1)));
+}
+
+/**
+ * A notebook page set down at a free angle -- 37 degrees -- exports with the paper and the ink
+ * turned by that angle, and its box is the bounding box displaySizePt() reports.
+ *
+ * /Rotate cannot name 37 degrees, so the turn is baked into the page: the page's own content is
+ * drawn under a rotation matrix and the MediaBox becomes the rectangle the turned sheet fits in,
+ * while the source's own /Rotate 90 stays in charge of the quarter turn the file already declared.
+ * A page set down at an angle is bigger than its sizePt; that is the accepted cost.
+ */
+void PdfExporterTest::testNotebookFreeAngleTurnsPaperAndInk()
+{
+    const QString source = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(source));
+    QCOMPARE(backend.pageInfo(1).rotation, 90);
+    QCOMPARE(backend.pageInfo(1).sizePt, QSizeF(842, 595));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    manifest.pages[1].extraRotation = 37;
+    const QSizeF display = manifest.pages[1].displaySizePt();
+    const qreal radians = qDegreesToRadians(37.0);
+    QCOMPARE(display.width(), 842 * qAbs(qCos(radians)) + 595 * qAbs(qSin(radians)));
+    QCOMPARE(display.height(), 842 * qAbs(qSin(radians)) + 595 * qAbs(qCos(radians)));
+    QVERIFY2(display.width() > 842 && display.height() > 595,
+             "a sheet set down at an angle does not fit in its unturned box");
+
+    const QImage sourceRender = backend.renderPage(1, 72.0);
+    QVERIFY(!sourceRender.isNull());
+    QVERIFY(qAbs(sourceRender.width() - 842) <= 1 && qAbs(sourceRender.height() - 595) <= 1);
+
+    QHash<int, QImage> ink;
+    ink.insert(1, inkWithRedMark(QSize(qRound(display.width()), qRound(display.height()))));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString withInk = dir.filePath(QStringLiteral("free-angle.pdf"));
+    const QString paperOnly = dir.filePath(QStringLiteral("free-angle-paper.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), paperOnly, &why),
+             qPrintable(why));
+
+    /// The box is the bounding box of the turned sheet, and the source's own quarter turn is still
+    /// what /Rotate says.
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(paperOnly));
+    const QSizeF box = clean.pageInfo(1).sizePt;
+    QVERIFY2(qAbs(box.width() - display.width()) <= 0.05
+                 && qAbs(box.height() - display.height()) <= 0.05,
+             qPrintable(QStringLiteral("the page box is %1x%2, where displaySizePt() says %3x%4")
+                            .arg(box.width()).arg(box.height())
+                            .arg(display.width()).arg(display.height())));
+    QCOMPARE(clean.pageInfo(1).rotation, 90);
+
+    const QImage cleanPage = clean.renderPage(1, 72.0);
+    QVERIFY(!cleanPage.isNull());
+    QVERIFY2(qAbs(cleanPage.width() - qRound(display.width())) <= 2
+                 && qAbs(cleanPage.height() - qRound(display.height())) <= 2,
+             qPrintable(QStringLiteral("the rendered page is %1x%2, expected about %3x%4")
+                            .arg(cleanPage.width()).arg(cleanPage.height())
+                            .arg(qRound(display.width())).arg(qRound(display.height()))));
+
+    /// The paper is turned by 37 degrees, not merely a bigger box: its own content came back where
+    /// the notebook's own render puts it.
+    const QImage expectedPaper = turnedForDisplay(sourceRender, 37);
+    const QRect paperWhere = darkBounds(cleanPage);
+    const QRect paperExpected = darkBounds(expectedPaper);
+    QVERIFY2(rectsClose(paperWhere, paperExpected, 8),
+             qPrintable(QStringLiteral("the paper came back at (%1,%2)-(%3,%4), where the turned "
+                                       "page puts it at (%5,%6)-(%7,%8)")
+                            .arg(paperWhere.left()).arg(paperWhere.top())
+                            .arg(paperWhere.right()).arg(paperWhere.bottom())
+                            .arg(paperExpected.left()).arg(paperExpected.top())
+                            .arg(paperExpected.right()).arg(paperExpected.bottom())));
+
+    /// And the ink is where it was drawn in the turned page's space.
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    const QImage rendered = exported.renderPage(1, 72.0);
+    QVERIFY(!rendered.isNull());
+    const QRect mark = redMarkBounds(rendered);
+    QVERIFY2(mark.isValid(), "the mark is not on the exported page");
+    const QString where = QStringLiteral("the mark came back at (%1,%2) measuring %3x%4, expected "
+                                         "50x50 at (10,10)")
+                              .arg(mark.left()).arg(mark.top()).arg(mark.width()).arg(mark.height());
+    QVERIFY2(qAbs(mark.left() - 10) <= 4 && qAbs(mark.top() - 10) <= 4
+                 && qAbs(mark.width() - 50) <= 4 && qAbs(mark.height() - 50) <= 4,
+             qPrintable(where));
+
+    /// The page's own text survived the bake. A free-angle turn reorders what an extractor sees --
+    /// the runs are no longer on one horizontal baseline -- so this checks that the text is still
+    /// extractable rather than that it spells the source's line back in the same order.
+    QVERIFY2(!exported.pageText(1).trimmed().isEmpty(),
+             "the baked page's own text was not extractable");
+    /// And the page is not blank: the paper's content came through and not only the ink.
+    QVERIFY2(darkPixels(cleanPage) > 0, "the baked page came out blank");
 }
 
 QTEST_MAIN(PdfExporterTest)

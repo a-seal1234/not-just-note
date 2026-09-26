@@ -12,6 +12,9 @@
 #include <QHash>
 #include <QSet>
 #include <QTransform>
+#include <QtMath>
+
+#include <cmath>
 
 namespace {
 
@@ -1400,6 +1403,165 @@ bool effectiveRotation(PdfDocument *doc, const PageEntry &page, QString *why, in
     return true;
 }
 
+/// \a degrees brought into 0..359, so a turn is one number however it was written.
+int normalizedTurn(int degrees)
+{
+    return ((degrees % 360) + 360) % 360;
+}
+
+/// Whether \a degrees is a whole number of right angles -- the only turns /Rotate can name.
+bool isRightAngleTurn(int degrees)
+{
+    return normalizedTurn(degrees) % 90 == 0;
+}
+
+/// Where a notebook page's turn puts the page in its own user space, and how the new page object
+/// has to say so.
+///
+/// PDF /Rotate can only name a multiple of 90 degrees, so a right angle is written there and
+/// nothing else moves: the reader turns the untouched page itself. Any other angle cannot go
+/// through /Rotate at all, so it is baked into the page -- its content is drawn under a rotation
+/// matrix and the box written is the rectangle the turned sheet fits in, which is what
+/// PdfPageRecord::displaySizePt() reports. That rectangle is bigger than the sheet, and that is the
+/// accepted cost of a page set down at an angle.
+///
+/// The ink plane is handed over in display space, already turned with the paper, so it is placed
+/// with the same counter-rotation it always was; only the box it fills changes, to the turned
+/// sheet's own. Nothing here is scaled to a rectangle the page does not have, which is what made a
+/// page the user turned come out as unturned paper with its notes squeezed into the source box.
+struct PageTurn {
+    int extraRotation = 0;   ///< the notebook's turn, 0..359
+    int writtenRotation = 0; ///< the /Rotate the new page object is written with
+    bool bake = false;       ///< true when the turn does not fit /Rotate and is drawn into the page
+    bool fromRecordedSize = false; ///< the source's box could not be read; the notebook's size stood in
+    /// The box the page occupies in the new page object's own space: the source's own box when the
+    /// turn goes through /Rotate, the turned sheet's bounding box when it is baked in.
+    double x0 = 0;
+    double y0 = 0;
+    double x1 = 0;
+    double y1 = 0;
+    /// The transform the page's own content is drawn under when baking: the PDF matrix
+    /// [a b c d tx ty], mapping the source's user space into the new page's own space.
+    double a = 1;
+    double b = 0;
+    double c = 0;
+    double d = 1;
+    double tx = 0;
+    double ty = 0;
+};
+
+/// The PDF matrix that turns the box [x0,y0..x1,y1] clockwise by \a extraRotation, and the box the
+/// turned sheet fits in once that matrix is applied to it.
+///
+/// The turn has to be the same visual clockwise turn the notebook applies to the render
+/// (PdfSourceRenderers::turnedForDisplay) and to the artifact (PdfPageRotator), or the ink no longer
+/// lies on the paper. In the page's own user space, where y grows upwards, that is the matrix
+/// [cos, -sin, sin, cos] with a translation that puts the turned box's lower left corner at the
+/// origin: the same matrix Qt writes for rotate(+angle) in the raster's y-down space, with the two
+/// y flips of the raw/render conversion cancelling out.
+void bakeTurnMatrix(double x0, double y0, double x1, double y1, int extraRotation, PageTurn *turn)
+{
+    const qreal radians = qDegreesToRadians(qreal(normalizedTurn(extraRotation)));
+    const double cosE = std::cos(radians);
+    const double sinE = std::sin(radians);
+
+    const double xs[4] = {x0, x1, x1, x0};
+    const double ys[4] = {y0, y0, y1, y1};
+    double minX = 0;
+    double minY = 0;
+    double maxX = 0;
+    double maxY = 0;
+    for (int i = 0; i < 4; ++i) {
+        const double x = cosE * xs[i] + sinE * ys[i];
+        const double y = -sinE * xs[i] + cosE * ys[i];
+        if (i == 0) {
+            minX = maxX = x;
+            minY = maxY = y;
+            continue;
+        }
+        minX = qMin(minX, x);
+        maxX = qMax(maxX, x);
+        minY = qMin(minY, y);
+        maxY = qMax(maxY, y);
+    }
+
+    turn->bake = true;
+    turn->a = cosE;
+    turn->b = -sinE;
+    turn->c = sinE;
+    turn->d = cosE;
+    turn->tx = -minX;
+    turn->ty = -minY;
+    turn->x0 = 0;
+    turn->y0 = 0;
+    turn->x1 = maxX - minX;
+    turn->y1 = maxY - minY;
+}
+
+/// Reads the source page's own box and rotation and decides how the notebook's turn has to be
+/// written.
+///
+/// A box that cannot be read falls back to the size the notebook recorded when it was made, which
+/// is the source's DISPLAYED size, so a quarter turn of the source is undone before it can stand in
+/// for a page-space box. One page with an unreadable box is not a reason to abandon the rest of the
+/// notebook.
+bool planPageTurn(PdfDocument *doc, const PageEntry &page, const QSizeF &recordedSizePt,
+                  int extraRotation, PageTurn *turn, QString *why)
+{
+    turn->extraRotation = normalizedTurn(extraRotation);
+
+    int rotation = 0;
+    if (!effectiveRotation(doc, page, why, &rotation)) {
+        return false;
+    }
+
+    double x0 = 0;
+    double y0 = 0;
+    double x1 = 0;
+    double y1 = 0;
+    QString rectWhy;
+    if (!effectiveRect(doc, page, &rectWhy, &x0, &y0, &x1, &y1)) {
+        if (recordedSizePt.isEmpty()) {
+            fail(why, QStringLiteral("page %1: %2, and the notebook has no recorded size for it "
+                                     "either")
+                          .arg(page.number).arg(rectWhy));
+            return false;
+        }
+        /// Both renderers report the size the reader shows, with /Rotate already applied, so a page
+        /// turned a quarter turn is recorded as tall-by-wide when its own user space is
+        /// wide-by-tall. Measured on ex-mediabox-cases.pdf, a 50x50 mark came back 35x71 on the
+        /// /Rotate 90 page and the /Rotate 270 page's mark fell off the page entirely.
+        const bool sourceRightAngle = rotation == 90 || rotation == 270;
+        x0 = 0;
+        y0 = 0;
+        x1 = sourceRightAngle ? recordedSizePt.height() : recordedSizePt.width();
+        y1 = sourceRightAngle ? recordedSizePt.width() : recordedSizePt.height();
+        turn->fromRecordedSize = true;
+
+        qWarning("[pdfio] page %d: %s; using the notebook's own %.2fx%.2f points%s", page.number,
+                 qPrintable(rectWhy), recordedSizePt.width(), recordedSizePt.height(),
+                 sourceRightAngle ? ", turned back into page space for the /Rotate" : "");
+    }
+
+    if (isRightAngleTurn(turn->extraRotation)) {
+        /// The reader can carry this turn itself: the page's own content and box stay as they are,
+        /// and /Rotate becomes the source's rotation plus the notebook's.
+        turn->writtenRotation = (rotation + turn->extraRotation) % 360;
+        turn->bake = false;
+        turn->x0 = x0;
+        turn->y0 = y0;
+        turn->x1 = x1;
+        turn->y1 = y1;
+        return true;
+    }
+
+    /// A free angle: /Rotate cannot name it, so the source's own rotation stays and the turn is
+    /// drawn into the page's user space instead.
+    turn->writtenRotation = rotation;
+    bakeTurnMatrix(x0, y0, x1, y1, turn->extraRotation, turn);
+    return true;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Writing.
 // ---------------------------------------------------------------------------------------------
@@ -1671,6 +1833,130 @@ int contentsValueEnd(const QByteArray &body, int valueAt)
     return p + 1;
 }
 
+/// Index just past the value of a dictionary key whose value starts at \a valueAt. Handles the
+/// shapes a page dictionary uses for the fields a baked turn has to rewrite: an array, a
+/// dictionary, an indirect reference "N G R", a name, a literal or hex string, and a bare number
+/// (/Rotate is one).
+int dictValueEnd(const QByteArray &body, int valueAt)
+{
+    const int v = skipWhite(body, valueAt);
+    if (v >= body.size()) {
+        return -1;
+    }
+    const char c = body.at(v);
+    if (c == '[') {
+        return arrayEndIndex(body, v);
+    }
+    if (c == '<') {
+        if (body.mid(v, 2) == "<<") {
+            return dictEndIndex(body, v);
+        }
+        int i = v + 1;
+        while (i < body.size() && body.at(i) != '>') {
+            ++i;
+        }
+        return i < body.size() ? i + 1 : -1;
+    }
+    if (c == '(') {
+        int i = v + 1;
+        int parens = 1;
+        while (i < body.size() && parens > 0) {
+            const char d = body.at(i);
+            if (d == '\\') {
+                i += 2;
+                continue;
+            }
+            if (d == '(') {
+                ++parens;
+            } else if (d == ')') {
+                --parens;
+            }
+            ++i;
+        }
+        return i;
+    }
+    if (c == '/') {
+        int i = v + 1;
+        while (i < body.size() && !isDelimiter(body.at(i))) {
+            ++i;
+        }
+        return i;
+    }
+
+    /// A number, or the "N G R" of an indirect reference.
+    int i = v;
+    qint64 first = 0;
+    if (readInt(body, &i, &first)) {
+        const int afterFirst = i;
+        int j = i;
+        qint64 second = 0;
+        if (readInt(body, &j, &second)) {
+            const int p = skipWhite(body, j);
+            if (p < body.size() && body.at(p) == 'R') {
+                return p + 1;
+            }
+        }
+        return afterFirst;
+    }
+
+    while (i < body.size() && !isWhite(body.at(i)) && !isDelimiter(body.at(i))) {
+        ++i;
+    }
+    return i > v ? i : -1;
+}
+
+/// Replaces the value of \a key in the page dictionary \a body, or appends it when the key is not
+/// there yet.
+///
+/// An update that only inserted a key it could not find would leave the page's own, unturned
+/// value in place -- the source's /Rotate 90 on a page the notebook turned a further 180, or the
+/// source's /MediaBox on a page whose turn had to be baked into a bigger box. The new page object
+/// is built from the old one, so every field the bake overrides has to be replaced, not skipped.
+bool setDictValue(QByteArray *body, const char *key, const QByteArray &value)
+{
+    const int start = skipWhite(*body, 0);
+    const int end = dictEndIndex(*body, start);
+    if (end < 0) {
+        return false;
+    }
+    const int at = dictValueAt(*body, start, end, key);
+    if (at < 0) {
+        *body = body->left(end - 2) + " /" + key + " " + value + " " + body->mid(end - 2);
+        return true;
+    }
+    const int valueEnd = dictValueEnd(*body, at);
+    if (valueEnd < 0) {
+        return false;
+    }
+    *body = body->left(at) + " " + value + body->mid(valueEnd);
+    return true;
+}
+
+/// The four numbers of a rectangle value, or false when the slice is not one.
+bool rectNumbers(const QByteArray &slice, double *values)
+{
+    const QStringList parts = QString::fromLatin1(slice).simplified().split(QLatin1Char(' '));
+    if (parts.size() != 4) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        bool ok = false;
+        values[i] = parts.at(i).toDouble(&ok);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The "[ x0 y0 x1 y1 ]" of \a turn's box.
+QByteArray boxArray(const PageTurn &turn)
+{
+    return "[ " + QByteArray::number(turn.x0, 'f', 4) + " " + QByteArray::number(turn.y0, 'f', 4)
+        + " " + QByteArray::number(turn.x1, 'f', 4) + " " + QByteArray::number(turn.y1, 'f', 4)
+        + " ]";
+}
+
 bool contentEntries(PdfDocument *doc, const QByteArray &owner, int valueAt, int depth,
                     QByteArray *out, int *count, QString *why);
 
@@ -1806,11 +2092,50 @@ bool contentEntries(PdfDocument *doc, const QByteArray &owner, int valueAt, int 
     return appendContentEntry(doc, int(number), int(generation), depth, out, count, why);
 }
 
+/// Puts the turn stream \a turnNumber in front of the page's /Contents.
+///
+/// A page that carries no ink still has to be turned, and a turn that cannot go through /Rotate is
+/// drawn by the page's own content -- so the turn stream has to become the first entry of the
+/// content list. An indirect /Contents array is spliced flat exactly as preparePage() does it, or a
+/// nested array would make readers answer "Weird page contents" and draw a blank page.
+bool prependContentEntry(PdfDocument *doc, const PageEntry &page, int turnNumber, QByteArray *body,
+                         QString *why)
+{
+    const int dictStart = skipWhite(*body, 0);
+    const int dictEnd = dictEndIndex(*body, dictStart);
+    if (dictEnd < 0) {
+        fail(why, QStringLiteral("page %1 is not a dictionary").arg(page.number));
+        return false;
+    }
+    const QByteArray turnRef = QByteArray::number(turnNumber) + " 0 R";
+    const int contentsAt = dictValueAt(*body, dictStart, dictEnd, "Contents");
+    if (contentsAt < 0) {
+        *body = body->left(dictEnd - 2) + " /Contents [ " + turnRef + " ] " + body->mid(dictEnd - 2);
+        return true;
+    }
+
+    QByteArray entries;
+    int count = 0;
+    QString contentWhy;
+    if (!contentEntries(doc, *body, contentsAt, 0, &entries, &count, &contentWhy)) {
+        fail(why, QStringLiteral("page %1: %2").arg(page.number).arg(contentWhy));
+        return false;
+    }
+    const int valueEnd = contentsValueEnd(*body, contentsAt);
+    if (valueEnd < 0) {
+        fail(why, QStringLiteral("page %1 has an unreadable /Contents").arg(page.number));
+        return false;
+    }
+    *body = body->left(contentsAt) + " [ " + turnRef + " " + entries + " ]" + body->mid(valueEnd);
+    return true;
+}
+
 /// The page body with the ink content stream appended to /Contents and /pdfioInk added to the
 /// page's (possibly inherited) resources.
 bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int contentNumber,
-                 int saveContentNumber, int *nextObject, QList<WrittenObject> *appended,
-                 QByteArray *newBody, int *originalContents, QString *why)
+                 int saveContentNumber, int turnNumber, int *nextObject,
+                 QList<WrittenObject> *appended, QByteArray *newBody, int *originalContents,
+                 QString *why)
 {
     QByteArray body;
     if (!objectByNumber(doc, page.number, &body, why)) {
@@ -1823,17 +2148,21 @@ bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int c
         return false;
     }
 
-    /// /Contents becomes [save, original..., ink]: the save stream opens the graphics state
-    /// before the page's own content and the ink stream closes it again, so the overlay is not
-    /// subject to a transform or clip the source forgot to restore. A page that legitimately had
-    /// no contents at all gets [save, ink].
+    /// /Contents becomes [save, turn, original..., ink]: the save stream opens the graphics state
+    /// before the page's own content, the turn stream (when the notebook's turn is a free angle and
+    /// has to be drawn in rather than written as /Rotate) puts the page's own content under that
+    /// turn, and the ink stream closes the state again so the overlay is not subject to a transform
+    /// or clip the source forgot to restore. A page that legitimately had no contents at all gets
+    /// [save, ink].
     const int contentsAt = dictValueAt(body, dictStart, dictEnd, "Contents");
     const QByteArray contentRef = QByteArray::number(contentNumber) + " 0 R";
     const QByteArray saveRef = QByteArray::number(saveContentNumber) + " 0 R";
+    const QByteArray turnRef =
+        turnNumber >= 0 ? QByteArray::number(turnNumber) + " 0 R " : QByteArray();
     *originalContents = 0;
     if (contentsAt < 0) {
-        body = body.left(dictEnd - 2) + " /Contents [ " + saveRef + " " + contentRef + " ] "
-               + body.mid(dictEnd - 2);
+        body = body.left(dictEnd - 2) + " /Contents [ " + saveRef + " " + turnRef + contentRef
+               + " ] " + body.mid(dictEnd - 2);
     } else {
         /// The original content has to sit in the same array as the save and the ink streams, as
         /// stream references. A /Contents that is an indirect reference to an array is resolved and
@@ -1856,8 +2185,8 @@ bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int c
             fail(why, QStringLiteral("page %1 has an unreadable /Contents").arg(page.number));
             return false;
         }
-        body = body.left(contentsAt) + " [ " + saveRef + " " + entries + contentRef + " ]"
-               + body.mid(valueEnd);
+        body = body.left(contentsAt) + " [ " + saveRef + " " + turnRef + entries + contentRef
+               + " ]" + body.mid(valueEnd);
     }
 
     dictStart = skipWhite(body, 0);
@@ -1902,21 +2231,41 @@ bool preparePage(PdfDocument *doc, const PageEntry &page, int imageNumber, int c
  * The body of a NEW page object for \a page, ready for the new page tree.
  *
  * With an \a imageNumber this is preparePage(): the page's own dictionary, its /Contents extended
- * by the save and ink streams, and its /Resources carrying the overlay's XObject.
+ * by the save, turn and ink streams, and its /Resources carrying the overlay's XObject.
  *
- * With no overlay (\a imageNumber < 0) the page is copied as it stands.
+ * With no overlay (\a imageNumber < 0) the page is copied as it stands -- and still turned: a page
+ * the notebook turned is a turned page whether or not it was drawn on.
  *
- * Either way, what the page inherited from the OLD page tree is written into it. The new tree does
- * not have the old one's ancestors: a page whose /MediaBox, /Resources or /Rotate lived on a
- * /Pages node would otherwise come out with no size, no fonts, or the wrong way up.
+ * Either way the notebook's own turn is written in: as /Rotate when it is a right angle the reader
+ * can carry, and as a transform the page's own content is drawn under when it is a free angle
+ * /Rotate cannot name. What the page inherited from the OLD page tree is written into it as well.
+ * The new tree does not have the old one's ancestors: a page whose /MediaBox, /Resources or /Rotate
+ * lived on a /Pages node would otherwise come out with no size, no fonts, or the wrong way up.
  */
-bool copyPageObject(PdfDocument *doc, const PageEntry &page, const QSizeF &recordedSizePt,
-                    int imageNumber, int contentNumber, int saveContentNumber, int *nextObject,
+bool copyPageObject(PdfDocument *doc, const PageEntry &page, const PageTurn &turn, int imageNumber,
+                    int contentNumber, int saveContentNumber, int *nextObject,
                     QList<WrittenObject> *appended, QByteArray *newBody, int *originalContents,
                     QString *why)
 {
     int unusedContents = 0;
     int *contents = originalContents ? originalContents : &unusedContents;
+
+    /// When the turn is a free angle it is drawn into the page: the page's own content is put under
+    /// the turn matrix, and the ink plane (when there is one) is placed in the turned sheet's own
+    /// box. The turn stream is the first thing the page's content list draws.
+    int turnNumber = -1;
+    if (turn.bake) {
+        const QByteArray matrix = QByteArray::number(turn.a, 'f', 8) + " "
+                                  + QByteArray::number(turn.b, 'f', 8) + " "
+                                  + QByteArray::number(turn.c, 'f', 8) + " "
+                                  + QByteArray::number(turn.d, 'f', 8) + " "
+                                  + QByteArray::number(turn.tx, 'f', 8) + " "
+                                  + QByteArray::number(turn.ty, 'f', 8) + " cm" + NL;
+        turnNumber = (*nextObject)++;
+        appended->append(WrittenObject{turnNumber, 0,
+                                       "<< /Length " + QByteArray::number(matrix.size()) + " >>"
+                                           + NL + "stream" + NL + matrix + "endstream"});
+    }
 
     QByteArray body;
     if (imageNumber < 0) {
@@ -1924,8 +2273,11 @@ bool copyPageObject(PdfDocument *doc, const PageEntry &page, const QSizeF &recor
             return false;
         }
         *contents = 0;
-    } else if (!preparePage(doc, page, imageNumber, contentNumber, saveContentNumber, nextObject,
-                            appended, &body, contents, why)) {
+        if (turnNumber >= 0 && !prependContentEntry(doc, page, turnNumber, &body, why)) {
+            return false;
+        }
+    } else if (!preparePage(doc, page, imageNumber, contentNumber, saveContentNumber, turnNumber,
+                            nextObject, appended, &body, contents, why)) {
         return false;
     }
 
@@ -1954,49 +2306,24 @@ bool copyPageObject(PdfDocument *doc, const PageEntry &page, const QSizeF &recor
         }
     }
 
-    /// The turn comes first: it is what the recorded size has to be undone by when the page's own
-    /// box cannot be read, exactly as the ink placement does it.
-    int rotation = 0;
-    if (!effectiveRotation(doc, page, why, &rotation)) {
-        return false;
-    }
-
-    /// /MediaBox: the page's own, or the one it inherited. A page whose box cannot be read at all
-    /// falls back to the size the notebook recorded when it was made -- the same fallback the
-    /// overlay placement uses, and the reason a notebook made from a file with an unreadable box
-    /// still exports. A new page object cannot inherit a box from a tree this one did not keep, so
-    /// the box has to be written in either way; without one the page has no size.
-    {
-        double x0 = 0;
-        double y0 = 0;
-        double x1 = 0;
-        double y1 = 0;
-        QString rectWhy;
-        if (!effectiveRect(doc, page, &rectWhy, &x0, &y0, &x1, &y1)) {
-            if (recordedSizePt.isEmpty()) {
-                fail(why, QStringLiteral("page %1: %2, and the notebook has no recorded size for it "
-                                         "either")
-                              .arg(page.number).arg(rectWhy));
-                return false;
-            }
-            const bool quarterTurn = rotation == 90 || rotation == 270;
-            x0 = 0;
-            y0 = 0;
-            x1 = quarterTurn ? recordedSizePt.height() : recordedSizePt.width();
-            y1 = quarterTurn ? recordedSizePt.width() : recordedSizePt.height();
-            qWarning("[pdfio] page %d: %s; using the notebook's own %.2fx%.2f points%s",
-                     page.number, qPrintable(rectWhy), recordedSizePt.width(),
-                     recordedSizePt.height(),
-                     quarterTurn ? ", turned back into page space for the /Rotate" : "");
+    /// /MediaBox: the box the new page occupies. A baked turn needs the turned sheet's bounding
+    /// box -- the rectangle displaySizePt() reports -- and has to replace the page's own box, which
+    /// is still in the unturned frame. A right-angle turn keeps the source's own box, because the
+    /// reader turns the page itself. A new page object cannot inherit a box from a tree this one
+    /// did not keep, so the box has to be written in either way; without one the page has no size.
+    if (turn.bake) {
+        if (!setDictValue(&body, "MediaBox", boxArray(turn))) {
+            fail(why, QStringLiteral("page %1 has an unreadable /MediaBox").arg(page.number));
+            return false;
         }
-        insertIfAbsent("MediaBox", "[ " + QByteArray::number(x0, 'f', 4) + " "
-                                       + QByteArray::number(y0, 'f', 4) + " "
-                                       + QByteArray::number(x1, 'f', 4) + " "
-                                       + QByteArray::number(y1, 'f', 4) + " ]");
+    } else {
+        insertIfAbsent("MediaBox", boxArray(turn));
     }
 
-    /// /CropBox: what the reader actually shows, when the page or an ancestor has one. Written as
-    /// it was read, because its numbers are the writer's and this code has no reason to touch them.
+    /// /CropBox: what the reader actually shows, when the page or an ancestor has one. A baked turn
+    /// has to carry it through the same transform as the content, or the clip would stay in the
+    /// unturned frame and cut the turned sheet; otherwise its numbers are the writer's and this
+    /// code has no reason to touch them.
     {
         QByteArray owner;
         int start = 0;
@@ -2010,12 +2337,56 @@ bool copyPageObject(PdfDocument *doc, const PageEntry &page, const QSizeF &recor
                 fail(why, QStringLiteral("page %1 has an unreadable /CropBox").arg(page.number));
                 return false;
             }
-            insertIfAbsent("CropBox", owner.mid(begin, close - begin + 1));
+            if (turn.bake) {
+                double corners[4] = {0, 0, 0, 0};
+                if (!rectNumbers(owner.mid(begin + 1, close - begin - 1), corners)) {
+                    fail(why,
+                         QStringLiteral("page %1 has an unreadable /CropBox").arg(page.number));
+                    return false;
+                }
+                const double cx[4] = {corners[0], corners[2], corners[2], corners[0]};
+                const double cy[4] = {corners[1], corners[1], corners[3], corners[3]};
+                double minX = 0;
+                double minY = 0;
+                double maxX = 0;
+                double maxY = 0;
+                for (int i = 0; i < 4; ++i) {
+                    const double x = turn.a * cx[i] + turn.c * cy[i] + turn.tx;
+                    const double y = turn.b * cx[i] + turn.d * cy[i] + turn.ty;
+                    if (i == 0) {
+                        minX = maxX = x;
+                        minY = maxY = y;
+                        continue;
+                    }
+                    minX = qMin(minX, x);
+                    maxX = qMax(maxX, x);
+                    minY = qMin(minY, y);
+                    maxY = qMax(maxY, y);
+                }
+                const QByteArray box = "[ " + QByteArray::number(minX, 'f', 4) + " "
+                    + QByteArray::number(minY, 'f', 4) + " " + QByteArray::number(maxX, 'f', 4)
+                    + " " + QByteArray::number(maxY, 'f', 4) + " ]";
+                if (!setDictValue(&body, "CropBox", box)) {
+                    fail(why,
+                         QStringLiteral("page %1 has an unreadable /CropBox").arg(page.number));
+                    return false;
+                }
+            } else {
+                insertIfAbsent("CropBox", owner.mid(begin, close - begin + 1));
+            }
         }
     }
 
-    if (rotation != 0) {
-        insertIfAbsent("Rotate", QByteArray::number(rotation));
+    /// /Rotate: the source's own rotation plus the notebook's, when the notebook's turn is a right
+    /// angle. A page whose own dictionary carries a /Rotate has to be overridden where the sum
+    /// differs -- inserting only a missing key would keep the source's value.
+    if (turn.extraRotation != 0) {
+        if (!setDictValue(&body, "Rotate", QByteArray::number(turn.writtenRotation))) {
+            fail(why, QStringLiteral("page %1 has an unreadable /Rotate").arg(page.number));
+            return false;
+        }
+    } else if (turn.writtenRotation != 0) {
+        insertIfAbsent("Rotate", QByteArray::number(turn.writtenRotation));
     }
 
     *newBody = body;
@@ -2117,11 +2488,17 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         QHash<int, QImage>::const_iterator found = ink.constFind(i);
         const bool hasInk = found != ink.constEnd() && !found->isNull();
         if (!hasInk) {
-            /// A page with no ink is still a page of the notebook: copied into the export untouched,
-            /// in its place. Skipping it would silently shorten the notebook.
+            /// A page with no ink is still a page of the notebook: copied into the export, in its
+            /// place, and turned by the notebook's own rotation -- a page the user turned is a
+            /// turned page whether or not anything was drawn on it. Skipping it would silently
+            /// shorten the notebook.
+            PageTurn plainTurn;
+            if (!planPageTurn(&doc, page, record.sizePt, record.extraRotation, &plainTurn, why)) {
+                return false;
+            }
             QByteArray plain;
-            if (!copyPageObject(&doc, page, record.sizePt, -1, -1, -1, &nextObject, &appended,
-                                &plain, nullptr, why)) {
+            if (!copyPageObject(&doc, page, plainTurn, -1, -1, -1, &nextObject, &appended, &plain,
+                                nullptr, why)) {
                 return false;
             }
             const int number = nextObject++;
@@ -2131,53 +2508,12 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         }
         ++inkedPages;
 
-        /// The rotation comes first: the fallback below has to know it, because the notebook's
-        /// recorded size is the *displayed* size and a quarter turn has to be undone before it can
-        /// stand in for a page-space box.
-        int rotation = 0;
-        if (!effectiveRotation(&doc, page, why, &rotation)) {
+        /// How the notebook's turn reaches the file: through /Rotate when it is a right angle, and
+        /// baked into the page (with the turned sheet's bounding box) when it is not. The box and
+        /// the written rotation both come from here, so the paper and the ink cannot disagree.
+        PageTurn turn;
+        if (!planPageTurn(&doc, page, record.sizePt, record.extraRotation, &turn, why)) {
             return false;
-        }
-
-        double x0 = 0;
-        double y0 = 0;
-        double x1 = 0;
-        double y1 = 0;
-        QString rectWhy;
-        if (!effectiveRect(&doc, page, &rectWhy, &x0, &y0, &x1, &y1)) {
-            /// The notebook measured this page from the same source when it was made, and the
-            /// measurement is kept in manifest.json, so it is what the overlay is placed against
-            /// when the source's own /MediaBox cannot be read.
-            ///
-            /// Measured on the tablet: a real 19-page notebook failed the whole export with
-            /// "page 3875 has an empty or inverted /MediaBox", and the page that failed was not
-            /// the first one -- so pressing Export did nothing at all, because the export had
-            /// already returned before the document picker could open. A page whose box cannot be
-            /// read is not a reason to refuse the other eighteen.
-            const QSizeF pageSize = manifest.pages.at(i).sizePt;
-            if (pageSize.isEmpty()) {
-                fail(why, QStringLiteral("page %1 (PDF object %2): %3, and the notebook has no "
-                                         "recorded size for it either")
-                              .arg(i + 1).arg(page.number).arg(rectWhy));
-                return false;
-            }
-
-            /// Both renderers report the size the reader shows, with /Rotate already applied, so a
-            /// page turned a quarter turn is recorded as tall-by-wide when its own user space is
-            /// wide-by-tall. Using it as it stands drew a 595x842 ink plane into an 842x595 box:
-            /// measured on ex-mediabox-cases.pdf, a 50x50 mark came back 35x71 on the /Rotate 90
-            /// page and the /Rotate 270 page's mark fell off the page entirely (0 red pixels).
-            const bool quarterTurn = rotation == 90 || rotation == 270;
-            x0 = 0;
-            y0 = 0;
-            x1 = quarterTurn ? pageSize.height() : pageSize.width();
-            y1 = quarterTurn ? pageSize.width() : pageSize.height();
-
-            qWarning("[pdfio] page %d (PDF object %d): %s; using the notebook's own %.2fx%.2f "
-                     "points%s",
-                     i + 1, page.number, qPrintable(rectWhy),
-                     pageSize.width(), pageSize.height(),
-                     quarterTurn ? ", turned back into page space for the /Rotate" : "");
         }
 
         /// The overlay is composited with the plane's own alpha as its mask, so a plane that has
@@ -2195,8 +2531,10 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         }
 
         /// The image is stored the way the viewer will rotate it, so it has to be turned back
-        /// into the page's own coordinates first.
-        const QImage placed = inkInPageSpace(*found, rotation);
+        /// into the page's own coordinates first. \c writtenRotation is the whole turn the page is
+        /// finally displayed with -- the source's /Rotate plus the notebook's -- so the overlay
+        /// comes back to the frame the user drew in.
+        const QImage placed = inkInPageSpace(*found, turn.writtenRotation);
         if (placed.isNull()) {
             fail(why, QStringLiteral("page %1 produced no image").arg(i + 1));
             return false;
@@ -2222,15 +2560,17 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                                       "<< /Length " + QByteArray::number(saveContent.size())
                                           + " >>" + NL + "stream" + NL + saveContent + "endstream"});
 
-        /// Draw the ink over the page, in the page's own user space.
-        const double widthPt = x1 - x0;
-        const double heightPt = y1 - y0;
+        /// Draw the ink over the page, in the page's own user space. The plane fills the box the
+        /// page's own content occupies there: the source's box when the turn goes through /Rotate,
+        /// and -- when the turn is baked in -- the turned sheet's bounding box the page now has.
+        const double widthPt = turn.x1 - turn.x0;
+        const double heightPt = turn.y1 - turn.y0;
         /// "Q " first, to leave whatever state the page content left. "q " and not "q": without
         /// the separator a parser reads "q595.0000" as one token.
         const QByteArray content = "Q q " + QByteArray::number(widthPt, 'f', 4) + " 0 0 "
                                    + QByteArray::number(heightPt, 'f', 4) + " "
-                                   + QByteArray::number(x0, 'f', 4) + " "
-                                   + QByteArray::number(y0, 'f', 4)
+                                   + QByteArray::number(turn.x0, 'f', 4) + " "
+                                   + QByteArray::number(turn.y0, 'f', 4)
                                    + " cm /pdfioInk Do Q" + NL;
 
         const int contentNumber = nextObject++;
@@ -2240,9 +2580,8 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
 
         QByteArray newBody;
         int originalContents = 0;
-        if (!copyPageObject(&doc, page, record.sizePt, imageNumber, contentNumber,
-                            saveContentNumber, &nextObject, &appended, &newBody, &originalContents,
-                            why)) {
+        if (!copyPageObject(&doc, page, turn, imageNumber, contentNumber, saveContentNumber,
+                            &nextObject, &appended, &newBody, &originalContents, why)) {
             return false;
         }
         const int exportedNumber = nextObject++;
@@ -2255,10 +2594,12 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         /// it carries alpha, and how many of the page's own content streams survived into the
         /// update. Zero surviving streams is a page whose background is gone.
         qWarning("[pdfio] export page %d/%d (PDF object %d): box %.2f,%.2f..%.2f,%.2f%s, rotate %d, "
-                 "ink %dx%d %s, page contents kept: %d stream(s)",
-                 i + 1, int(qMin(pages.size(), manifest.pages.size())), page.number,
-                 x0, y0, x1, y1, rectWhy.isEmpty() ? " from /MediaBox" : " from the notebook",
-                 rotation, placed.width(), placed.height(),
+                 "notebook turn %d%s, ink %dx%d %s, page contents kept: %d stream(s)",
+                 i + 1, int(qMin(pages.size(), manifest.pages.size())), page.number, turn.x0,
+                 turn.y0, turn.x1, turn.y1,
+                 turn.fromRecordedSize ? " from the notebook" : " from /MediaBox",
+                 turn.writtenRotation, turn.extraRotation,
+                 turn.bake ? " baked into the page" : "", placed.width(), placed.height(),
                  found->hasAlphaChannel() ? "with alpha" : "NO ALPHA", originalContents);
     }
 
