@@ -190,11 +190,13 @@ private:
         /**
          * The page's preview, read once and kept in memory.
          *
-         * The record's own thumbFile is the durable name, and a turn drops it -- nothing on disk
-         * shows the turn yet, and a preview left as it was would show the page the wrong way up. The
-         * pixels are what the canvas shows while the change is still pending, so they are kept here:
-         * the canvas and the row's own card are turned from them rather than from a file that is on
-         * its way out.
+         * The record's own thumbFile is the durable name, and a turn or a resize drops the FILE
+         * and keeps the name -- nothing on disk shows the change yet, and a preview left as it was
+         * would show the page the wrong way up or the wrong size. The name has to stay, because it
+         * is where the regenerated picture is written and what every reader looks it up by; a record
+         * that named no preview could never be given one again. The pixels are what the canvas shows
+         * while the change is still pending, so they are kept here: the canvas and the row's own card
+         * are turned from them rather than from a file that is on its way out.
          */
         QPixmap preview;
         /// The turn \c preview was drawn at, so what is drawn on top of it is the difference this
@@ -261,6 +263,9 @@ private:
     /// Turns the selected row to \a degrees, the whole-degree angle the canvas reports. Any angle is
     /// legal, and it lands in the same record field the buttons write to.
     void setSelectedTurn(int degrees);
+    /// Drops the row's stale preview PICTURE: the file goes into the change's removals and the
+    /// record keeps its thumbFile, which is where the navigator writes the new one. See the
+    /// definition for why the name must survive.
     void dropThumbnail(Row &row);
     /// Reads the row's preview into memory, once, when the file is there. A row that already has one,
     /// or whose record names no preview at all, is left alone.

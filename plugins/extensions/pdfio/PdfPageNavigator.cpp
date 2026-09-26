@@ -20,6 +20,7 @@
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSet>
 #include <kis_image_config.h>
 #include <QtMath>
 
@@ -841,14 +842,38 @@ QPointF PdfPageNavigator::preferredCenterFor(KisView *view, const QPointF &image
         - converter->imageRectInWidgetPixels().topLeft();
 }
 
+QSize PdfPageNavigator::previewBoxFor(const PdfPageRecord &record, const QSize &room)
+{
+    if (room.isEmpty()) {
+        return QSize();
+    }
+
+    /// The reader's size and nothing else: a turn swaps the sides, a scale changes both and a box
+    /// changes the ratio, and displaySizePt() is the one place all three are already applied.
+    const QSizeF display = record.displaySizePt();
+    if (!display.isValid() || display.isEmpty()) {
+        return QSize();
+    }
+
+    /// Rounded to whole points first, then fitted with Qt's own arithmetic, so every surface that
+    /// prepares a preview for the same room agrees about the box to the pixel.
+    const QSize page(qMax(1, qRound(display.width())), qMax(1, qRound(display.height())));
+    return page.scaled(room, Qt::KeepAspectRatio);
+}
+
 void PdfPageNavigator::ensureThumbnail(int index)
 {
     if (!hasNotebook() || index < 0 || index >= m_manifest.pages.size()) {
         return;
     }
 
-    const QString path = QDir(m_projectDir).filePath(m_manifest.pages.at(index).thumbFile);
-    if (QFileInfo::exists(path)) {
+    /// An empty name is "no preview yet" -- and it is NOT the project directory, which is what
+    /// QDir::filePath(QString()) would answer and what QFileInfo::exists() would then confirm. A
+    /// page whose name an edit stripped was believed to have a preview forever; nameMissingPreviews()
+    /// settles a name for such a page when the notebook is adopted, and until it has one there is
+    /// nowhere a generated file could be written that any reader would look at.
+    const QString name = m_manifest.pages.at(index).thumbFile;
+    if (!name.isEmpty() && QFileInfo::exists(QDir(m_projectDir).filePath(name))) {
         Q_EMIT thumbnailReady(index);
         return;
     }
@@ -873,6 +898,70 @@ void PdfPageNavigator::ensureThumbnail(int index)
         /// to move -- when the strip loads and turns -- is the settle delay and the reading share.
         m_thumbnailTimer->start(40);
     }
+}
+
+void PdfPageNavigator::nameMissingPreviews()
+{
+    if (m_projectDir.isEmpty() || m_manifest.pages.isEmpty()) {
+        return;
+    }
+
+    bool missing = false;
+    for (const PdfPageRecord &page : m_manifest.pages) {
+        if (page.thumbFile.isEmpty()) {
+            missing = true;
+            break;
+        }
+    }
+    /// Every page names its preview already, which is every notebook this build writes: nothing is
+    /// written merely for opening one.
+    if (!missing) {
+        return;
+    }
+
+    /// The allocator the notebook itself uses: a number past every artifact name the list already
+    /// holds, so a name handed out here is one no other page's preview is using. A number is skipped
+    /// when its preview name is somehow taken, which keeps the naming rule in one place.
+    int number = m_manifest.effectiveNextPageNumber();
+    QSet<QString> taken;
+    for (const PdfPageRecord &page : m_manifest.pages) {
+        if (!page.thumbFile.isEmpty()) {
+            taken.insert(page.thumbFile);
+        }
+    }
+
+    int named = 0;
+    for (PdfPageRecord &page : m_manifest.pages) {
+        if (!page.thumbFile.isEmpty()) {
+            continue;
+        }
+        QString name;
+        do {
+            name = PdfSession::thumbFileNameForNumber(number++);
+        } while (taken.contains(name));
+        page.thumbFile = name;
+        taken.insert(name);
+        ++named;
+    }
+    if (named == 0) {
+        return;
+    }
+    m_manifest.nextPageNumber = number;
+
+    /// The manifest is where every reader gets the name from -- the docker, the strip decoration,
+    /// a generated preview's own writer and the ops screen all read it -- so the list is settled on
+    /// disk as well as in memory. A write that fails leaves the in-memory names in force: the
+    /// previews are generated and written at exactly these names, and the next open derives the
+    /// same ones again.
+    QString why;
+    if (!m_manifest.writeTo(PdfSession::manifestPath(m_projectDir), &why)) {
+        say(QStringLiteral("%1 page(s) were given a preview name in memory, but the notebook could not "
+                           "be written: %2")
+                .arg(named)
+                .arg(why));
+        return;
+    }
+    say(QStringLiteral("%1 page(s) that recorded no preview were given one").arg(named));
 }
 
 void PdfPageNavigator::makeOneThumbnail()
@@ -901,6 +990,15 @@ void PdfPageNavigator::makeOneThumbnail()
         manifest = m_manifest;
     }
     if (index >= manifest.pages.size()) {
+        return;
+    }
+
+    /// The name the picture is written at: the record's own, the same one every reader joins onto
+    /// the project directory. A record that names none has nowhere a reader would look, and joining
+    /// an empty name would write at the project directory itself -- so nothing is generated for
+    /// such a page. nameMissingPreviews() is what gives it a name, on adoption.
+    const QString thumbName = manifest.pages.at(index).thumbFile;
+    if (thumbName.isEmpty()) {
         return;
     }
 
@@ -955,7 +1053,7 @@ void PdfPageNavigator::makeOneThumbnail()
         ? composed.scaled(box, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
         : composed;
 
-    const QString path = QDir(m_projectDir).filePath(manifest.pages.at(index).thumbFile);
+    const QString path = QDir(m_projectDir).filePath(thumbName);
     QDir().mkpath(QFileInfo(path).absolutePath());
     if (!thumbnail.save(path, "PNG")) {
         return;
@@ -1495,6 +1593,11 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
     /// the provider's own name is asked for after this -- so this only ever replaces a name the
     /// application itself made up for a cache copy.
     ensureNotebookName(/*nameWhenEmpty=*/false, nullptr);
+
+    /// And the same for a page that records no preview: the name is the durable half, and without
+    /// one a page can never be given a picture again -- see nameMissingPreviews(). Before showPage()
+    /// below, because that is where the first previews are asked for.
+    nameMissingPreviews();
 
     const int anchor = qBound(0, anchorPage, manifest.pages.size() - 1);
     const bool shown = showPage(anchor, why);

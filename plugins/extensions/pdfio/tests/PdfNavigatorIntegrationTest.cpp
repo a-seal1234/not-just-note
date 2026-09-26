@@ -135,6 +135,16 @@ private Q_SLOTS:
     void testAPreviewIsPreparedForTheScreensDeviceRatio();
     /// The canvas asks the navigator for a fresh preview rather than stretching a small one.
     void testTheCanvasAsksTheNavigatorForAFreshPreview();
+    /// A preview's box is the page's CURRENT shape -- displaySizePt() -- for a turned, a scaled
+    /// and a boxed record, and it never exceeds the room it is drawn in.
+    void testAPreviewsBoxFollowsThePagesDisplaySize();
+    /// The report: a page that was RESIZED (scaled) lost its preview everywhere, while a page that
+    /// was only moved kept its own. The screen's drop must keep the durable name, the navigator
+    /// must generate when the file is gone, and the new picture must be the page's new shape.
+    void testAResizedPageGetsItsPreviewBackAtItsNewShape();
+    /// A page that records no preview at all -- which is what an edit used to leave behind -- is
+    /// given a durable name when the notebook is adopted, so it can be pictured again.
+    void testAPageThatRecordsNoPreviewIsGivenOneOnOpen();
     /// Deleting a notebook: the open one is closed for real, its folder goes, and the recent list
     /// forgets it. A real fixture notebook, not a hand-made directory.
     void testDeletingANotebookClosesItAndRemovesItsFolder();
@@ -3470,12 +3480,15 @@ void PdfNavigatorIntegrationTest::testAPreviewIsPreparedForTheScreensDeviceRatio
     dialog.show();
     QTest::qWait(50);
 
-    /// The card: the file is 180x256, the card is the table's icon size, and the pixels prepared for
-    /// it are that box at the table's ratio -- not the file handed through.
+    /// The card: the file is 180x256, and the box prepared for it is the PAGE's own shape --
+    /// displaySizePt() fitted into the table's icon size -- at the table's ratio. The file's own
+    /// size is deliberately not the box: a thumbnail written before a turn, a scale or a box is the
+    /// wrong shape for the page now, which is the card the user saw clipped.
     const PdfNotebookOpsDialog::PreparedPreview card = dialog.cardPreview(0);
     QVERIFY2(!card.pixmap.isNull(), "the card has no picture");
     QCOMPARE(card.sourcePixels, QSize(180, 256));
-    QCOMPARE(card.logicalSize, QSize(180, 256).scaled(table->iconSize(), Qt::KeepAspectRatio));
+    QCOMPARE(card.logicalSize,
+             PdfPageNavigator::previewBoxFor(manifest.pages.at(0), table->iconSize()));
     QCOMPARE(card.devicePixelRatio, table->devicePixelRatioF());
     QCOMPARE(card.pixmap.size(), QSize(qRound(card.logicalSize.width() * table->devicePixelRatioF()),
                                        qRound(card.logicalSize.height() * table->devicePixelRatioF())));
@@ -3658,6 +3671,240 @@ void PdfNavigatorIntegrationTest::testAGeneratedPreviewCarriesTheInk()
     /// And it is where the page put it: the block is in the page's top left quarter.
     QVERIFY2(where.center().x() < written.width() / 2 && where.center().y() < written.height() / 2,
              "the ink came back in the wrong part of the page");
+}
+
+/**
+ * A preview's box is the page's CURRENT shape: displaySizePt(), the one place the sheet, the box,
+ * the notebook's turn and the notebook's scale are already applied.
+ *
+ * This is the arithmetic behind the report, without a widget: the card is a fixed box and the page
+ * has to fit inside it, so a box taken from the sheet -- or from whatever the thumbnail file was
+ * last written at -- is clip-shaped the moment a page is turned (the sides swap), boxed (the ratio
+ * changes) or scaled (both change). The room here is a card's own DEVICE pixels on the tablet's
+ * 2.5 ratio, so the numbers are the ones the panel really draws.
+ */
+void PdfNavigatorIntegrationTest::testAPreviewsBoxFollowsThePagesDisplaySize()
+{
+    const QSize room(460, 620);
+
+    PdfPageRecord plain;
+    plain.sizePt = QSizeF(595, 842);
+    plain.extraScale = 1.0;
+
+    const QSize plainBox = PdfPageNavigator::previewBoxFor(plain, room);
+    QCOMPARE(plainBox, QSize(438, 620));
+    QVERIFY2(plainBox.width() <= room.width() && plainBox.height() <= room.height(),
+             "the page's box is bigger than the room it is drawn in: the card would clip it");
+
+    /// A quarter turn swaps the sides, and the box is the LANDSCAPE one. A box taken from the sheet
+    /// -- or from a thumbnail written before the turn -- is portrait, which is the clipped card.
+    PdfPageRecord turned = plain;
+    turned.extraRotation = 90;
+    const QSize turnedBox = PdfPageNavigator::previewBoxFor(turned, room);
+    QCOMPARE(turnedBox, QSize(460, 325));
+    QVERIFY2(turnedBox.width() > turnedBox.height(), "a turned page is still boxed as a portrait one");
+
+    /// A box changes the ratio: a page cropped to a narrower rectangle is drawn narrower.
+    PdfPageRecord cropped = plain;
+    cropped.boxPt = QRectF(0, 0, 300, 842);
+    const QSize croppedBox = PdfPageNavigator::previewBoxFor(cropped, room);
+    QCOMPARE(croppedBox, QSize(220, 620));
+    QVERIFY2(croppedBox.width() < plainBox.width(), "a cropped page is boxed as wide as the sheet");
+
+    /// A scale changes BOTH sides, so the shape -- and with it the fitted box -- is the page's own
+    /// again. What carries a scale is the pixels the preview is prepared from (the generated-preview
+    /// test below measures that); what must not happen is the scale being read as a turn or a crop.
+    PdfPageRecord scaled = plain;
+    scaled.extraScale = 2.0;
+    QCOMPARE(scaled.displaySizePt(), plain.displaySizePt() * 2.0);
+    QCOMPARE(PdfPageNavigator::previewBoxFor(scaled, room), plainBox);
+
+    /// And the rule every one of them comes from: the box has displaySizePt()'s aspect, to within
+    /// the rounding of a point.
+    for (const PdfPageRecord &record : { plain, turned, cropped, scaled }) {
+        const QSize box = PdfPageNavigator::previewBoxFor(record, room);
+        const QSizeF display = record.displaySizePt();
+        QVERIFY2(box.isValid() && !box.isEmpty(), "a page with a size was given no box");
+        QVERIFY2(qAbs(qreal(box.width()) / box.height() - display.width() / display.height()) < 0.01,
+                 qPrintable(QStringLiteral("the box %1x%2 does not have the shape displaySizePt() "
+                                           "reports (%3x%4)")
+                                .arg(box.width()).arg(box.height())
+                                .arg(display.width()).arg(display.height())));
+    }
+
+    /// Nothing in, nothing out: no room is no box, and a page with no size is no box either.
+    QVERIFY(PdfPageNavigator::previewBoxFor(plain, QSize()).isEmpty());
+    PdfPageRecord sizeless;
+    QVERIFY(PdfPageNavigator::previewBoxFor(sizeless, room).isEmpty());
+}
+
+/**
+ * The report, end to end: a page that was RESIZED lost its preview everywhere, while a page that was
+ * only moved kept its own.
+ *
+ * A size-changing edit drops the stale picture -- it was made at the old size -- and what the user
+ * met was that nothing ever brought one back. The drop cleared the record's thumbFile as well as the
+ * file, and every reader joins an empty name onto the project directory: ensureThumbnail() found the
+ * DIRECTORY, told the surfaces the preview was ready, and never generated one. The page was left
+ * with no picture at all, on every surface, for good.
+ *
+ * So this drives the whole cycle the way the plugin does -- the screen's edit, the commit, the
+ * reload, the ask -- and asserts both halves: the durable name survives the drop, and the picture
+ * that comes back is the page's CURRENT size. The last act is the dock's own turn, which takes the
+ * same path, so the turn's side-swap is measured rather than assumed.
+ */
+void PdfNavigatorIntegrationTest::testAResizedPageGetsItsPreviewBackAtItsNewShape()
+{
+    QVERIFY(useNotebook(QStringLiteral("preview-after-resize")));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest before = navigator()->manifest();
+    QVERIFY(before.pages.size() >= 3);
+    QVERIFY2(!before.pages.at(0).thumbFile.isEmpty(), "the page records no preview name");
+    const QString thumb = QDir(project).filePath(before.pages.at(0).thumbFile);
+
+    /// A picture at the page's own size, so there is something to drop and to see come back.
+    QImage sheet(180, 256, QImage::Format_ARGB32_Premultiplied);
+    sheet.fill(Qt::white);
+    QVERIFY2(sheet.save(thumb, "PNG"), qPrintable(thumb));
+
+    /// The screen's own edit: halved, which is the user's case (extraScale != 1). Half rather than
+    /// 1.5 because a preview smaller than the 1152 box is saved at the pixels it really has, so the
+    /// file's own size is what shows which display size it was rendered for.
+    PdfNotebookOpsDialog dialog(project, before, 0);
+    auto *field = dialog.findChild<QDoubleSpinBox *>(QStringLiteral("pdfio_ops_scale_value"));
+    QVERIFY2(field, "the ops screen has no scale field");
+    field->setValue(50.0);
+
+    const PdfNotebookOps::PageEdits edits = dialog.edits();
+    QCOMPARE(edits.pages.at(0).extraScale, 0.5);
+    /// The drop is paired with the name it must come back to, and with the file being taken away:
+    /// a name with no file is what makes the navigator generate, and a file with no name is what
+    /// left the page pictureless.
+    QCOMPARE(edits.pages.at(0).thumbFile, before.pages.at(0).thumbFile);
+    QVERIFY2(edits.removeAfter.contains(before.pages.at(0).thumbFile),
+             "the stale picture was not dropped with the change");
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::applyPageEdits(project, edits, PdfPageRotator::rotateInto);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QVERIFY2(!QFileInfo::exists(thumb), qPrintable(QStringLiteral("%1 is still there after the "
+                                                                  "change dropped it").arg(thumb)));
+
+    QVERIFY2(navigator()->reloadNotebook(outcome.anchorPage, &why), qPrintable(why));
+    QElapsedTimer clock;
+    clock.start();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload never finished");
+
+    /// The record still names the preview, and it is the scaled page.
+    const PdfPageRecord scaled = navigator()->manifest().pages.at(0);
+    QCOMPARE(scaled.extraScale, 0.5);
+    QCOMPARE(scaled.thumbFile, before.pages.at(0).thumbFile);
+
+    /// The ask brings the picture back -- nothing else in this test writes the file.
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(thumb), 30000);
+
+    const QImage written(thumb);
+    QVERIFY2(!written.isNull(), qPrintable(thumb));
+    qInfo("the preview of the half-size page is %dx%d", written.width(), written.height());
+    /// Rendered for the page as it is NOW: at the old size this came out 814x1152 (the unscaled
+    /// A4 preview the other test pins), and a generator that ignored extraScale would give that.
+    QVERIFY2(written.height() < 1000, "the preview was rendered at the page's OLD size");
+    QVERIFY2(written.height() > 700, "the preview is too small to be the page");
+    QVERIFY2(qAbs(qreal(written.width()) / written.height()
+                  - scaled.displaySizePt().width() / scaled.displaySizePt().height()) < 0.01,
+             "the preview does not have the shape displaySizePt() reports");
+
+    /// And the dock's own turn, which drops the picture the same way: the name stays, the file goes,
+    /// and what comes back is the page's turned shape -- landscape, where the sheet is portrait.
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    const PdfNotebookOps::Outcome turned =
+        PdfNotebookOps::rotatePages(project, 0, 1, 90, PdfPageRotator::rotateInto, 0);
+    QVERIFY2(turned.ok, qPrintable(turned.why));
+    QVERIFY2(!QFileInfo::exists(thumb), "the turned page kept its upright picture");
+    QVERIFY2(navigator()->reloadNotebook(0, &why), qPrintable(why));
+    clock.restart();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload after the turn never finished");
+
+    const PdfPageRecord turnedRecord = navigator()->manifest().pages.at(0);
+    QCOMPARE(turnedRecord.extraRotation, 90);
+    QCOMPARE(turnedRecord.thumbFile, before.pages.at(0).thumbFile);
+    QVERIFY2(turnedRecord.displaySizePt().width() > turnedRecord.displaySizePt().height(),
+             "the turn did not reach displaySizePt()");
+
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(thumb), 30000);
+    const QImage turnedBack(thumb);
+    QVERIFY2(!turnedBack.isNull(), qPrintable(thumb));
+    qInfo("the preview of the turned page is %dx%d", turnedBack.width(), turnedBack.height());
+    QVERIFY2(turnedBack.width() > turnedBack.height(),
+             "the preview of the turned page is still portrait: it was made at the old shape");
+}
+
+/**
+ * A page that records no preview at all is given a durable name when the notebook is adopted.
+ *
+ * An empty thumbFile is legal -- it means "no preview yet" -- but it does NOT mean the project
+ * directory, which is what joining it there answers; a page left like that (which is exactly what a
+ * size-changing edit used to leave behind) could never be given a picture again, on any surface.
+ * The name is settled on adoption, once, and the first ask then writes the picture at it.
+ */
+void PdfNavigatorIntegrationTest::testAPageThatRecordsNoPreviewIsGivenOneOnOpen()
+{
+    /// Under the run's own temporary root, beside every other test's, rather than in a directory
+    /// that dies when the function returns: the navigator still knows about this notebook
+    /// afterwards, and the next test's open writes the page being replaced before it adopts its own.
+    const QString project = m_dir.filePath(QStringLiteral("preview-nameless"));
+
+    /// One page at a time: this is about a name, not about memory.
+    navigator()->setScope(1);
+
+    PopplerRenderBackend backend;
+    PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this test needs could not be made");
+    QVERIFY(manifest.pages.size() >= 2);
+
+    /// The shape an edit used to leave behind.
+    manifest.pages[0].thumbFile.clear();
+    QString why;
+    QVERIFY2(manifest.writeTo(PdfSession::manifestPath(project), &why), qPrintable(why));
+
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+
+    /// The page has a name now -- in memory AND on disk, because every reader joins it from the
+    /// manifest -- and the pages that already had one are untouched.
+    const PdfSessionManifest repaired = navigator()->manifest();
+    QVERIFY2(!repaired.pages.at(0).thumbFile.isEmpty(),
+             "the page that records no preview was left without one");
+    QCOMPARE(repaired.pages.at(1).thumbFile, manifest.pages.at(1).thumbFile);
+
+    const PdfSessionManifest onDisk =
+        PdfSessionManifest::readFrom(PdfSession::manifestPath(project), &why);
+    QVERIFY2(onDisk.isValid(), qPrintable(why));
+    QCOMPARE(onDisk.pages.at(0).thumbFile, repaired.pages.at(0).thumbFile);
+
+    /// And that name is where the generated picture lands, drawn for the page's own shape.
+    const QString thumb = QDir(project).filePath(repaired.pages.at(0).thumbFile);
+    QVERIFY2(!QFileInfo::exists(thumb), qPrintable(thumb));
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(thumb), 30000);
+
+    const QImage written(thumb);
+    QVERIFY2(!written.isNull(), qPrintable(thumb));
+    const QSizeF display = repaired.pages.at(0).displaySizePt();
+    QVERIFY2(qAbs(qreal(written.width()) / written.height() - display.width() / display.height()) < 0.01,
+             qPrintable(QStringLiteral("the page's preview is %1x%2, where displaySizePt() says %3x%4")
+                            .arg(written.width()).arg(written.height())
+                            .arg(display.width()).arg(display.height())));
 }
 
 /**

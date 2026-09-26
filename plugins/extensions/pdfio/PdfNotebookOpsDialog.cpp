@@ -226,9 +226,11 @@ QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, 
                            qMax(1, qRound(logicalSize.height() * ratio)));
 
     /// IgnoreAspectRatio because the caller passes the box it is about to draw into, already fitted
-    /// to the sheet's own shape -- the canvas works it out from the turned page's bounding box, the
-    /// card from the icon size. Smooth because this is a picture of text, and a nearest-neighbour
-    /// scale of one is a page of broken letters.
+    /// to the PAGE's own shape -- the canvas works it out from the turned page's bounding box, the
+    /// card from PdfPageNavigator::previewBoxFor() and the page's displaySizePt(). A file still
+    /// written at an older shape is drawn into that box rather than fitted by its own, so a turned,
+    /// scaled or boxed page is never the wrong shape on screen. Smooth because this is a picture of
+    /// text, and a nearest-neighbour scale of one is a page of broken letters.
     QPixmap prepared = source.scaled(deviceSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     prepared.setDevicePixelRatio(ratio);
     return prepared;
@@ -1455,8 +1457,9 @@ void PdfNotebookOpsDialog::refresh()
 
         /// The row's card shows the page as the change would leave it, at the pixels the screen
         /// will draw it with. The pixels are kept in the row rather than read from the record's
-        /// thumbFile because a turn drops that stale name, and the list must not go blank exactly
-        /// where a page is turned.
+        /// thumbFile because a turn or a resize drops that stale picture (the name it goes by stays,
+        /// which is where the new one is written), and the list must not go blank exactly where a
+        /// page is turned.
         auto *thumbnail = new QTableWidgetItem;
         loadPreview(row);
         m_table->setItem(i, ThumbnailColumn, thumbnail);
@@ -2036,9 +2039,15 @@ void PdfNotebookOpsDialog::restorePreviewIfUnchanged(Row &row)
             && page.extraRotation == row.record.extraRotation
             && page.extraScale == row.record.extraScale && page.boxPt == row.record.boxPt
             && page.sizePt == row.record.sizePt;
-        if (same && row.record.thumbFile.isEmpty() && !page.thumbFile.isEmpty()) {
-            row.record.thumbFile = page.thumbFile;
-            m_removals.removeAll(page.thumbFile);
+        if (same) {
+            /// The row is the record the notebook already has, so the picture the drop queued is
+            /// the right one again: the removal is not part of any change and the name goes back
+            /// with it. A notebook whose page records no preview keeps none -- there is nothing to
+            /// restore it to.
+            if (!page.thumbFile.isEmpty()) {
+                row.record.thumbFile = page.thumbFile;
+                m_removals.removeAll(page.thumbFile);
+            }
         }
         return;
     }
@@ -2117,16 +2126,25 @@ PdfNotebookOpsDialog::PreparedPreview PdfNotebookOpsDialog::cardPreview(int row)
         return prepared;
     }
 
-    /// Turned first, then fitted: a quarter turn swaps the page's sides, so the box the card is
-    /// drawn in is the turned one and not the one it had before.
+    /// Turned first, then drawn: the file was written at previewRotation, so what it still needs
+    /// on top of itself is the difference between that and the turn the screen is holding.
     const QPixmap turned = turnedPixmap(card.preview,
                                         card.record.extraRotation - card.previewRotation);
-    const QSize fitted = turned.size().scaled(m_table->iconSize(), Qt::KeepAspectRatio);
+    /// The box comes from the page the screen is HOLDING, not from the file it happens to have:
+    /// displaySizePt() is where the sheet, the box, the turn and the scale are already applied, so
+    /// a page this screen has turned (sides swap), scaled (both change) or cropped (ratio changes)
+    /// is prepared at the shape it is about to have. The file can still be the OLD shape -- it is
+    /// regenerated at the new one -- and it is drawn into that box rather than fitted by its own,
+    /// which is the difference between a preview of the page and a clipped picture of it.
+    const QSize box = PdfPageNavigator::previewBoxFor(card.record, m_table->iconSize());
+    if (box.isEmpty()) {
+        return prepared;
+    }
     const qreal ratio = m_table->devicePixelRatioF() > 0 ? m_table->devicePixelRatioF() : 1.0;
 
     prepared.sourcePixels = card.preview.size();
-    prepared.logicalSize = fitted;
-    prepared.pixmap = pdfioPreviewForDisplay(turned, fitted, ratio);
+    prepared.logicalSize = box;
+    prepared.pixmap = pdfioPreviewForDisplay(turned, box, ratio);
     prepared.devicePixelRatio = ratio;
     return prepared;
 }
@@ -2328,6 +2346,19 @@ void PdfNotebookOpsDialog::dropThumbnail(Row &row)
         return;
     }
 
+    /// The stale PICTURE goes; the NAME it goes by stays.
+    ///
+    /// The name is the durable half of a preview and the only place a new one can land. Dropping it
+    /// as well -- which is what this did -- left the record naming nothing, and every reader joins
+    /// an empty name onto the project directory: ensureThumbnail() found the DIRECTORY, told the
+    /// surfaces the preview was ready, and never generated one. A page that was turned or scaled
+    /// here then had no picture at all on any surface, for good, which is the report: a page that
+    /// was only MOVED keeps its picture, because a move drops nothing.
+    ///
+    /// So the file is what is dropped -- Apply moves it into the journal, the way
+    /// PdfNotebookOps::rotatePages() has always dropped a turned page's preview -- and the ask that
+    /// follows finds the name, finds no file, and makes a new picture at the page's CURRENT
+    /// displaySizePt() (see PdfPageNavigator::makeOneThumbnail).
     const QString thumb = row.record.thumbFile;
     for (int i = m_copies.size() - 1; i >= 0; --i) {
         if (m_copies.at(i).second == thumb) {
@@ -2337,7 +2368,6 @@ void PdfNotebookOpsDialog::dropThumbnail(Row &row)
     if (!row.isNew && !m_removals.contains(thumb)) {
         m_removals << thumb;
     }
-    row.record.thumbFile.clear();
 }
 
 bool PdfNotebookOpsDialog::hasPendingEdits() const

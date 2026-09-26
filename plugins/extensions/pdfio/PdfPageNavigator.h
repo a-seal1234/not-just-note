@@ -288,6 +288,23 @@ public:
     void ensureThumbnail(int index);
 
     /**
+     * The box a page's preview is drawn in when a surface has \a room logical pixels for it: the
+     * page's CURRENT displaySizePt() fitted into that room, its shape kept.
+     *
+     * THE one place a preview's aspect is decided, and it is displaySizePt() because that is the
+     * one place the reader's size comes from: the sheet, then the box, then the notebook's turn,
+     * then the notebook's scale. A surface that takes the aspect from the file it happens to have
+     * -- the sheet's shape, or whatever the thumbnail was last written at -- looks right until the
+     * page is turned (the sides swap), scaled (both change) or boxed (the ratio changes), and then
+     * it letterboxes, stretches or clips exactly as the user reported.
+     *
+     * The result is never bigger than \a room, so a picture prepared into it is the whole page
+     * inside its box and never a crop of it. It does not depend on the preview file at all, which
+     * is what lets a stale picture be drawn at the right shape while the new one is being made.
+     */
+    static QSize previewBoxFor(const PdfPageRecord &record, const QSize &room);
+
+    /**
      * Whether panning past the edge of a page turns to the next one.
      *
      * Off is a reasonable choice: the gesture that turns a page is the same one used to look at
@@ -834,6 +851,25 @@ private:
     int m_stripActiveSlot = -1;
 
     void makeOneThumbnail();
+
+    /**
+     * Gives a preview name to every page of the adopted notebook that records none, and settles
+     * the list on disk.
+     *
+     * PdfPageRecord::thumbFile says an empty name is legal and means "no preview yet". It does NOT
+     * mean the project directory -- but every reader joins it onto the project directory anyway,
+     * and the join answers the DIRECTORY: ensureThumbnail() saw a file where there was none, told
+     * the surfaces the preview was ready, and never generated one. A page an edit had stripped the
+     * name from was therefore left with no picture at all, on every surface, permanently.
+     *
+     * Settled on adoption rather than lazily because this is a manifest write, and a thumbnail is
+     * generated from a timer: a write here would land inside the nested event loop a page rotation
+     * runs, in the middle of another change's commit. The names are handed out by the notebook's
+     * own allocator, so a name is never one another page is using and the counter stays ahead of
+     * them. A write that fails leaves the names in memory and the pages still pictureless until the
+     * next open -- which settles the SAME names, because nothing was written to change them.
+     */
+    void nameMissingPreviews();
 
     /**
      * Opens \a index by building a document for it alone, or for a strip of pages around it.

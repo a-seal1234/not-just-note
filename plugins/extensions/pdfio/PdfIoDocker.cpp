@@ -90,7 +90,14 @@ public:
                                 qRound(prepared.height() / ratio));
             QRect area = option.rect;
             area.setBottom(area.bottom() - CardLabelHeight);
-            QRect card(QPoint(0, 0), logical);
+            /// The label strip is not the picture's, and what is left of the cell is what the page
+            /// has to fit in. A page nearly as tall as the card -- an A4 sheet is -- would otherwise
+            /// be drawn a few pixels past the edge and clipped there. Shrunk into the strip rather
+            /// than drawn through it, so the whole page is always inside its box.
+            const QSize drawn = (logical.width() > area.width() || logical.height() > area.height())
+                ? logical.scaled(area.size(), Qt::KeepAspectRatio)
+                : logical;
+            QRect card(QPoint(0, 0), drawn);
             card.moveCenter(area.center());
             painter->drawPixmap(card, prepared, QRectF(prepared.rect()));
         }
@@ -454,8 +461,14 @@ void PdfIoDocker::updateThumbnail(int index)
         return;
     }
 
-    const QString thumbPath = QDir(navigator->projectDir())
-                                  .filePath(navigator->manifest().pages.at(index).thumbFile);
+    const PdfPageRecord &record = navigator->manifest().pages.at(index);
+
+    /// An empty name is "no preview yet", and never the project directory: joining it would hand
+    /// QPixmap the directory, which is not a picture, and the page would lose the card it is about
+    /// to be given back by the ask below.
+    const QString thumbPath = record.thumbFile.isEmpty()
+        ? QString()
+        : QDir(navigator->projectDir()).filePath(record.thumbFile);
     const QPixmap pixmap(thumbPath);
     if (pixmap.isNull()) {
         /// The preview is gone rather than late: a turn or a notebook change drops it, and the
@@ -466,18 +479,27 @@ void PdfIoDocker::updateThumbnail(int index)
         return;
     }
 
-    /// KeepAspectRatio, never a crop: a thumbnail of a different shape is letterboxed inside the
-    /// card so the whole page is always visible.
+    /// The box the page is drawn in comes from the PAGE, not from the file: displaySizePt() is the
+    /// one place the reader's size comes from -- sheet, box, turn, scale -- so a turned, scaled or
+    /// boxed page keeps its own shape here. A file still written at the old shape is drawn INTO
+    /// that box rather than fitted by its own, which is the difference between a preview of the
+    /// page and a picture clipped by its box. Fitting the box into the card also means the whole
+    /// page is always inside it.
     ///
-    /// Scaled to the card's size in DEVICE pixels and handed to the delegate with that ratio: a
-    /// card is measured in logical pixels, so on a tablet with a 2-2.5x screen a picture sized for
-    /// the logical card was drawn at two and a half times the size it had, which is the pixelation
-    /// the user reported. The delegate draws it with both rectangles explicit, one source pixel per
+    /// Scaled to that box in DEVICE pixels and handed to the delegate with the ratio: a card is
+    /// measured in logical pixels, so on a tablet with a 2-2.5x screen a picture sized for the
+    /// logical card was drawn at two and a half times the size it had, which is the pixelation the
+    /// user reported. The delegate draws it with both rectangles explicit, one source pixel per
     /// device pixel.
     const qreal ratio = m_pages->devicePixelRatioF() > 0 ? m_pages->devicePixelRatioF() : 1.0;
     const QSize card = m_pages->iconSize();
-    const QSize deviceCard(qRound(card.width() * ratio), qRound(card.height() * ratio));
-    QPixmap scaled = pixmap.scaled(deviceCard, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    const QSize box = PdfPageNavigator::previewBoxFor(record, card);
+    if (box.isEmpty()) {
+        m_pages->item(index)->setData(CardPreviewRole, QVariant());
+        return;
+    }
+    const QSize deviceBox(qMax(1, qRound(box.width() * ratio)), qMax(1, qRound(box.height() * ratio)));
+    QPixmap scaled = pixmap.scaled(deviceBox, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     scaled.setDevicePixelRatio(ratio);
     m_pages->item(index)->setData(CardPreviewRole, scaled);
 }
