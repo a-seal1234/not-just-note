@@ -11,12 +11,14 @@
 #include <QList>
 #include <QPair>
 #include <QPoint>
+#include <QRectF>
 #include <QPixmap>
 #include <QSizeF>
 #include <QStringList>
 
 #include <functional>
 
+class QDoubleSpinBox;
 class QEvent;
 class QLabel;
 class QPushButton;
@@ -98,6 +100,19 @@ public:
 
     /// The page the reader was on when the screen opened, so the notebook reopens where they were.
     int anchorPage() const { return m_anchor; }
+
+    /**
+     * What a drag on the canvas does, one at a time. Turn, Scale and Box are separate controls
+     * because they fail differently -- a wrong turn is the wrong way up, a wrong scale is the wrong
+     * size, a wrong crop is ink the user drew that is no longer on the page -- and because the
+     * emphasis of this whole feature is Scale, which must not be a flag on the crop control.
+     */
+    enum DragMode {
+        TurnDrag,
+        ScaleDrag,
+        BoxDrag,
+    };
+    DragMode dragMode() const { return m_dragMode; }
 
     /**
      * The whole-notebook action the user asked for instead of a page-list change, if any.
@@ -228,6 +243,18 @@ private:
     void deleteSelected();
     void keepSelected();
     void rotateSelected(int degrees);
+    /// Which of the three gestures a drag on the canvas performs, said on the pane before it starts.
+    void setDragMode(DragMode mode);
+    /**
+     * Puts the scale on the selected row, the way the typed field and a corner drag both ask for it.
+     * Clamped to the field's own range, so a gesture cannot record a factor the field cannot show.
+     */
+    void setSelectedScale(qreal factor);
+    /// The same for Box: the box in source points, or an invalid rectangle for "the whole sheet".
+    void setSelectedBox(const QRectF &box);
+    /// What the pending crop would remove from the page's preview, in words, or empty when nothing
+    /// painted would be lost or there is no preview to judge by.
+    QString boxCropWarning() const;
     /// Turns \a row by \a degrees. The buttons, the swipe and the canvas all come through here, so
     /// no two ways of turning a page can record a different amount or leave a different trail.
     void turnRow(int row, int degrees);
@@ -255,6 +282,11 @@ private:
     /// screen is holding, and writes the angle in the readout beside it. Called whenever the
     /// selection or the pending turn changes, so the two can never disagree.
     void refreshCanvas();
+    /// The box a row's preview was made in, so the picture and the crop overlay share one frame.
+    QRectF previewBoxFor(const Row &row) const;
+    /// Puts a row's preview back when the row is the record the notebook already has: an edit that
+    /// was undone by hand is not a change, and the preview it dropped is not one either.
+    void restorePreviewIfUnchanged(Row &row);
     void insertPagesFromPdf();
     void mergeNotebookIn();
     void addPagesFromSource(const PdfToAdd &pdf, int first, int count);
@@ -328,9 +360,23 @@ private:
     int m_nextNumber = 0;
 
     QTableWidget *m_table = nullptr;
-    /// The selected page, large, and turned by hand; and the live readout of its angle.
+    /// The selected page, large; the live readout of what the mode in force is producing; and the
+    /// line that says what a crop is about to remove.
     PdfPageCanvas *m_canvas = nullptr;
     QLabel *m_angle = nullptr;
+    QLabel *m_boxWarning = nullptr;
+    /// Which gesture a drag performs, and the three buttons that choose it.
+    DragMode m_dragMode = TurnDrag;
+    QPushButton *m_modeTurn = nullptr;
+    QPushButton *m_modeScale = nullptr;
+    QPushButton *m_modeBox = nullptr;
+    /// The scale as a number to type or step, the same shape as the memory budget's field because
+    /// this is a tablet; and the two resets, which are separate so resetting one leaves the other.
+    QDoubleSpinBox *m_scaleField = nullptr;
+    QPushButton *m_resetScale = nullptr;
+    QPushButton *m_resetBox = nullptr;
+    /// Set while the field is being filled from the model, so writing it back does not loop.
+    bool m_updatingScale = false;
     /// Where a swipe started and which row it started on: the gesture acts on the row it was made
     /// on, not on whatever was selected before it.
     QPoint m_swipeFrom;

@@ -57,6 +57,13 @@ public:
     /**
      * \a page's page inside its source, rendered at \a dpi and turned by the notebook's own
      * rotation: what the reader sees, which is what the paper under the ink has to be.
+     *
+     * \a dpi is the reader's resolution -- the strip's, or the budget's -- and the page's own size
+     * follows from displaySizePt(). A page the notebook scaled is rendered at a LARGER SOURCE dpi
+     * (dpi * extraScale) rather than being upscaled afterwards, so a 2x page is twice the pixels of
+     * the same source and the pen's ink stays sharp; the memory budget is what decides how far that
+     * can go. A page with a box renders its box only, and a box that reaches past the sheet (a
+     * margin) comes back as blank paper rather than as a hole.
      */
     QImage renderPage(const PdfSessionManifest &manifest, const QString &projectDir,
                       int page, qreal dpi, QString *why = nullptr);

@@ -57,6 +57,12 @@ private Q_SLOTS:
     void testNotebookHalfTurnTurnsPaperAndInk();
     void testNotebookFreeAngleTurnsPaperAndInk();
 
+    /// The notebook's own resize, on top of whatever the source declares: Scale writes the scaled
+    /// box and the transform that agrees with it, and Box writes the cropped box and clips the page
+    /// to it instead of squeezing the whole page into the smaller rectangle.
+    void testAScaledPageExportsItsScaledBoxAndTransform();
+    void testACroppedPageExportsOnlyItsBox();
+
     /// The guard that makes a notebook whose pages are no longer the PDF's own order refuse to
     /// export, rather than write a file whose ink is on the wrong pages.
     void testAMovedNotebookExportsInNotebookOrder();
@@ -1237,6 +1243,175 @@ void PdfExporterTest::testNotebookFreeAngleTurnsPaperAndInk()
              "the baked page's own text was not extractable");
     /// And the page is not blank: the paper's content came through and not only the ink.
     QVERIFY2(darkPixels(cleanPage) > 0, "the baked page came out blank");
+}
+
+
+/**
+ * A page the notebook scaled exports at the scaled size, with its content scaled to match.
+ *
+ * The MediaBox and the content transform have to AGREE: a box twice the size with the content left
+ * at 1x is a small page in the corner of a big sheet, and a content transform twice the size inside
+ * the old box is a page two thirds off the paper. The mark the user drew is what tells the two
+ * apart -- it is drawn in the page's own points, so it stays 50x50 at (10,10) whatever the factor,
+ * and a squeeze would halve it.
+ */
+void PdfExporterTest::testAScaledPageExportsItsScaledBoxAndTransform()
+{
+    const QString source = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(source));
+    QCOMPARE(backend.pageInfo(0).rotation, 0);
+    QCOMPARE(backend.pageInfo(0).sizePt, QSizeF(595, 842));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    manifest.pages[0].extraScale = 2.0;
+    const QSizeF display = manifest.pages[0].displaySizePt();
+    QCOMPARE(display, QSizeF(1190, 1684));
+
+    /// The ink as the page holds it after a resize: the page in its own frame. A resize never
+    /// re-renders the artifact, so the plane is what it was and the page is what got bigger.
+    QHash<int, QImage> ink;
+    ink.insert(0, inkWithRedMark(QSize(qRound(display.width()), qRound(display.height()))));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString withInk = dir.filePath(QStringLiteral("scaled.pdf"));
+    const QString paperOnly = dir.filePath(QStringLiteral("scaled-paper.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), paperOnly, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    QCOMPARE(exported.pageInfo(0).sizePt, display);
+    const QImage rendered = exported.renderPage(0, 72.0);
+    QVERIFY(!rendered.isNull());
+    QVERIFY2(qAbs(rendered.width() - 1190) <= 2 && qAbs(rendered.height() - 1684) <= 2,
+             qPrintable(QStringLiteral("the exported page rendered %1x%2, expected 1190x1684")
+                            .arg(rendered.width()).arg(rendered.height())));
+
+    const QRect mark = redMarkBounds(rendered);
+    QVERIFY2(mark.isValid(), "the mark is not on the exported page");
+    QVERIFY2(qAbs(mark.left() - 10) <= 4 && qAbs(mark.top() - 10) <= 4
+                 && qAbs(mark.width() - 50) <= 4 && qAbs(mark.height() - 50) <= 4,
+             qPrintable(QStringLiteral("the mark came back at (%1,%2) measuring %3x%4, expected "
+                                       "50x50 at (10,10) in the scaled page")
+                            .arg(mark.left()).arg(mark.top()).arg(mark.width()).arg(mark.height())));
+
+    /// And the page's own content is scaled with the box, not left in its corner: at 72 dpi the
+    /// exported paper has to measure the same as the SOURCE rendered at 144 dpi, which is the same
+    /// page at twice the pixels.
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(paperOnly));
+    const QImage paper = clean.renderPage(0, 72.0);
+    QVERIFY(!paper.isNull());
+    const QImage twiceTheDpi = backend.renderPage(0, 144.0);
+    QVERIFY(!twiceTheDpi.isNull());
+    QVERIFY2(qAbs(paper.width() - twiceTheDpi.width()) <= 2
+                 && qAbs(paper.height() - twiceTheDpi.height()) <= 2,
+             qPrintable(QStringLiteral("the exported paper is %1x%2 where the source at 144 dpi is "
+                                       "%3x%4")
+                            .arg(paper.width()).arg(paper.height())
+                            .arg(twiceTheDpi.width()).arg(twiceTheDpi.height())));
+    const QRect paperWhere = darkBounds(paper);
+    const QRect expectedWhere = darkBounds(twiceTheDpi);
+    QVERIFY2(rectsClose(paperWhere, expectedWhere, 8),
+             qPrintable(QStringLiteral("the scaled paper came back at (%1,%2)-(%3,%4), where the "
+                                       "source at 144 dpi puts it at (%5,%6)-(%7,%8)")
+                            .arg(paperWhere.left()).arg(paperWhere.top())
+                            .arg(paperWhere.right()).arg(paperWhere.bottom())
+                            .arg(expectedWhere.left()).arg(expectedWhere.top())
+                            .arg(expectedWhere.right()).arg(expectedWhere.bottom())));
+
+    /// The page's own text is still there, still selectable, and not turned into a picture.
+    QVERIFY2(exported.pageText(0).contains(QStringLiteral("Rotation zero")),
+             qPrintable(exported.pageText(0)));
+}
+
+/**
+ * A page the notebook cropped exports as the box and nothing else.
+ *
+ * "Nothing else" is the whole result: the page's own content is under a transform that puts the
+ * box's corner at the origin and a /MediaBox that is the box's own size, so what was outside the
+ * box falls outside the page and is clipped by the reader. Measured against the source's own
+ * top-left corner -- the same pixels, not the whole page squeezed into a smaller rectangle, which
+ * would put every mark somewhere else on the paper.
+ */
+void PdfExporterTest::testACroppedPageExportsOnlyItsBox()
+{
+    const QString source = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(source));
+    QCOMPARE(backend.pageInfo(0).rotation, 0);
+    QCOMPARE(backend.pageInfo(0).sizePt, QSizeF(595, 842));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+
+    const QImage sourceRender = backend.renderPage(0, 72.0);
+    QVERIFY(!sourceRender.isNull());
+    QVERIFY(qAbs(sourceRender.width() - 595) <= 1 && qAbs(sourceRender.height() - 842) <= 1);
+
+    /// The box is put WHERE THE PAGE'S OWN CONTENT IS, measured off the source rather than assumed:
+    /// a crop of a blank corner would come out blank and prove nothing about clipping. It is in the
+    /// reader's frame, whose origin is the page's top left, so the raster's pixels are read directly.
+    const QRect content = darkBounds(sourceRender);
+    QVERIFY2(content.isValid(), "the source page has no content to crop around");
+    const QRectF box = QRectF(content.adjusted(-4, -4, 4, 4));
+    manifest.pages[0].boxPt = box;
+    QCOMPARE(manifest.pages[0].displaySizePt(), box.size());
+
+    /// The ink is the page's own frame -- the crop has already clipped the artifact in the notebook
+    /// (that check is in PdfSessionTest), so the plane here is the box, mark included.
+    QHash<int, QImage> ink;
+    ink.insert(0, inkWithRedMark(box.size().toSize()));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString withInk = dir.filePath(QStringLiteral("cropped.pdf"));
+    const QString paperOnly = dir.filePath(QStringLiteral("cropped-paper.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, ink, withInk, &why), qPrintable(why));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), paperOnly, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend exported;
+    QVERIFY(exported.open(withInk));
+    QCOMPARE(exported.pageInfo(0).sizePt, box.size());
+    const QImage rendered = exported.renderPage(0, 72.0);
+    QVERIFY(!rendered.isNull());
+    QVERIFY2(qAbs(rendered.width() - qRound(box.width())) <= 2
+                 && qAbs(rendered.height() - qRound(box.height())) <= 2,
+             qPrintable(QStringLiteral("the cropped page rendered %1x%2, expected %3x%4")
+                            .arg(rendered.width()).arg(rendered.height())
+                            .arg(qRound(box.width())).arg(qRound(box.height()))));
+
+    /// The mark that was inside the box is still there, at its own size -- the page was cut, not
+    /// scaled.
+    const QRect mark = redMarkBounds(rendered);
+    QVERIFY2(mark.isValid(), "the mark inside the crop is not on the exported page");
+    QVERIFY2(qAbs(mark.left() - 10) <= 4 && qAbs(mark.top() - 10) <= 4
+                 && qAbs(mark.width() - 50) <= 4 && qAbs(mark.height() - 50) <= 4,
+             qPrintable(QStringLiteral("the mark came back at (%1,%2) measuring %3x%4")
+                            .arg(mark.left()).arg(mark.top()).arg(mark.width()).arg(mark.height())));
+
+    /// And the page's own content is the source's top-left corner, pixel for pixel, not the whole
+    /// sheet squeezed into 300x300.
+    PopplerRenderBackend clean;
+    QVERIFY(clean.open(paperOnly));
+    const QImage paper = clean.renderPage(0, 72.0);
+    QVERIFY(!paper.isNull());
+    const QImage expected = sourceRender.copy(box.toRect());
+    QVERIFY2(darkPixels(paper) > 0, "the cropped page came out blank");
+    const QRect paperWhere = darkBounds(paper);
+    const QRect expectedWhere = darkBounds(expected);
+    QVERIFY2(rectsClose(paperWhere, expectedWhere, 6),
+             qPrintable(QStringLiteral("the cropped paper came back at (%1,%2)-(%3,%4), where the "
+                                       "source's own top-left corner puts it at (%5,%6)-(%7,%8)")
+                            .arg(paperWhere.left()).arg(paperWhere.top())
+                            .arg(paperWhere.right()).arg(paperWhere.bottom())
+                            .arg(expectedWhere.left()).arg(expectedWhere.top())
+                            .arg(expectedWhere.right()).arg(expectedWhere.bottom())));
 }
 
 QTEST_MAIN(PdfExporterTest)

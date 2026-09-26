@@ -81,6 +81,42 @@ struct StubRotator {
     }
 };
 
+/**
+ * A clipper that writes a file the test can recognise at the destination and remembers what it was
+ * asked to clip from and to -- the same stub idea as StubRotator, for the same reason: what is under
+ * test is the OPERATION, and that the real clip puts the pixels where the page says is checked
+ * against a real artifact in PdfNavigatorIntegrationTest.
+ */
+struct StubClipper {
+    struct Call {
+        QString source;
+        QString destination;
+        PdfPageRecord from;
+        PdfPageRecord to;
+    };
+
+    QList<Call> calls;
+    bool fail = false;
+
+    PdfNotebookOps::ArtifactClipper fn()
+    {
+        return [this](const QString &source, const QString &destination, const PdfPageRecord &from,
+                      const PdfPageRecord &to, QString *why) {
+            calls.append(Call{source, destination, from, to});
+            if (fail) {
+                writeBytes(destination, QByteArrayLiteral("half a clip"));
+                if (why) {
+                    *why = QStringLiteral("the stub was asked to fail");
+                }
+                return false;
+            }
+            writeBytes(destination, QByteArrayLiteral("clipped"));
+            writeBytes(destination + QStringLiteral(".layers.txt"), QByteArrayLiteral("clipped sidecar"));
+            return true;
+        };
+    }
+};
+
 } // namespace
 
 /**
@@ -162,6 +198,14 @@ private Q_SLOTS:
     void testAWholePageListChangeIsOneCommit();
     void testAWholeChangeThatInsertsFromANewPdfIsOneCommit();
     void testAWholeChangeThatMergesANotebookInIsOneCommit();
+
+    /// Resizing a page: the two modes are two record fields, the size the reader sees is box then
+    /// turn then scale, the schema bump refuses an older build rather than dropping the size, and a
+    /// crop is clipped inside the same commit and the same undo as the manifest.
+    void testPageSizeIsBoxThenTurnThenScale();
+    void testAScaleOrABoxIsAChangeAndAResetIsOneToo();
+    void testACropClipsTheArtifactInTheSameStepAsTheBox();
+    void testACropWithoutAClipperIsRefused();
 
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
@@ -2603,6 +2647,315 @@ void PdfSessionTest::testAPageCanBeSetDownAtAnAngle()
     const PdfNotebookOps::Outcome undone = PdfNotebookOps::undoLast(project);
     QVERIFY2(undone.ok, qPrintable(undone.why));
     QCOMPARE(PdfSession::openProject(project, &why).pages.at(0).extraRotation, 0);
+}
+
+
+/**
+ * Scale and Box are two fields, and the size the reader sees is box, then turn, then scale.
+ *
+ * The ORDER is the contract, not a detail: boxPt is measured in the source's displayed frame, before
+ * the notebook's own turn, so cropping after turning would measure a rectangle in the wrong frame.
+ * The cases below are the ones that tell the two apart -- a non-square box turned a right angle
+ * reports its sides swapped, and a page with both is the turned box times the factor.
+ */
+void PdfSessionTest::testPageSizeIsBoxThenTurnThenScale()
+{
+    PdfPageRecord page;
+    page.index = 0;
+    page.sizePt = QSizeF(595, 842);
+    /// A record is a page of a notebook: the writer refuses one with no ink file, which is the same
+    /// rule every page of a real project obeys.
+    page.kraFile = QStringLiteral("pages/p0001.kra");
+
+    /// A page nobody resized: exactly the source's size, which is every notebook made until now.
+    QCOMPARE(page.displaySizePt(), QSizeF(595, 842));
+    QVERIFY(!page.isResized());
+
+    /// Scale alone multiplies the source's size and leaves the sheet alone.
+    page.extraScale = 2.0;
+    QCOMPARE(page.displaySizePt(), QSizeF(1190, 1684));
+    QVERIFY(page.isResized());
+    QCOMPARE(page.boxedSizePt(), QSizeF(595, 842));
+
+    /// Box alone is the box's size. A NON-SQUARE box turned a right angle reports the sides swapped
+    /// -- 200x300, not 300x200 -- which is what tells "box then turn" from "turn then box".
+    page.extraScale = 1.0;
+    page.boxPt = QRectF(100, 200, 300, 200);
+    QCOMPARE(page.boxedSizePt(), QSizeF(300, 200));
+    page.extraRotation = 90;
+    QCOMPARE(page.displaySizePt(), QSizeF(200, 300));
+
+    /// Both, at a free angle: the turned box, times the factor. 300x200 at 37 degrees is
+    /// 300*cos37 + 200*sin37 by 300*sin37 + 200*cos37, and the scale multiplies that.
+    page.extraRotation = 37;
+    const QSizeF turned = PdfPageRecord::turnedSize(QSizeF(300, 200), 37);
+    page.extraScale = 2.0;
+    QCOMPARE(page.displaySizePt(), QSizeF(turned.width() * 2.0, turned.height() * 2.0));
+    QVERIFY2(qAbs(page.displaySizePt().width() - 719.9) < 1.0,
+             qPrintable(QString::number(page.displaySizePt().width())));
+    QVERIFY2(qAbs(page.displaySizePt().height() - 680.5) < 1.0,
+             qPrintable(QString::number(page.displaySizePt().height())));
+
+    /// sizePt is what the file declares and neither mode rewrites it.
+    QCOMPARE(page.sizePt, QSizeF(595, 842));
+
+    /// Both fields survive the manifest, and the schema is the one that carries them.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("manifest.json"));
+    PdfSessionManifest manifest;
+    manifest.sourceFile = QStringLiteral("source.pdf");
+    manifest.sourceSha256 = QByteArrayLiteral("deadbeef");
+    manifest.sourceByteSize = 4;
+    manifest.pages.append(page);
+    QString why;
+    QVERIFY2(manifest.writeTo(path, &why), qPrintable(why));
+    QCOMPARE(PdfSessionManifest::readFrom(path, &why).toJson().value(QStringLiteral("schema")).toInt(),
+             PdfSessionManifest::CurrentSchema);
+    const PdfSessionManifest read = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(read.isValid(&why), qPrintable(why));
+    QCOMPARE(read.pages.at(0).extraScale, 2.0);
+    QCOMPARE(read.pages.at(0).boxPt, QRectF(100, 200, 300, 200));
+    QCOMPARE(read.pages.at(0).extraRotation, 37);
+
+    /// A schema 2 notebook -- the shape a build before this one wrote -- still opens, unchanged: no
+    /// scale is 1.0 and no box is the whole sheet, and the reader's size is what it always was.
+    const QByteArray two = R"({
+    "schema": 2,
+    "name": "from a schema 2 build",
+    "source": { "file": "source.pdf", "sha256": "deadbeef", "bytes": 4 },
+    "sources": [ { "file": "source.pdf", "sha256": "deadbeef", "bytes": 4 } ],
+    "nextPageNumber": 2,
+    "pages": [
+        { "index": 0, "sizePt": [595, 842], "rotation": 0, "kra": "pages/p0001.kra",
+          "thumb": "thumbs/p0001.png", "generation": 1, "source": 0, "extraRotation": 90 }
+    ]
+})";
+    writeBytes(path, two);
+    const PdfSessionManifest upgraded = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(upgraded.isValid(&why), qPrintable(why));
+    QCOMPARE(upgraded.schema, PdfSessionManifest::CurrentSchema);
+    QCOMPARE(upgraded.pages.at(0).extraScale, 1.0);
+    QCOMPARE(upgraded.pages.at(0).boxPt, QRectF());
+    QCOMPARE(upgraded.pages.at(0).displaySizePt(), QSizeF(842, 595));
+
+    /// And the other direction, which the schema number exists for: a manifest this build is too old
+    /// to understand is REFUSED with the number in the reason, not opened with the size dropped.
+    const QByteArray four = R"({
+    "schema": 4,
+    "source": { "file": "source.pdf", "sha256": "deadbeef", "bytes": 4 },
+    "pages": [ { "index": 0, "sizePt": [595, 842], "kra": "pages/p0001.kra" } ]
+})";
+    writeBytes(path, four);
+    why.clear();
+    const PdfSessionManifest refused = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY(!refused.isValid());
+    QVERIFY2(why.contains(QStringLiteral("unsupported manifest schema 4")), qPrintable(why));
+}
+
+/**
+ * A scale and a box are changes the Apply path has to see -- including a value put BACK to its
+ * default, or resetting one would silently do nothing.
+ *
+ * Nothing is clipped here: Scale changes the page and never what of the source is on it, which is
+ * exactly why it is a mode of its own.
+ */
+void PdfSessionTest::testAScaleOrABoxIsAChangeAndAResetIsOneToo()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    StubRotator rotator;
+    StubClipper clipper;
+    QString why;
+
+    /// Scale alone: one manifest write, no artifact touched, and the reader's size doubled.
+    PdfNotebookOps::PageEdits scale;
+    scale.sources = before.sources;
+    PdfPageRecord scaled = before.pages.at(0);
+    scaled.extraScale = 2.0;
+    scale.pages << scaled << before.pages.at(1) << before.pages.at(2);
+    scale.summary = QStringLiteral("1 page scaled");
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome scaledOutcome =
+        PdfNotebookOps::applyPageEdits(project, scale, rotator.fn());
+    QVERIFY2(scaledOutcome.ok, qPrintable(scaledOutcome.why));
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    QCOMPARE(rotator.calls.size(), 0);
+    PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.at(0).extraScale, 2.0);
+    QCOMPARE(after.pages.at(0).displaySizePt(), before.pages.at(0).sizePt * 2.0);
+
+    /// Resetting the scale back to 1.0 is a change as well: the comparison is over the whole value,
+    /// not over "is it not 1".
+    PdfNotebookOps::PageEdits unscale;
+    unscale.sources = after.sources;
+    PdfPageRecord unscaled = after.pages.at(0);
+    unscaled.extraScale = 1.0;
+    unscale.pages << unscaled << after.pages.at(1) << after.pages.at(2);
+    unscale.summary = QStringLiteral("1 page scaled back");
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome unscaleOutcome =
+        PdfNotebookOps::applyPageEdits(project, unscale, rotator.fn());
+    QVERIFY2(unscaleOutcome.ok, qPrintable(unscaleOutcome.why));
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    after = PdfSession::openProject(project, &why);
+    QCOMPARE(after.pages.at(0).extraScale, 1.0);
+    QCOMPARE(after.pages.at(0).displaySizePt(), before.pages.at(0).sizePt);
+}
+
+
+/**
+ * A crop is the page's INK as well as its box, and both go in one commit and one undo.
+ *
+ * If the artifact were left alone, the roll's task-13 scaling path would squeeze the whole page into
+ * the smaller rectangle -- the user's marks moved rather than removed, which is worse than losing
+ * them -- so the clip is not an extra, it is what the crop means. And because it runs inside the same
+ * journal entry, one undo brings back the size AND the ink.
+ */
+void PdfSessionTest::testACropClipsTheArtifactInTheSameStepAsTheBox()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    /// Ink and a preview for the page about to be cropped, so the clip has something to replace and
+    /// the change has something to drop.
+    const PdfPageRecord a = before.pages.at(0);
+    writeBytes(QDir(project).filePath(a.kraFile), QByteArrayLiteral("ink of A"));
+    writeBytes(QDir(project).filePath(a.kraFile + QStringLiteral(".layers/Ink.png")),
+               QByteArrayLiteral("a layer"));
+    writeBytes(QDir(project).filePath(a.thumbFile), QByteArrayLiteral("preview of A"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    const QRectF box(50, 60, 300, 400);
+    StubRotator rotator;
+    StubClipper clipper;
+
+    PdfNotebookOps::PageEdits crop;
+    crop.sources = before.sources;
+    PdfPageRecord cropped = a;
+    cropped.boxPt = box;
+    crop.pages << cropped << before.pages.at(1) << before.pages.at(2);
+    crop.removeAfter << a.thumbFile;
+    crop.clipper = clipper.fn();
+    crop.summary = QStringLiteral("1 page cropped");
+
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(project, crop, rotator.fn());
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// ONE manifest write, and the clip ran on the page's own artifact, told which frame it was in
+    /// and which frame the page becomes.
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    QCOMPARE(clipper.calls.size(), 1);
+    QCOMPARE(clipper.calls.at(0).source, QDir(project).filePath(a.kraFile));
+    QCOMPARE(clipper.calls.at(0).from.boxPt, QRectF());
+    QCOMPARE(clipper.calls.at(0).to.boxPt, box);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("clipped"));
+
+    QString why;
+    PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.at(0).boxPt, box);
+    QCOMPARE(after.pages.at(0).displaySizePt(), box.size());
+
+    /// ONE undo, and it puts back the manifest AND the ink the clip had replaced. This is the claim
+    /// the clip's placement in the journal exists for, so it is asserted on the crop itself rather
+    /// than on something that happened later.
+    const PdfNotebookOps::Outcome undone = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undone.ok, qPrintable(undone.why));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("ink of A"));
+    QCOMPARE(readBytes(QDir(project).filePath(a.thumbFile)), QByteArrayLiteral("preview of A"));
+
+    /// The crop again, and then the other direction: putting the box back to the whole sheet is a
+    /// change too -- the rule both ways -- and it is clipped like any other box change, from the
+    /// frame the artifact is in now.
+    const PdfNotebookOps::Outcome recropped = PdfNotebookOps::applyPageEdits(project, crop, rotator.fn());
+    QVERIFY2(recropped.ok, qPrintable(recropped.why));
+    after = PdfSession::openProject(project, &why);
+    QCOMPARE(after.pages.at(0).boxPt, box);
+
+    PdfNotebookOps::PageEdits uncrop;
+    uncrop.sources = after.sources;
+    PdfPageRecord whole = after.pages.at(0);
+    whole.boxPt = QRectF();
+    whole.extraScale = 3.0;
+    uncrop.pages << whole << after.pages.at(1) << after.pages.at(2);
+    uncrop.clipper = clipper.fn();
+    uncrop.summary = QStringLiteral("1 page un-cropped");
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome uncropped =
+        PdfNotebookOps::applyPageEdits(project, uncrop, rotator.fn());
+    QVERIFY2(uncropped.ok, qPrintable(uncropped.why));
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    /// Three clips now: the crop whose undo was just checked, the same crop again, and this one.
+    QCOMPARE(clipper.calls.size(), 3);
+    QCOMPARE(clipper.calls.at(1).to.boxPt, box);
+    QCOMPARE(clipper.calls.at(2).from.boxPt, box);
+    QCOMPARE(clipper.calls.at(2).to.boxPt, QRectF());
+    after = PdfSession::openProject(project, &why);
+    QCOMPARE(after.pages.at(0).boxPt, QRectF());
+    /// ...and resetting the BOX left the SCALE in force: the two are separate fields, and one reset
+    /// must not take the other with it.
+    QCOMPARE(after.pages.at(0).extraScale, 3.0);
+}
+
+/**
+ * A crop with nothing to clip with is refused, not applied with the ink left behind.
+ *
+ * The screen names PdfPageRotator::clipInto; a caller that builds a crop by hand and forgets it gets
+ * an error before the journal exists, rather than a page whose box says one thing and whose ink says
+ * another.
+ */
+void PdfSessionTest::testACropWithoutAClipperIsRefused()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    const PdfPageRecord a = before.pages.at(0);
+    writeBytes(QDir(project).filePath(a.kraFile), QByteArrayLiteral("ink of A"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    PdfNotebookOps::PageEdits crop;
+    crop.sources = before.sources;
+    PdfPageRecord cropped = a;
+    cropped.boxPt = QRectF(50, 60, 300, 400);
+    crop.pages << cropped << before.pages.at(1) << before.pages.at(2);
+    /// No clipper: the one thing the operation refuses to guess at.
+    crop.summary = QStringLiteral("1 page cropped");
+
+    StubRotator rotator;
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(project, crop, rotator.fn());
+    QVERIFY(!outcome.ok);
+    QVERIFY2(outcome.why.contains(QStringLiteral("clipper")), qPrintable(outcome.why));
+
+    /// Nothing was written at all: no manifest, no journal, no clipped artifact.
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 0);
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("ink of A"));
 }
 
 QTEST_MAIN(PdfSessionTest)

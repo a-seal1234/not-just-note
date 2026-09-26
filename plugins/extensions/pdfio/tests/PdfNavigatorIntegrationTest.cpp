@@ -14,6 +14,8 @@
 #include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
+#include "session/PdfSourceRenderers.h"
+#include "session/PdfStripBuilder.h"
 
 #include <KisDocument.h>
 #include <KisMainWindow.h>
@@ -35,6 +37,7 @@
 
 #include <QApplication>
 #include <QDialog>
+#include <QDoubleSpinBox>
 #include <QImage>
 #include <QLabel>
 #include <QMessageBox>
@@ -57,6 +60,7 @@
 /// For the parked exit: fflush() before _exit(), because _exit() runs no static destructors and
 /// flushes nothing, and ctest reads QTest's summary from those streams.
 #include <cstdio>
+#include <limits>
 #include <unistd.h>
 
 #if defined(__linux__)
@@ -164,6 +168,22 @@ private Q_SLOTS:
     /// A bigger strip at a fixed budget stays inside it (the pages get coarser); with no limit it
     /// simply costs more. The figures the report is written from are printed here.
     void testABiggerStripStaysInsideTheMemoryBudget();
+
+    /// Resizing: the pane's three modes stay apart, a scale typed or dragged is one pending edit,
+    /// Scale and Box reset independently, and a scaled page renders at a larger SOURCE dpi rather
+    /// than being upscaled.
+    void testTheOpsPaneKeepsTurnScaleAndBoxApart();
+    void testAScaledPageIsRenderedAtALargerDpi();
+
+    /// The page-loading trigger: the settle delay and the reading share, persisted, defaulted to
+    /// today's behaviour, clamped at their ends, and -- for the share -- changing which page a scroll
+    /// leaves under the centre of the viewport.
+    void testThePageLoadingTriggerIsPersistedAndClamped();
+
+    /// Importing a PDF while a notebook is open: the new notebook replaces the old one in every
+    /// place that names it, and its pages are rendered from the NEW notebook's own PDF -- which the
+    /// source-renderer cache, keyed on the relative file name, used to hand back as the old one's.
+    void testImportingWhileANotebookIsOpenReplacesIt();
 
 
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
@@ -363,17 +383,20 @@ void PdfNavigatorIntegrationTest::initTestCase()
 
     QVERIFY(m_dir.isValid());
 
-    /// The strip's page count and whether it is on are PERSISTED settings, and the navigator is a
-    /// process-wide singleton constructed the first time anything asks for it. This is the one place
-    /// the DEFAULT can be observed: with both keys absent, the notebook opens at five pages with the
-    /// strip on, exactly as it always did. Cleared before the first ask -- a previous run of the suite
-    /// leaves both behind -- rather than asserted in a test that runs later, by which time the
-    /// singleton has already read them. The count and the on/off state are two keys on purpose; the
-    /// tests below are what proves turning the strip off leaves the count alone.
+    /// The strip's page count, whether it is on, and the page-loading trigger are PERSISTED settings,
+    /// and the navigator is a process-wide singleton constructed the first time anything asks for it.
+    /// This is the one place the DEFAULTS can be observed: with the keys absent, the notebook opens at
+    /// five pages with the strip on, turns 450 ms after the view settles, and fits a page to three
+    /// fifths (60%) of the viewport -- exactly as it always did. Cleared before the first ask -- a
+    /// previous run of the suite leaves them behind -- rather than asserted in a test that runs later,
+    /// by which time the singleton has already read them. The count and the on/off state are two keys
+    /// on purpose; the tests below are what proves turning the strip off leaves the count alone.
     {
         QSettings settings;
         settings.remove(QStringLiteral("pdfio/stripPages"));
         settings.remove(QStringLiteral("pdfio/stripOn"));
+        settings.remove(QStringLiteral("pdfio/scrollSettleMs"));
+        settings.remove(QStringLiteral("pdfio/readingSharePercent"));
         settings.sync();
     }
 
@@ -448,10 +471,14 @@ void PdfNavigatorIntegrationTest::initTestCase()
     /// refused save is being handled.
     navigator()->setScrollFollowEnabled(false);
 
-    /// And the default the singleton read, asserted once it exists: five pages, the strip on. The
-    /// keys were removed above, before anything could construct it.
+    /// And the defaults the singleton read, asserted once it exists: five pages, the strip on, a
+    /// 450 ms settle -- what the follow's own log calls "settled on page N after 450 ms" -- and the
+    /// three fifths the fit has always used. The keys were removed above, before anything could
+    /// construct it.
     QCOMPARE(navigator()->scope(), 5);
     QCOMPARE(navigator()->stripPageCount(), 5);
+    QCOMPARE(navigator()->scrollSettleMs(), 450);
+    QCOMPARE(navigator()->readingSharePercent(), 60);
 }
 
 void PdfNavigatorIntegrationTest::cleanupTestCase()
@@ -2967,6 +2994,148 @@ struct StripRestore {
     int m_count;
 };
 
+/// A notebook of \a pages same-size Letter (612x792 pt) records, for geometry that needs a manifest
+/// but no document: at the 200 dpi reference that is a 1700x2200 px page.
+PdfSessionManifest letterManifest(int pages)
+{
+    PdfSessionManifest manifest;
+    manifest.sourceFile = QStringLiteral("strip-page-loading.pdf");
+    manifest.sourceSha256 = QByteArrayLiteral("0123456789abcdef");
+    manifest.sourceByteSize = 1;
+
+    for (int i = 0; i < pages; ++i) {
+        PdfPageRecord page;
+        page.index = i;
+        page.sizePt = QSizeF(612, 792);
+        page.kraFile = PdfSession::pageFileName(i);
+        page.thumbFile = PdfSession::thumbFileName(i);
+        manifest.pages.append(page);
+    }
+    return manifest;
+}
+
+/// Puts the page-loading trigger back however a test ends: the two persisted keys and the values in
+/// force, which the singleton has already read and the keys alone cannot restore.
+///
+/// RAII on purpose, the same lesson StripRestore records: a failing assertion must not leave the next
+/// test with this one's settle delay or reading share.
+struct PageLoadingRestore {
+    PageLoadingRestore()
+        : m_settleMs(QSettings().value(QStringLiteral("pdfio/scrollSettleMs"), 450).toInt())
+        , m_share(QSettings().value(QStringLiteral("pdfio/readingSharePercent"), 60).toInt())
+        , m_navigatorSettleMs(PdfPageNavigator::instance()->scrollSettleMs())
+        , m_navigatorShare(PdfPageNavigator::instance()->readingSharePercent())
+    {
+    }
+    ~PageLoadingRestore()
+    {
+        /// The navigator first -- the setters write both keys -- and the original keys LAST, so what
+        /// is on disk at the end is exactly what was there at the start.
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        navigator->setScrollSettleMs(m_navigatorSettleMs);
+        navigator->setReadingSharePercent(m_navigatorShare);
+
+        QSettings settings;
+        settings.setValue(QStringLiteral("pdfio/scrollSettleMs"), m_settleMs);
+        settings.setValue(QStringLiteral("pdfio/readingSharePercent"), m_share);
+    }
+
+    PageLoadingRestore(const PageLoadingRestore &) = delete;
+    PageLoadingRestore &operator=(const PageLoadingRestore &) = delete;
+
+    int m_settleMs;
+    int m_share;
+    int m_navigatorSettleMs;
+    int m_navigatorShare;
+};
+
+/// Writes a one-source notebook into \a project whose source is copied in under \a sourceName --
+/// the RELATIVE name the manifest records and the renderer cache keys on -- with one page per entry
+/// of \a pageIndices, its displayed size in \a sizes (parallel lists). \a name is the notebook's
+/// display name, so two notebooks built this way can be told apart on the tab.
+///
+/// Hand-built rather than through PdfSession::createProject because the collision under test is
+/// exactly two notebooks whose source files have the SAME NAME in different directories, which is
+/// what the Android picker makes of every import.
+bool writeCollidingSourceNotebook(const QString &project, const QString &sourcePdf,
+                                  const QString &sourceName, const QString &name,
+                                  const QList<int> &pageIndices, const QList<QSizeF> &sizes,
+                                  QString *why)
+{
+    if (pageIndices.size() != sizes.size() || pageIndices.isEmpty()) {
+        if (why) {
+            *why = QStringLiteral("the page and size lists do not agree");
+        }
+        return false;
+    }
+    QDir().mkpath(project);
+    const QString copied = QDir(project).filePath(sourceName);
+    if (!QFile::copy(sourcePdf, copied)) {
+        if (why) {
+            *why = QStringLiteral("cannot copy %1 to %2").arg(sourcePdf, copied);
+        }
+        return false;
+    }
+
+    PdfSessionManifest manifest;
+    manifest.name = name;
+    manifest.sourceFile = sourceName;
+    manifest.sourceSha256 = PdfSessionManifest::sha256OfFile(copied);
+    manifest.sourceByteSize = QFileInfo(copied).size();
+
+    PdfSourceRecord source;
+    source.file = sourceName;
+    source.sha256 = manifest.sourceSha256;
+    source.byteSize = manifest.sourceByteSize;
+    manifest.sources.append(source);
+
+    for (int i = 0; i < pageIndices.size(); ++i) {
+        PdfPageRecord page;
+        page.index = pageIndices.at(i);
+        /// The DISPLAYED size (the source's /Rotate already applied), which is what displaySizePt()
+        /// returns and what the renderer produces -- so every page lands in a slot its own size.
+        page.sizePt = sizes.at(i);
+        page.kraFile = PdfSession::pageFileName(i);
+        page.thumbFile = PdfSession::thumbFileName(i);
+        manifest.pages.append(page);
+    }
+    manifest.refreshNextPageNumber();
+
+    if (!manifest.isValid(why)) {
+        return false;
+    }
+    return manifest.writeTo(PdfSession::manifestPath(project), why);
+}
+
+/// Whether \a band holds anything but the desk colour: a slot whose page was rendered carries paper
+/// and text inside its rectangle, and one whose render came back EMPTY keeps the desk fill and
+/// nothing else. The same rule, and the same tolerance, PdfStripBuilderTest uses to find where a
+/// page landed.
+bool bandHasARenderedPage(KisNodeSP band)
+{
+    /// By value and non-const on purpose: a const KisNodeSP hands back a const KisNode*, and
+    /// qobject_cast refuses to cast the constness away (this exact error has cost two builds now).
+    KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(band.data());
+    if (!layer) {
+        return false;
+    }
+
+    const QImage pixels = layer->paintDevice()->convertToQImage(0, layer->paintDevice()->extent());
+    if (pixels.isNull()) {
+        return false;
+    }
+
+    for (int y = 0; y < pixels.height(); ++y) {
+        for (int x = 0; x < pixels.width(); ++x) {
+            const QColor at = pixels.pixelColor(x, y);
+            if (qAbs(at.red() - 96) > 1 || qAbs(at.green() - 96) > 1 || qAbs(at.blue() - 96) > 1) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 /**
@@ -4100,6 +4269,297 @@ void PdfNavigatorIntegrationTest::testABiggerStripStaysInsideTheMemoryBudget()
 }
 
 /**
+ * The page-loading trigger is the user's: how long the view must settle before the strip turns, and
+ * how much of the viewport the active page takes when it is fitted.
+ *
+ * Both are PERSISTED like the strip's page count and the memory budget, both default to exactly what
+ * every build before the setting did (450 ms, three fifths), and both are CLAMPED rather than refused:
+ * the settle delay at 0 -- a negative pause has no meaning, and there is NO CEILING because no value
+ * breaks anything -- and the reading share between 1% and 100%, the fraction's own ends (zero is a
+ * page with no height; above 100% the page is taller than the viewport and the neighbour the rule
+ * exists to show is gone again).
+ *
+ * The share is not only a quality knob: it decides how much scrolling turns the reading page, and the
+ * geometry at the end of this test pins that down with the code's own layout and the code's own fit
+ * arithmetic. The spinner widgets themselves live in PdfIoPlugin.cpp and are not in this binary; what
+ * is tested here is the value handling the dialogs call.
+ */
+void PdfNavigatorIntegrationTest::testThePageLoadingTriggerIsPersistedAndClamped()
+{
+    PageLoadingRestore restore;
+
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+
+    /// The strip's own scope, to be shown at the end to be untouched: the page-loading trigger is a
+    /// separate setting and must not move the window.
+    const int scopeBefore = navigator->scope();
+
+    /// The defaults this test can see -- initTestCase asserted the ones the singleton read at
+    /// construction: 450 ms and 60%, what every build before the setting used.
+    QCOMPARE(navigator->scrollSettleMs(), 450);
+    QCOMPARE(navigator->readingSharePercent(), 60);
+    QCOMPARE(PdfPageNavigator::minReadingSharePercent(), 1);
+    QCOMPARE(PdfPageNavigator::maxReadingSharePercent(), 100);
+
+    /// Persisted and read back, under the two keys, exactly like the memory budget.
+    navigator->setScrollSettleMs(300);
+    QCOMPARE(navigator->scrollSettleMs(), 300);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/scrollSettleMs")).toInt(), 300);
+
+    navigator->setReadingSharePercent(40);
+    QCOMPARE(navigator->readingSharePercent(), 40);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/readingSharePercent")).toInt(), 40);
+
+    /// Clamped, not refused: a negative settle is held at 0, and an hour is stored as asked -- there
+    /// is no ceiling for the settle delay, and the switch is what says "off".
+    navigator->setScrollSettleMs(-100);
+    QCOMPARE(navigator->scrollSettleMs(), 0);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/scrollSettleMs")).toInt(), 0);
+    navigator->setScrollSettleMs(3600000);
+    QCOMPARE(navigator->scrollSettleMs(), 3600000);
+
+    /// The share is held at both ends: 0 is not a share at all and 100 is the last value that leaves
+    /// the neighbour on screen.
+    navigator->setReadingSharePercent(0);
+    QCOMPARE(navigator->readingSharePercent(), PdfPageNavigator::minReadingSharePercent());
+    navigator->setReadingSharePercent(1000);
+    QCOMPARE(navigator->readingSharePercent(), PdfPageNavigator::maxReadingSharePercent());
+
+    /// The default the fit has always used, pinned against the real arithmetic: a 1700x2200 px page
+    /// (612x792 pt at the 200 dpi reference) in a 1200x1600 viewport, three fifths of the height.
+    const QSize viewport(1200, 1600);
+    const QRect pageRect(0, 0, 1700, 2200);
+    navigator->setReadingSharePercent(60);
+    const qreal atSixty = navigator->fitZoomForViewport(viewport, pageRect);
+    const qreal threeFifths = 0.6 * 1600.0 / 2200.0;
+    QVERIFY2(qAbs(atSixty - threeFifths) < 1e-9,
+             qPrintable(QStringLiteral("the 60% fit is %1, not the three fifths %2")
+                            .arg(atSixty).arg(threeFifths)));
+
+    navigator->setReadingSharePercent(100);
+    const qreal atFull = navigator->fitZoomForViewport(viewport, pageRect);
+    QVERIFY2(atFull > atSixty, "100% has to make the page bigger on screen than 60%");
+    /// At 100% the width fits before the height does, which is the ceiling's own meaning: the page is
+    /// no longer limited by the share, and nothing of the next page is left.
+    QCOMPARE(atFull, 1200.0 / 1700.0);
+
+    /// And the share changes WHICH PAGE a scroll leaves under the centre -- the reading page.
+    ///
+    /// Three same-size pages are laid out by the code's own layout, the centre starts on page 2 (the
+    /// middle slot) and the user scrolls 600 widget px. The strip travels 600/zoom DOCUMENT px, so
+    /// the bigger the page on screen (the larger the share) the less far the centre goes: at 100% it
+    /// is still on page 2, at 60% it has reached page 3.
+    const PdfSessionManifest manifest = letterManifest(3);
+    const PdfStripLayout layout = PdfStripLayout::forWindow(manifest, 1, 3, 200.0);
+    QVERIFY(layout.isValid());
+    const QList<PdfStripLayout::Slot> slots = layout.slots();
+    QCOMPARE(slots.size(), 3);
+
+    const QPointF start = slots.at(1).rect.center();
+    const QList<int> pages = { slots.at(0).page, slots.at(1).page, slots.at(2).page };
+    const QList<QRect> rects = { slots.at(0).rect, slots.at(1).rect, slots.at(2).rect };
+    const auto readingPageAfterScroll = [&pages, &rects, &layout, &start](qreal zoom) {
+        const QPointF centre(start.x(), start.y() + 600.0 / zoom);
+        return layout.nearestPage(pages, rects, centre, std::numeric_limits<qreal>::max());
+    };
+
+    navigator->setReadingSharePercent(100);
+    const qreal biggerPage = navigator->fitZoomForViewport(viewport, slots.at(1).rect);
+    navigator->setReadingSharePercent(60);
+    const qreal smallerPage = navigator->fitZoomForViewport(viewport, slots.at(1).rect);
+    QVERIFY2(smallerPage < biggerPage, "the 60% page has to be smaller on screen than the 100% one");
+
+    qInfo("reading page after a 600 widget px scroll: 100%% (zoom %f) stays on page %d; 60%% "
+          "(zoom %f) is on page %d",
+          biggerPage, readingPageAfterScroll(biggerPage) + 1, smallerPage,
+          readingPageAfterScroll(smallerPage) + 1);
+
+    QCOMPARE(readingPageAfterScroll(biggerPage), slots.at(1).page);
+    QCOMPARE(readingPageAfterScroll(smallerPage), slots.at(2).page);
+
+    /// And the trigger is a setting of its own: moving either value changed nothing about which
+    /// window the strip holds.
+    QCOMPARE(navigator->scope(), scopeBefore);
+}
+
+/**
+ * Importing a PDF while a notebook is open: the new notebook has to replace the old one everywhere.
+ *
+ * The report was "the proportion/rescale is the new one but the content is the old notebook", and the
+ * mechanism was NOT the reuse path in the open flow -- it was the source-renderer cache.
+ * PdfSourceRenderers keeps one open backend per RELATIVE source file name the manifest records, and
+ * every Android import is a copy called "pdfio-picked.pdf": with a notebook already open, the second
+ * import's pages were rendered through the FIRST notebook's still-open PDF, giving the new manifest's
+ * page count, sizes and rotation (the new proportions) with the old notebook's pixels drawn into
+ * them. adoptNotebook() now clears the renderers -- and the stale thumbnail queue and write stamps --
+ * when a notebook replaces another, which is what closeNotebook() had always done for a close.
+ *
+ * The two projects here are built to make that visible: different PDFs under the SAME relative source
+ * name, and the second notebook's pages point at source pages the first notebook's PDF does not have,
+ * so a render served by the wrong backend comes back EMPTY and the band keeps only the desk colour.
+ * With realistic (in-range) page indices the same fault shows as the old notebook's pages drawn into
+ * the new notebook, which is what the user saw; out of range is what a test can see.
+ *
+ * The ink half is here too: the open notebook's pages are written by the gate the import path now
+ * runs before it closes it (prepareForNotebookChange), and the page that was drawn on comes back with
+ * its mark when the notebook is opened again.
+ *
+ * What this test does NOT cover: the plugin's own close-first helper (openNotebookReplacing) is not
+ * in this binary, so what is tested is the gate it calls and the navigator's own replace. Nor does it
+ * cover the second, latent half of the cache fault -- the key is still the relative name, so two
+ * notebooks are only safe because the cache is cleared between them (see the report).
+ */
+void PdfNavigatorIntegrationTest::testImportingWhileANotebookIsOpenReplacesIt()
+{
+    StripRestore restore;
+
+    const QString fixtureA = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf");
+    const QString fixtureB = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(fixtureA) && QFileInfo::exists(fixtureB), "the fixtures are missing");
+
+    const QString dirA = m_dir.filePath(QStringLiteral("import-open-a"));
+    const QString dirB = m_dir.filePath(QStringLiteral("import-open-b"));
+    QString why;
+
+    /// A: three pages of text-fixture (its own PDF has three), source recorded as "same-name.pdf".
+    /// The displayed sizes are the fixture's own (page 1 is turned a right angle by the file).
+    QVERIFY2(writeCollidingSourceNotebook(dirA, fixtureA, QStringLiteral("same-name.pdf"),
+                                          QStringLiteral("Notebook A"), { 0, 1, 2 },
+                                          { QSizeF(595, 842), QSizeF(420, 595), QSizeF(300, 300) },
+                                          &why), qPrintable(why));
+    /// B: SIX pages of ex-manypage -- source pages 10..15, past the end of A's three page PDF --
+    /// under the same relative source name, with the fixture's displayed sizes for those pages. Six
+    /// rather than three so a window move after the import can be exercised as well.
+    QVERIFY2(writeCollidingSourceNotebook(dirB, fixtureB, QStringLiteral("same-name.pdf"),
+                                          QStringLiteral("Notebook B"), { 10, 11, 12, 13, 14, 15 },
+                                          { QSizeF(612, 792), QSizeF(595, 420), QSizeF(595, 842),
+                                            QSizeF(420, 595), QSizeF(612, 792), QSizeF(595, 420) },
+                                          &why), qPrintable(why));
+
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+
+    /// A is open at three pages, with ink on its first page that is not on disk yet.
+    navigator->setScope(3);
+    QVERIFY2(navigator->openNotebookDir(dirA, &why), qPrintable(why));
+    QCOMPARE(navigator->projectDir(), dirA);
+    QCOMPARE(navigator->manifest().pages.size(), 3);
+
+    {
+        KisDocument *document = navigator->currentDocument();
+        QVERIFY(document);
+        KisPaintLayer *ink = stripInkLayer(document->image());
+        QVERIFY2(ink, "the strip has no layer called Ink to draw on");
+
+        const PdfStripLayout layout = PdfStripLayout::forWindow(navigator->manifest(), 0, 3,
+                                                                navigator->currentRenderDpi());
+        QVERIFY(layout.isValid());
+        const QRect mark(layout.slots().at(0).rect.topLeft() + QPoint(8, 8), QSize(24, 24));
+        ink->paintDevice()->fill(mark, KoColor(QColor(0, 0, 0), document->image()->colorSpace()));
+        document->setModified(true);
+        Q_EMIT document->image()->sigImageModified();
+    }
+
+    /// The gate the import path now runs before it closes the old notebook: every page the document
+    /// holds is written, and only then may the close happen. The ink must reach the artifact -- this
+    /// is the "written before it is closed" half of the fix.
+    QVERIFY2(navigator->prepareForNotebookChange(&why), qPrintable(why));
+    QVERIFY2(QFileInfo::exists(artifactFor(0)), "the first notebook's page was not written");
+    QVERIFY2(inkMarkInImage(PdfInkLoader::loadInk(artifactFor(0))),
+             "the mark did not reach the first notebook's artifact");
+
+    /// And the import itself: open B while A's document is still standing, which is the sequence the
+    /// report is about (the plugin closes the view first; the navigator must replace either way).
+    QVERIFY2(navigator->openNotebookDir(dirB, &why), qPrintable(why));
+
+    /// Every place that names the notebook is B's: the navigator's directory and manifest, the
+    /// document's own recorded directory, and the tab.
+    QCOMPARE(navigator->projectDir(), dirB);
+    QCOMPARE(navigator->manifest().pages.size(), 6);
+    QCOMPARE(navigator->manifest().pages.at(0).index, 10);
+    QCOMPARE(navigator->manifest().pages.at(5).index, 15);
+    QCOMPARE(navigator->manifest().displayName(), QStringLiteral("Notebook B"));
+
+    KisDocument *documentB = navigator->currentDocument();
+    QVERIFY(documentB);
+    QCOMPARE(documentB->property("pdfioProjectDir").toString(), dirB);
+    QVERIFY2(documentB->caption().contains(QStringLiteral("Notebook B")),
+             qPrintable(QStringLiteral("the tab still reads \"%1\"").arg(documentB->caption())));
+
+    /// And the CONTENT is B's: every band holds a page rendered from ex-manypage. If the old
+    /// notebook's renderer was reused, all three renders come back empty (A's PDF has no page 11)
+    /// and every band is desk colour and nothing else.
+    const KisImageSP imageB = documentB->image();
+    QVERIFY(imageB);
+    QList<KisNodeSP> bandsB;
+    for (quint32 i = 0; i < imageB->root()->childCount(); ++i) {
+        if (PdfPageSaver::isPageBackground(imageB->root()->at(i))) {
+            bandsB.append(imageB->root()->at(i));
+        }
+    }
+    QCOMPARE(bandsB.size(), 3);
+    for (int slot = 0; slot < bandsB.size(); ++slot) {
+        QVERIFY2(bandHasARenderedPage(bandsB.at(slot)),
+                 qPrintable(QStringLiteral("band %1 of the imported notebook has no page in it: the "
+                                           "old notebook's PDF was rendered into the new window")
+                                .arg(slot + 1)));
+    }
+
+    /// And scrolling on, into a SECOND window of the new notebook: it is built from the new
+    /// notebook's own pages too, with no band left over from the window before it or from the old
+    /// notebook. Page 6 is outside the window [1..3], so this is a roll.
+    QVERIFY2(navigator->showPage(5, &why), qPrintable(why));
+    QCOMPARE(navigator->currentIndex(), 5);
+
+    const KisImageSP rolled = navigator->currentDocument()->image();
+    QVERIFY(rolled);
+    QList<KisNodeSP> rolledBands;
+    QStringList rolledNames;
+    for (quint32 i = 0; i < rolled->root()->childCount(); ++i) {
+        if (PdfPageSaver::isPageBackground(rolled->root()->at(i))) {
+            rolledBands.append(rolled->root()->at(i));
+            rolledNames.append(rolled->root()->at(i)->name());
+        }
+    }
+    QCOMPARE(rolledBands.size(), 3);
+    /// The window around page 6 holds notebook positions 4..6, whose source pages are 13..15, and the
+    /// band names are the LAYER names the builder gives those records -- so this says which pages the
+    /// new window is holding, not only that it painted something.
+    QCOMPARE(rolledNames,
+             QStringList({ PdfStripBuilder::backgroundLayerName(13),
+                           PdfStripBuilder::backgroundLayerName(14),
+                           PdfStripBuilder::backgroundLayerName(15) }));
+    for (int slot = 0; slot < rolledBands.size(); ++slot) {
+        QVERIFY2(bandHasARenderedPage(rolledBands.at(slot)),
+                 qPrintable(QStringLiteral("band %1 of the second window after the import has no page "
+                                           "in it").arg(slot + 1)));
+    }
+
+    /// The inverse, while we are here: going BACK to A rebuilds A -- the renderer cache cleared the
+    /// other way round -- and the ink written before the import is back on the page it was drawn on.
+    QVERIFY2(navigator->openNotebookDir(dirA, &why), qPrintable(why));
+    QCOMPARE(navigator->projectDir(), dirA);
+    QCOMPARE(navigator->manifest().displayName(), QStringLiteral("Notebook A"));
+
+    KisDocument *documentA = navigator->currentDocument();
+    QVERIFY(documentA);
+    QCOMPARE(documentA->property("pdfioProjectDir").toString(), dirA);
+
+    const PdfStripLayout layoutA = PdfStripLayout::forWindow(navigator->manifest(), 0, 3,
+                                                             navigator->currentRenderDpi());
+    QVERIFY(layoutA.isValid());
+    KisPaintLayer *inkA = stripInkLayer(documentA->image());
+    QVERIFY(inkA);
+    QVERIFY2(inkMarkInImage(inkA->paintDevice()->convertToQImage(0, layoutA.slots().at(0).rect)),
+             "the ink written before the import did not come back with the notebook");
+
+    /// And the same notebook opened twice in a row: one document, still A's, no stale B left over.
+    QVERIFY2(navigator->openNotebookDir(dirA, &why), qPrintable(why));
+    QCOMPARE(navigator->projectDir(), dirA);
+    QVERIFY(navigator->currentDocument());
+    QCOMPARE(navigator->currentDocument()->property("pdfioProjectDir").toString(), dirA);
+}
+
+/**
  * Deleting a notebook: the open one is closed for real, its folder goes, and the recent list forgets
  * it.
  *
@@ -4707,6 +5167,187 @@ int main(int argc, char *argv[])
     /// hand because _exit() does not do it, and ctest reads the summary from those streams.
     std::fflush(nullptr);
     ::_exit(failed == 0 ? 0 : 1);
+}
+
+
+/**
+ * The pane's three modes stay apart: one in force at a time, named before a drag starts.
+ *
+ * Turn is the default and is untouched; Scale is the emphasis, reachable by typing a percentage as
+ * well as by dragging; Box is its own mode with its own warning. The two resets are separate, which
+ * is the user's own rule: putting the scale back must leave the crop in force and the other way
+ * round.
+ */
+void PdfNavigatorIntegrationTest::testTheOpsPaneKeepsTurnScaleAndBoxApart()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("ops-resize"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+
+    /// A preview the pane can draw, so the Box gesture has a page to take hold of.
+    const QString thumbPath = QDir(project).filePath(manifest.pages.at(0).thumbFile);
+    QImage sheet(180, 256, QImage::Format_ARGB32_Premultiplied);
+    sheet.fill(Qt::white);
+    {
+        QPainter painter(&sheet);
+        painter.fillRect(QRect(10, 10, 40, 40), QColor(Qt::red));
+        painter.fillRect(QRect(10, 200, 160, 20), QColor(Qt::black));
+    }
+    QVERIFY2(sheet.save(thumbPath), qPrintable(thumbPath));
+
+    WatchdogPause watchdogPaused(m_dialogWatchdog);
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *turn = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_mode_turn"));
+    auto *scale = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_mode_scale"));
+    auto *boxMode = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_mode_box"));
+    auto *readout = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_angle"));
+    auto *warning = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_box_warning"));
+    auto *field = dialog.findChild<QDoubleSpinBox *>(QStringLiteral("pdfio_ops_scale_value"));
+    auto *resetScale = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_reset_scale"));
+    auto *resetBox = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_reset_box"));
+    auto *apply = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_apply"));
+    auto *canvas = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_canvas"));
+    QVERIFY(turn && scale && boxMode && readout && warning && field && resetScale && resetBox && apply
+            && canvas);
+
+    /// Turn is in force to begin with, the pane says so, and that is what a drag would do.
+    QVERIFY2(turn->isChecked() && !scale->isChecked() && !boxMode->isChecked(),
+             "the pane did not open on Turn");
+    QCOMPARE(dialog.dragMode(), PdfNotebookOpsDialog::TurnDrag);
+    QVERIFY2(readout->text().contains(QStringLiteral("Turn")), qPrintable(readout->text()));
+    QVERIFY2(!apply->isEnabled(), "Apply was offered before anything changed");
+
+    /// Scale: the mode switch is exclusive, the readout names the mode, and the typed field is the
+    /// second way in. A scale is a change, and the summary names it as a scale rather than a turn.
+    scale->click();
+    QVERIFY2(scale->isChecked() && !turn->isChecked() && !boxMode->isChecked(),
+             "the mode switch is not exclusive");
+    QCOMPARE(dialog.dragMode(), PdfNotebookOpsDialog::ScaleDrag);
+    QVERIFY2(readout->text().contains(QStringLiteral("Scale")), qPrintable(readout->text()));
+    field->setValue(150.0);
+    QCOMPARE(dialog.edits().pages.at(0).extraScale, 1.5);
+    QCOMPARE(dialog.edits().pages.at(0).displaySizePt(), manifest.pages.at(0).sizePt * 1.5);
+    QVERIFY2(apply->isEnabled(), "a typed scale is not a pending edit");
+    auto *summary = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_summary"));
+    QVERIFY(summary);
+    QVERIFY2(summary->text().contains(QStringLiteral("scaled")), qPrintable(summary->text()));
+
+    /// Box is its own mode with its own readout and warning, and the pane says what the crop would
+    /// remove before Apply is pressed.
+    boxMode->click();
+    QVERIFY2(boxMode->isChecked() && !scale->isChecked(), "Box and Scale are not exclusive");
+    QVERIFY2(readout->text().contains(QStringLiteral("Box")), qPrintable(readout->text()));
+    QVERIFY2(!warning->text().isEmpty(), "Box mode said nothing about what the crop removes");
+
+    dialog.show();
+    QTest::qWait(50);
+
+    /// A drag on the left edge: the crop the mode is for. The grip is where the drawn page's left
+    /// edge is, measured off the pane itself rather than assumed.
+    const QImage painted = canvas->grab().toImage();
+    const QRect drawn = cardOnCanvas(painted);
+    QVERIFY2(drawn.isValid(), "the pane drew no page to take hold of");
+    const QPoint leftEdge(drawn.left() + 1, drawn.center().y());
+    const QPoint pushedIn = leftEdge + QPoint(40, 0);
+    const auto send = [canvas](QEvent::Type type, const QPoint &at, Qt::MouseButton button,
+                               Qt::MouseButtons buttons) {
+        QMouseEvent event(type, at, canvas->mapToGlobal(at), button, buttons, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &event);
+    };
+    send(QEvent::MouseButtonPress, leftEdge, Qt::LeftButton, Qt::LeftButton);
+    send(QEvent::MouseMove, pushedIn, Qt::NoButton, Qt::LeftButton);
+    QVERIFY2(!dialog.edits().pages.at(0).boxPt.isValid(),
+             "the crop was recorded while the hand was still down");
+    QVERIFY2(readout->text().contains(QStringLiteral("Box")), qPrintable(readout->text()));
+    send(QEvent::MouseButtonRelease, pushedIn, Qt::LeftButton, Qt::NoButton);
+
+    const QRectF crop = dialog.edits().pages.at(0).boxPt;
+    QVERIFY2(crop.isValid() && crop.x() > 10.0 && crop.width() < manifest.pages.at(0).sizePt.width(),
+             qPrintable(QStringLiteral("the crop is %1,%2 %3x%4")
+                            .arg(crop.x()).arg(crop.y()).arg(crop.width()).arg(crop.height())));
+    QVERIFY2(summary->text().contains(QStringLiteral("cropped")), qPrintable(summary->text()));
+    /// The pane warned BEFORE the drag and still warns after it: the ink inside the cut-away part is
+    /// what the user is about to lose.
+    QVERIFY2(!warning->text().isEmpty(), "the crop said nothing about the ink it removes");
+
+    /// Resetting one mode leaves the other: Box goes back to the whole sheet and the scale of 1.5
+    /// stays; then the scale goes back and the page is the one the notebook has.
+    resetBox->click();
+    QCOMPARE(dialog.edits().pages.at(0).boxPt, QRectF());
+    QCOMPARE(dialog.edits().pages.at(0).extraScale, 1.5);
+    resetScale->click();
+    QCOMPARE(dialog.edits().pages.at(0).extraScale, 1.0);
+    QVERIFY2(!apply->isEnabled(),
+             "the page is back to what the notebook has, and Apply is still offered");
+
+    /// And the screen hands the operation the one thing a crop cannot be applied without.
+    QVERIFY2(static_cast<bool>(dialog.edits().clipper),
+             "the screen did not name a clipper, so a crop would be refused");
+}
+
+/**
+ * A scaled page is rendered at a LARGER DPI, not upscaled: the same source, more pixels.
+ *
+ * This is what keeps the pen's ink sharp and what makes the memory budget the thing that decides how
+ * far a scale can go. The proof is that a 2x page at 100 dpi is byte for byte the source rendered at
+ * 200 dpi -- and NOT the 100 dpi render stretched, which is a different picture however carefully it
+ * is stretched.
+ */
+void PdfNavigatorIntegrationTest::testAScaledPageIsRenderedAtALargerDpi()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString sourcePath = dir.filePath(QStringLiteral("source.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"),
+                        sourcePath));
+
+    PdfSessionManifest manifest;
+    manifest.sourceFile = QStringLiteral("source.pdf");
+    manifest.sourceSha256 = PdfSessionManifest::sha256OfFile(sourcePath);
+    manifest.sourceByteSize = QFileInfo(sourcePath).size();
+    manifest.pages.append(PdfPageRecord{0, QSizeF(595, 842), 0, QStringLiteral("pages/p0001.kra"),
+                                        QString(), 0});
+
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
+    QString why;
+    const QImage once = renderers.renderPage(manifest, dir.path(), 0, 100.0, &why);
+    QVERIFY2(!once.isNull(), qPrintable(why));
+
+    manifest.pages[0].extraScale = 2.0;
+    const QImage twice = renderers.renderPage(manifest, dir.path(), 0, 100.0, &why);
+    QVERIFY2(!twice.isNull(), qPrintable(why));
+
+    /// Twice the pixels in each direction: the same page at the same dpi, bigger.
+    QVERIFY2(qAbs(twice.width() - once.width() * 2) <= 2
+                 && qAbs(twice.height() - once.height() * 2) <= 2,
+             qPrintable(QStringLiteral("a 2x page at 100 dpi rendered %1x%2, where twice the 1x "
+                                       "render is %3x%4")
+                            .arg(twice.width()).arg(twice.height())
+                            .arg(once.width() * 2).arg(once.height() * 2)));
+
+    /// And those pixels are the SOURCE's at twice the dpi, not the first render stretched: the same
+    /// page at scale 1 and 200 dpi is the same picture, byte for byte.
+    PdfSessionManifest unscaled = manifest;
+    unscaled.pages[0].extraScale = 1.0;
+    const QImage atTwiceTheDpi = renderers.renderPage(unscaled, dir.path(), 0, 200.0, &why);
+    QVERIFY2(!atTwiceTheDpi.isNull(), qPrintable(why));
+    QCOMPARE(twice, atTwiceTheDpi);
+    QVERIFY2(twice != once.scaled(twice.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation),
+             "the 2x page is the 1x render stretched, not rendered again at a larger dpi");
+
+    /// A box renders its box only, at the frame the box's own points say.
+    unscaled.pages[0].boxPt = QRectF(100, 100, 200, 300);
+    const QImage boxed = renderers.renderPage(unscaled, dir.path(), 0, 100.0, &why);
+    QVERIFY2(!boxed.isNull(), qPrintable(why));
+    QVERIFY2(qAbs(boxed.width() - qRound(200.0 * 100.0 / 72.0)) <= 2
+                 && qAbs(boxed.height() - qRound(300.0 * 100.0 / 72.0)) <= 2,
+             qPrintable(QStringLiteral("a 200x300 point box at 100 dpi rendered %1x%2")
+                            .arg(boxed.width()).arg(boxed.height())));
 }
 
 #include "PdfNavigatorIntegrationTest.moc"

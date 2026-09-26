@@ -10,6 +10,8 @@
 
 #include <QFile>
 #include <QHash>
+#include <QPointF>
+#include <QRectF>
 #include <QSet>
 #include <QTransform>
 #include <QtMath>
@@ -1434,6 +1436,11 @@ struct PageTurn {
     int writtenRotation = 0; ///< the /Rotate the new page object is written with
     bool bake = false;       ///< true when the turn does not fit /Rotate and is drawn into the page
     bool fromRecordedSize = false; ///< the source's box could not be read; the notebook's size stood in
+    /// The notebook's scale for this page, and whether the page was resized at all (a box, a scale,
+    /// or both). A resized page always bakes: the box, the turn and the scale become one content
+    /// transform, and the /MediaBox is the box the reader ends up with.
+    qreal scale = 1.0;
+    bool resized = false;
     /// The box the page occupies in the new page object's own space: the source's own box when the
     /// turn goes through /Rotate, the turned sheet's bounding box when it is baked in.
     double x0 = 0;
@@ -1450,18 +1457,75 @@ struct PageTurn {
     double ty = 0;
 };
 
-/// The PDF matrix that turns the box [x0,y0..x1,y1] clockwise by \a extraRotation, and the box the
-/// turned sheet fits in once that matrix is applied to it.
-///
+/// An affine map in the sense a PDF "cm" writes: (x, y) -> (a x + c y + tx, b x + d y + ty).
+struct Affine {
+    double a = 1;
+    double b = 0;
+    double c = 0;
+    double d = 1;
+    double tx = 0;
+    double ty = 0;
+};
+
+QPointF affineMap(const Affine &map, const QPointF &point)
+{
+    return QPointF(map.a * point.x() + map.c * point.y() + map.tx,
+                   map.b * point.x() + map.d * point.y() + map.ty);
+}
+
+/// \a outer applied after \a inner.
+Affine affineCompose(const Affine &outer, const Affine &inner)
+{
+    Affine out;
+    out.a = outer.a * inner.a + outer.c * inner.b;
+    out.b = outer.b * inner.a + outer.d * inner.b;
+    out.c = outer.a * inner.c + outer.c * inner.d;
+    out.d = outer.b * inner.c + outer.d * inner.d;
+    out.tx = outer.a * inner.tx + outer.c * inner.ty + outer.tx;
+    out.ty = outer.b * inner.tx + outer.d * inner.ty + outer.ty;
+    return out;
+}
+
+/// The map that undoes \a map. Every map this file builds is a rotation by a multiple of 90, a
+/// scale or a translation, so the determinant is never zero and the inverse is exact.
+Affine affineInverse(const Affine &map)
+{
+    const double det = map.a * map.d - map.b * map.c;
+    if (qFuzzyIsNull(det)) {
+        return Affine();
+    }
+    Affine out;
+    out.a = map.d / det;
+    out.b = -map.b / det;
+    out.c = -map.c / det;
+    out.d = map.a / det;
+    out.tx = (map.c * map.ty - map.d * map.tx) / det;
+    out.ty = (map.b * map.tx - map.a * map.ty) / det;
+    return out;
+}
+
+/// The map that turns the box [x0,y0..x1,y1] clockwise by \a degrees, and the box the turned sheet
+/// fits in once that map is applied to it.
+struct TurnedBox {
+    /// Puts the turned box's lower left corner at the origin.
+    Affine map;
+    double width = 0;
+    double height = 0;
+};
+
 /// The turn has to be the same visual clockwise turn the notebook applies to the render
 /// (PdfSourceRenderers::turnedForDisplay) and to the artifact (PdfPageRotator), or the ink no longer
 /// lies on the paper. In the page's own user space, where y grows upwards, that is the matrix
 /// [cos, -sin, sin, cos] with a translation that puts the turned box's lower left corner at the
 /// origin: the same matrix Qt writes for rotate(+angle) in the raster's y-down space, with the two
 /// y flips of the raw/render conversion cancelling out.
-void bakeTurnMatrix(double x0, double y0, double x1, double y1, int extraRotation, PageTurn *turn)
+///
+/// One spelling of it, because the exporter now needs it three times -- the source's own /Rotate,
+/// the notebook's turn, and the pair of them conjugated into a scale -- and two spellings of "where
+/// a turned box lands" is how a page and its ink come apart.
+TurnedBox turnOfBox(double x0, double y0, double x1, double y1, int degrees)
 {
-    const qreal radians = qDegreesToRadians(qreal(normalizedTurn(extraRotation)));
+    const qreal radians = qDegreesToRadians(qreal(normalizedTurn(degrees)));
     const double cosE = std::cos(radians);
     const double sinE = std::sin(radians);
 
@@ -1485,30 +1549,46 @@ void bakeTurnMatrix(double x0, double y0, double x1, double y1, int extraRotatio
         maxY = qMax(maxY, y);
     }
 
-    turn->bake = true;
-    turn->a = cosE;
-    turn->b = -sinE;
-    turn->c = sinE;
-    turn->d = cosE;
-    turn->tx = -minX;
-    turn->ty = -minY;
-    turn->x0 = 0;
-    turn->y0 = 0;
-    turn->x1 = maxX - minX;
-    turn->y1 = maxY - minY;
+    TurnedBox box;
+    box.map.a = cosE;
+    box.map.b = -sinE;
+    box.map.c = sinE;
+    box.map.d = cosE;
+    box.map.tx = -minX;
+    box.map.ty = -minY;
+    box.width = maxX - minX;
+    box.height = maxY - minY;
+    return box;
 }
 
-/// Reads the source page's own box and rotation and decides how the notebook's turn has to be
-/// written.
+void bakeTurnMatrix(double x0, double y0, double x1, double y1, int extraRotation, PageTurn *turn)
+{
+    const TurnedBox box = turnOfBox(x0, y0, x1, y1, extraRotation);
+    turn->bake = true;
+    turn->a = box.map.a;
+    turn->b = box.map.b;
+    turn->c = box.map.c;
+    turn->d = box.map.d;
+    turn->tx = box.map.tx;
+    turn->ty = box.map.ty;
+    turn->x0 = 0;
+    turn->y0 = 0;
+    turn->x1 = box.width;
+    turn->y1 = box.height;
+}
+
+/// Reads the source page's own box and rotation and decides how the notebook's resize and turn
+/// have to be written.
 ///
 /// A box that cannot be read falls back to the size the notebook recorded when it was made, which
 /// is the source's DISPLAYED size, so a quarter turn of the source is undone before it can stand in
 /// for a page-space box. One page with an unreadable box is not a reason to abandon the rest of the
 /// notebook.
-bool planPageTurn(PdfDocument *doc, const PageEntry &page, const QSizeF &recordedSizePt,
-                  int extraRotation, PageTurn *turn, QString *why)
+bool planPageTurn(PdfDocument *doc, const PageEntry &page, const PdfPageRecord &record,
+                  PageTurn *turn, QString *why)
 {
-    turn->extraRotation = normalizedTurn(extraRotation);
+    const QSizeF recordedSizePt = record.sizePt;
+    turn->extraRotation = normalizedTurn(record.extraRotation);
 
     int rotation = 0;
     if (!effectiveRotation(doc, page, why, &rotation)) {
@@ -1541,6 +1621,90 @@ bool planPageTurn(PdfDocument *doc, const PageEntry &page, const QSizeF &recorde
         qWarning("[pdfio] page %d: %s; using the notebook's own %.2fx%.2f points%s", page.number,
                  qPrintable(rectWhy), recordedSizePt.width(), recordedSizePt.height(),
                  sourceRightAngle ? ", turned back into page space for the /Rotate" : "");
+    }
+
+    /**
+     * A resize is written as ONE content transform over the page, in the order the design record
+     * fixes: BOX first, then the notebook's turn, then SCALE.
+     *
+     * The source page's DISPLAYED frame -- the rectangle sizePt records, the source's /Rotate
+     * applied and its lower-left corner at the origin -- is the frame boxPt is measured in, so a
+     * box can be read without ever moving the source. Everything else follows from composing three
+     * maps in that frame: the crop (a translation by the box's own corner), the turn (the same
+     * clockwise rotation the renderer and the artifact use), and the scale (a plain scale about the
+     * origin). The result is conjugated back into the page's own user space by the inverse of the
+     * source's /Rotate, because that is the space the content is drawn in and the viewer applies
+     * /Rotate to it afterwards.
+     *
+     * The /MediaBox is the BOX's image, not the whole page's: content outside it is clipped by the
+     * reader, which is what makes a crop a crop instead of the whole page squeezed into a smaller
+     * rectangle. That distinction is the whole reason Box is a mode of its own -- a squeezed page
+     * puts the user's ink back on the paper in the wrong place, which is worse than losing it.
+     */
+    if (record.isResized()) {
+        const TurnedBox toDisplay = turnOfBox(x0, y0, x1, y1, rotation);
+
+        /// boxPt is in the READER's frame, whose origin is the page's TOP LEFT -- the frame the ops
+        /// pane drags in and the renderer crops in -- and this is the page's own user space, where y
+        /// grows upwards. One flip, here and nowhere else: without it a box taken from the top of the
+        /// page cuts the bottom of it instead, and a crop of the very content the user chose comes
+        /// out as blank paper, which is the one thing Box mode must never do.
+        const QRectF boxReader = record.boxPt.isValid()
+            ? record.boxPt
+            : QRectF(0, 0, toDisplay.width, toDisplay.height);
+        const QRectF box(boxReader.x(), toDisplay.height - boxReader.bottom(), boxReader.width(),
+                         boxReader.height());
+
+        Affine crop;
+        crop.tx = -box.x();
+        crop.ty = -box.y();
+        const TurnedBox turned = turnOfBox(0, 0, box.width(), box.height(), turn->extraRotation);
+        Affine placed = affineCompose(turned.map, crop);
+        const qreal scale = record.extraScale > 0.0 ? record.extraScale : 1.0;
+        placed.a *= scale;
+        placed.b *= scale;
+        placed.c *= scale;
+        placed.d *= scale;
+        placed.tx *= scale;
+        placed.ty *= scale;
+
+        Affine content = affineCompose(affineInverse(toDisplay.map), placed);
+
+        /// The box's own image, and the shift that puts its lower-left corner at the origin: a new
+        /// page object inherits no geometry from the tree it left, so its box has to be written
+        /// somewhere reproducible.
+        const QPointF corners[4] = {affineMap(content, box.topLeft()),
+                                    affineMap(content, box.topRight()),
+                                    affineMap(content, box.bottomRight()),
+                                    affineMap(content, box.bottomLeft())};
+        double minX = corners[0].x();
+        double minY = corners[0].y();
+        double maxX = minX;
+        double maxY = minY;
+        for (int i = 1; i < 4; ++i) {
+            minX = qMin(minX, corners[i].x());
+            maxX = qMax(maxX, corners[i].x());
+            minY = qMin(minY, corners[i].y());
+            maxY = qMax(maxY, corners[i].y());
+        }
+
+        content.tx -= minX;
+        content.ty -= minY;
+        turn->bake = true;
+        turn->resized = true;
+        turn->scale = scale;
+        turn->writtenRotation = rotation;
+        turn->a = content.a;
+        turn->b = content.b;
+        turn->c = content.c;
+        turn->d = content.d;
+        turn->tx = content.tx;
+        turn->ty = content.ty;
+        turn->x0 = 0;
+        turn->y0 = 0;
+        turn->x1 = maxX - minX;
+        turn->y1 = maxY - minY;
+        return true;
     }
 
     if (isRightAngleTurn(turn->extraRotation)) {
@@ -2363,6 +2527,15 @@ bool copyPageObject(PdfDocument *doc, const PageEntry &page, const PageTurn &tur
                     minY = qMin(minY, y);
                     maxY = qMax(maxY, y);
                 }
+                /// A resize moved the page's own edges: the source's /CropBox, transformed by
+                /// the same matrix, can reach past the box the page now has, and a /CropBox bigger
+                /// than the /MediaBox puts back page the crop removed. Held to the new box.
+                if (turn.resized) {
+                    minX = qMax(minX, turn.x0);
+                    minY = qMax(minY, turn.y0);
+                    maxX = qMin(maxX, turn.x1);
+                    maxY = qMin(maxY, turn.y1);
+                }
                 const QByteArray box = "[ " + QByteArray::number(minX, 'f', 4) + " "
                     + QByteArray::number(minY, 'f', 4) + " " + QByteArray::number(maxX, 'f', 4)
                     + " " + QByteArray::number(maxY, 'f', 4) + " ]";
@@ -2493,7 +2666,7 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
             /// turned page whether or not anything was drawn on it. Skipping it would silently
             /// shorten the notebook.
             PageTurn plainTurn;
-            if (!planPageTurn(&doc, page, record.sizePt, record.extraRotation, &plainTurn, why)) {
+            if (!planPageTurn(&doc, page, record, &plainTurn, why)) {
                 return false;
             }
             QByteArray plain;
@@ -2512,7 +2685,7 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         /// baked into the page (with the turned sheet's bounding box) when it is not. The box and
         /// the written rotation both come from here, so the paper and the ink cannot disagree.
         PageTurn turn;
-        if (!planPageTurn(&doc, page, record.sizePt, record.extraRotation, &turn, why)) {
+        if (!planPageTurn(&doc, page, record, &turn, why)) {
             return false;
         }
 
@@ -2601,6 +2774,20 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
                  turn.writtenRotation, turn.extraRotation,
                  turn.bake ? " baked into the page" : "", placed.width(), placed.height(),
                  found->hasAlphaChannel() ? "with alpha" : "NO ALPHA", originalContents);
+
+        /// And what the notebook's resize did, when it did anything: the scale that was written and
+        /// the box the page was cut to. A cropped page's ink is clipped by the /MediaBox, so this
+        /// line is where a log says the pixels outside the box are gone rather than re-rendered.
+        if (turn.resized) {
+            qWarning("[pdfio] export page %d: notebook scale %.4f, box %s%.2f,%.2f..%.2f,%.2f, "
+                     "ink clipped to the box",
+                     i + 1, turn.scale,
+                     record.boxPt.isValid() ? "" : "none (the whole sheet) ",
+                     record.boxPt.isValid() ? record.boxPt.x() : 0.0,
+                     record.boxPt.isValid() ? record.boxPt.y() : 0.0,
+                     record.boxPt.isValid() ? record.boxPt.width() : turn.x1,
+                     record.boxPt.isValid() ? record.boxPt.height() : turn.y1);
+        }
     }
 
     /// The new page tree: one page object per notebook page, in the notebook's order. Every

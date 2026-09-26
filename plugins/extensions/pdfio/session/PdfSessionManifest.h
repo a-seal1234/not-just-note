@@ -10,6 +10,7 @@
 #include <QByteArray>
 #include <QJsonObject>
 #include <QList>
+#include <QRectF>
 #include <QSizeF>
 #include <QString>
 
@@ -76,8 +77,46 @@ struct PdfPageRecord {
      */
     int extraRotation = 0;
 
-    /// The size the user sees: sizePt with extraRotation applied. A right angle swaps the sides
-    /// exactly; any other angle gives the rectangle the turned sheet fits in.
+    /**
+     * A scale the NOTEBOOK applies on top of the source's own size: a positive factor, 1.0 = as the
+     * source declares it.
+     *
+     * This is Scale mode, and it is deliberately NOT the same thing as boxPt below. It changes how
+     * large the page is shown and exported at; it never changes what of the source is part of the
+     * page, and it never touches the source. The pixels follow: a scaled page is rendered at a
+     * larger dpi (PdfSourceRenderers::renderPage), so the pen's ink stays sharp instead of being
+     * stretched, and the memory budget is what decides how far the factor can go.
+     */
+    qreal extraScale = 1.0;
+
+    /**
+     * The rectangle of the source this page IS, in source points -- Box mode: the sheet cropped, or
+     * widened to add margins. An invalid/absent rectangle is the whole sheet, which is every page
+     * made before this field existed.
+     *
+     * In the source's DISPLAYED frame: the source's own /Rotate is already applied, and
+     * extraRotation is not, exactly as sizePt is. It may sit outside the sheet -- dragging an edge
+     * outwards is how a margin is added -- so a consumer has to clip the source to it rather than
+     * assume it is a sub-rectangle.
+     *
+     * A wrong crop is content the user drew on disappearing from the page, which is why the ops
+     * screen warns before Apply and why this is a separate control from extraScale rather than a
+     * flag on it. A crop the notebook commits is clipped into the artifact in the same step
+     * (PdfNotebookOps::PageEdits's clipper), so the ink on disk keeps the page's own frame.
+     */
+    QRectF boxPt;
+
+    /// The size the page's own box leaves: boxPt's size, or sizePt when there is no box.
+    QSizeF boxedSizePt() const;
+
+    /// Whether this record resizes the page at all: a box, or a scale other than exactly 1.
+    bool isResized() const;
+
+    /// The size the user sees: sizePt with boxPt applied, then extraRotation, then extraScale. A
+    /// right angle swaps the sides exactly; any other angle gives the rectangle the turned sheet
+    /// fits in. THE one place the reader's size comes from -- the layout, the strip window, the
+    /// roll's resize, the exporter, the previews and the memory budget all ask this, which is what
+    /// makes a resize follow through for free.
     QSizeF displaySizePt() const;
 
     /**
@@ -116,11 +155,19 @@ public:
      * pages from the wrong PDF, which is the whole reason the number is bumped instead of the new
      * fields being added quietly.
      *
+     * 3 adds pages[].extraScale and pages[].boxPt -- the page's size, which a schema 2 build has no
+     * concept of. A schema 1 or 2 manifest is upgraded in memory when it is read and written back as
+     * 3 by the next write, so every notebook made until now opens unchanged. The other direction is
+     * the one this number is for: a schema 3 notebook in a schema 2 build is REFUSED by isValid()
+     * with "unsupported manifest schema 3" rather than opened with every resized page silently
+     * shown at the source's size. A size that can be dropped without a word is worse than a refusal,
+     * because the user only finds out when they print.
+     *
      * A constexpr member, so that the default below can be the same value: a manifest built in
      * code that defaulted to the previous schema is refused by its own reader, which is exactly
      * what happened when the number lived in one place and the default in another.
      */
-    static constexpr int CurrentSchema = 2;
+    static constexpr int CurrentSchema = 3;
 
     int schema = CurrentSchema;
     /// File name of the source inside the project directory, not a full path.

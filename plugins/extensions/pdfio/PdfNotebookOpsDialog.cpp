@@ -4,6 +4,7 @@
 #include "PdfNotebookOpsDialog.h"
 
 #include "PdfPageNavigator.h"
+#include "session/PdfPageRotator.h"
 #include "session/PdfSession.h"
 
 #include <KLocalizedString>
@@ -12,15 +13,19 @@
 #include <QApplication>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QDoubleSpinBox>
 #include <QEvent>
 #include <QFileInfo>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QIcon>
+#include <QImage>
 #include <QLabel>
+#include <QLineF>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPixmap>
 #include <QPushButton>
 #include <QSizePolicy>
@@ -72,8 +77,12 @@ constexpr int CanvasMargin = 12;
 /// How far a grip has to be from the page's centre before its direction means anything. A grip
 /// taken on the centre itself has no direction -- the first stray pixel would send the page
 /// spinning to whatever angle it happened to imply -- so such a drag accumulates from where the hand
-/// goes next instead.
+/// goes next instead. Scale and Box reuse it as the screen size of a corner or edge grip.
 constexpr qreal GripRadius = 24.0;
+
+/// The shortest side a box may be dragged to, in points: half an inch, so a page can be cropped hard
+/// without a slip of the hand turning it into a page of nothing.
+constexpr qreal MinBoxSidePt = 36.0;
 
 /// A whole number of degrees in 0..359, whatever was asked for: a page can be turned either way and
 /// past a full circle, and a record only ever holds one of the 360 angles.
@@ -107,11 +116,38 @@ QPoint mousePosition(const QMouseEvent *event)
 #endif
 }
 
+/// The size the READER sees, and which of the three modes produced it. The size is displaySizePt()'s
+/// -- the one place the reader's size comes from -- so a scaled or cropped page says so here without
+/// this function knowing how any of it is done.
 QString sizeLabel(const PdfPageRecord &record)
 {
     const QSizeF size = record.displaySizePt();
-    return QStringLiteral("%1 x %2 pt")
+    QString label = QStringLiteral("%1 x %2 pt")
         .arg(QString::number(size.width(), 'f', 0), QString::number(size.height(), 'f', 0));
+    QStringList modes;
+    if (record.extraRotation != 0) {
+        modes << i18n("turned");
+    }
+    if (record.extraScale != 1.0) {
+        modes << i18n("scaled x%1", QString::number(record.extraScale, 'g', 3));
+    }
+    if (record.boxPt.isValid()) {
+        modes << i18n("boxed");
+    }
+    if (!modes.isEmpty()) {
+        label += QStringLiteral(" (%1)").arg(modes.join(QStringLiteral(" + ")));
+    }
+    return label;
+}
+
+/// A box in words, for the readout: its size, and what the drag did to the page.
+QString boxLabel(const QRectF &box)
+{
+    if (!box.isValid()) {
+        return i18n("the whole sheet");
+    }
+    return i18n("%1 x %2 pt", QString::number(qRound(box.width())),
+                QString::number(qRound(box.height())));
 }
 
 /// The turn in words. A right angle keeps the phrase it has always had, and every one of them says
@@ -229,14 +265,31 @@ QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, 
 class PdfPageCanvas : public QWidget
 {
 public:
+    /**
+     * What a drag does, one at a time and never two at once.
+     *
+     * Turn, Scale and Box are three different questions about a page -- which way up it is, how big
+     * it is, and what of the source it is -- and they fail differently. A wrong turn is a page the
+     * wrong way up; a wrong scale is the wrong size; a wrong crop is ink the user drew on that is
+     * no longer on the page. One mode in force at a time, named on the pane before a drag starts, is
+     * the whole defence against a gesture meaning something the hand did not intend.
+     */
+    enum Mode { TurnMode, ScaleMode, BoxMode };
+
     explicit PdfPageCanvas(QWidget *parent = nullptr);
 
-    /// Shows \a preview at \a previewRotation, with \a pendingRotation the screen is holding on top
-    /// of it. An empty \a preview draws an empty sheet of \a pageSizePt instead. All angles are whole
-    /// degrees.
+    /// Shows the page: \a preview at \a previewRotation, the turn, scale and box this screen is
+    /// holding on top of it, and the sheet the page is cut from. An empty \a preview draws an empty
+    /// sheet of \a pageSizePt. \a previewBoxPt is the box the preview was made in, so the picture
+    /// and the overlay are placed in one frame.
     void setPage(const QPixmap &preview, int previewRotation, int pendingRotation,
-                 const QSizeF &pageSizePt);
+                 const QSizeF &pageSizePt, qreal extraScale, const QRectF &boxPt,
+                 const QRectF &previewBoxPt);
     void clearPage();
+
+    /// Which gesture a drag will perform. The pane says so before the drag begins.
+    void setMode(Mode mode);
+    Mode mode() const { return m_mode; }
 
     /// The whole-degree angle being previewed while the hand is still down: the dialog moves the
     /// live readout and nothing else, so the list, the Turn column and the pending change stay
@@ -246,17 +299,33 @@ public:
     /// turn is, so one drag from 0 to 37 degrees is one change when Apply runs.
     std::function<void(int)> turned;
 
+    /// The scale being previewed while a corner is held, and the factor the hand ended on. One
+    /// report per drag, like a turn: one drag is one pending edit and one undo.
+    std::function<void(qreal)> scalePreviewed;
+    std::function<void(qreal)> scaled;
+
+    /// The box being previewed while an edge is held, and the box the hand ended on, both in source
+    /// points with the origin at the page's top left. One report per drag.
+    std::function<void(const QRectF &)> boxPreviewed;
+    std::function<void(const QRectF &)> boxChanged;
+
     /// The DEVICE pixels the pane has just prepared its picture for, reported while painting. The
     /// dialog compares them with what the row's preview holds and asks the navigator for a fresh one
     /// when the picture would otherwise be stretched.
     std::function<void(const QSize &)> needsPreview;
 
-    /// Whether a turn is in flight. The dialog leaves the canvas alone meanwhile: a preview that
+    /// Whether a gesture is in flight. The dialog leaves the canvas alone meanwhile: a preview that
     /// arrived mid-gesture would move the page under the hand.
     bool isTurning() const { return m_gesture; }
     /// The pixels prepared for the last paint (device pixels), and what the row's preview held.
     QPixmap preparedPreview() const { return m_prepared; }
     QSize sourcePixels() const { return m_sourcePixels; }
+
+    /// The factor a scale drag means: how far the hand is from the page's centre now, against how
+    /// far it was when it took hold, applied to the factor the page had. Held between 10% and 800%,
+    /// which is what the typed field offers too, so a drag can never ask for a page the field
+    /// cannot show. Static and public because it is arithmetic a test can pin without a screen.
+    static qreal scaleFromDrag(qreal heldPixels, qreal nowPixels, qreal fromScale);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -266,6 +335,19 @@ protected:
     bool event(QEvent *event) override;
 
 private:
+    /// The grip a press took hold of: a corner for Scale, an edge for Box.
+    enum Handle {
+        NoHandle,
+        TopLeftCorner,
+        TopRightCorner,
+        BottomRightCorner,
+        BottomLeftCorner,
+        LeftEdge,
+        TopEdge,
+        RightEdge,
+        BottomEdge,
+    };
+
     /// The direction of \a at from the page's centre, in whole degrees.
     int directionAt(const QPoint &at) const;
     /// Whether a grip at \a at is far enough from the centre for that direction to mean something.
@@ -279,20 +361,48 @@ private:
     void endGesture();
     void handleTouch(QTouchEvent *event);
 
+    /// The frame the page is drawn in: the preview's own pixels when there is one, the page's points
+    /// otherwise. Both frames carry the same shape, so one mapping of the box serves both.
+    QSizeF sheetFrame() const;
+    /// The box this screen is holding, in frame units.
+    QRectF boxInFrame() const;
+    /// The box the preview was made in, in frame units.
+    QRectF previewBoxInFrame() const;
+    /// The grip at \a at, or NoHandle. A grip is a screen length rather than a page length.
+    Handle handleAt(const QPoint &at) const;
+    /// The page's centre in widget coordinates: the point the turn measures from and the scale drag
+    /// measures against.
+    QPointF hub() const;
+    /// Where a frame-space point lands on the screen, from the last paint.
+    QPointF toWidget(const QPointF &inFrame) const;
+    /// One gesture's worth of a scale drag: previews while the hand is down.
+    void dragScale(const QPointF &at);
+    /// One gesture's worth of a box drag: previews while the hand is down.
+    void dragBox(const QPointF &at);
+
     /// The preview as it was read, and the turn it was drawn at: everything painted on top of it is
     /// a difference from that turn rather than the whole turn a second time.
     QPixmap m_preview;
     int m_previewRotation = 0;
     int m_rotation = 0;
     QSizeF m_pageSizePt;
+    /// The scale and the box this screen is holding on top of the record: previews while a gesture
+    /// is in flight, the pending edit once the hand is up.
+    qreal m_scale = 1.0;
+    QRectF m_box;
+    QRectF m_previewBox;
+    Mode m_mode = TurnMode;
 
     /// What the last paint prepared and drew, kept so the dialog can be told what was drawn: the
     /// pixels in DEVICE units, and the pixels the row's own preview had to make them from.
     QPixmap m_prepared;
     QSize m_sourcePixels;
+    /// Where the page was drawn, and how big a frame unit came out: both gestures read them.
+    QTransform m_frameToWidget;
+    qreal m_fit = 1.0;
 
-    /// A turn in progress, either a drag or a two-finger twist. While it is set, m_rotation is a
-    /// preview and no record has been touched.
+    /// A gesture in progress. While it is set the value it moves is a preview and no record has been
+    /// touched: a turn's angle, a scale's factor or a box's edges.
     bool m_gesture = false;
     /// Set when the gesture is a two-finger twist rather than a drag.
     bool m_twisting = false;
@@ -304,6 +414,12 @@ private:
     int m_lastDirection = 0;
     /// The direction between the two fingers when the twist began.
     int m_twistFrom = 0;
+    /// The scale and the box gesture: the grip, where the hand took hold, and what was there then.
+    Handle m_handle = NoHandle;
+    QPointF m_gestureStartAt;
+    qreal m_gestureStartDistance = 0;
+    qreal m_gestureStartScale = 1.0;
+    QRectF m_gestureStartBox;
 };
 
 PdfPageCanvas::PdfPageCanvas(QWidget *parent)
@@ -322,12 +438,36 @@ PdfPageCanvas::PdfPageCanvas(QWidget *parent)
 }
 
 void PdfPageCanvas::setPage(const QPixmap &preview, int previewRotation, int pendingRotation,
-                            const QSizeF &pageSizePt)
+                            const QSizeF &pageSizePt, qreal extraScale, const QRectF &boxPt,
+                            const QRectF &previewBoxPt)
 {
+    /// Never while the hand is down: a preview arriving mid-gesture would move the page under it.
+    if (m_gesture) {
+        return;
+    }
     m_preview = preview;
     m_previewRotation = normalizedTurn(previewRotation);
     m_rotation = normalizedTurn(pendingRotation);
     m_pageSizePt = pageSizePt;
+    m_scale = extraScale > 0 ? extraScale : 1.0;
+    m_box = boxPt;
+    m_previewBox = previewBoxPt;
+    update();
+}
+
+void PdfPageCanvas::setMode(Mode mode)
+{
+    if (m_mode == mode) {
+        return;
+    }
+    m_mode = mode;
+    /// A mode change cancels whatever grip was in flight rather than letting a half-made gesture
+    /// finish as a different one.
+    m_gesture = false;
+    m_twisting = false;
+    m_handle = NoHandle;
+    setCursor(mode == TurnMode ? Qt::OpenHandCursor
+                               : (mode == ScaleMode ? Qt::SizeFDiagCursor : Qt::SizeHorCursor));
     update();
 }
 
@@ -337,11 +477,210 @@ void PdfPageCanvas::clearPage()
     m_previewRotation = 0;
     m_rotation = 0;
     m_pageSizePt = QSizeF();
+    m_scale = 1.0;
+    m_box = QRectF();
+    m_previewBox = QRectF();
     m_prepared = QPixmap();
     m_sourcePixels = QSize();
     m_gesture = false;
     m_twisting = false;
+    m_handle = NoHandle;
     update();
+}
+
+qreal PdfPageCanvas::scaleFromDrag(qreal heldPixels, qreal nowPixels, qreal fromScale)
+{
+    if (heldPixels <= 0.0 || !qIsFinite(heldPixels) || !qIsFinite(nowPixels)
+        || !qIsFinite(fromScale) || fromScale <= 0.0) {
+        return fromScale > 0.0 ? fromScale : 1.0;
+    }
+    /// The hand's distance from the page's centre is what the gesture carries: taking hold at the
+    /// corner and pulling outwards is a bigger page, pushing in is a smaller one. Whole percent, so
+    /// the number the readout shows is the number the record gets.
+    const qreal factor = fromScale * (nowPixels / heldPixels);
+    /// qBound needs one type on all three arguments, and qRound answers an int: the rounded value
+    /// is what the record gets, so it is converted rather than the bound loosened to double.
+    const qreal percent = qBound(qreal(10.0), qreal(qRound(factor * 100.0)), qreal(800.0));
+    return percent / 100.0;
+}
+
+QSizeF PdfPageCanvas::sheetFrame() const
+{
+    /// The picture is the page as the row holds it, and its own pixels are the frame the box is drawn
+    /// in. Without one the page's own points are the frame. Both are the same shape, so one box
+    /// serves both and the overlay cannot drift from the picture it is drawn over.
+    if (!m_preview.isNull()) {
+        return QSizeF(m_preview.size());
+    }
+    return m_pageSizePt;
+}
+
+QRectF PdfPageCanvas::boxInFrame() const
+{
+    const QSizeF frame = sheetFrame();
+    const QRectF box = m_box.isValid() ? m_box : QRectF(QPointF(0, 0), m_pageSizePt);
+    if (m_pageSizePt.isEmpty() || frame.isEmpty()) {
+        return box;
+    }
+    return QRectF(box.x() * frame.width() / m_pageSizePt.width(),
+                  box.y() * frame.height() / m_pageSizePt.height(),
+                  box.width() * frame.width() / m_pageSizePt.width(),
+                  box.height() * frame.height() / m_pageSizePt.height());
+}
+
+QRectF PdfPageCanvas::previewBoxInFrame() const
+{
+    const QSizeF frame = sheetFrame();
+    const QRectF box = m_previewBox.isValid() ? m_previewBox : QRectF(QPointF(0, 0), m_pageSizePt);
+    if (m_pageSizePt.isEmpty() || frame.isEmpty()) {
+        return box;
+    }
+    return QRectF(box.x() * frame.width() / m_pageSizePt.width(),
+                  box.y() * frame.height() / m_pageSizePt.height(),
+                  box.width() * frame.width() / m_pageSizePt.width(),
+                  box.height() * frame.height() / m_pageSizePt.height());
+}
+
+QPointF PdfPageCanvas::hub() const
+{
+    const QRectF view = m_mode == ScaleMode ? boxInFrame()
+                                            : QRectF(QPointF(0, 0), sheetFrame()).united(boxInFrame());
+    return m_frameToWidget.map(view.center());
+}
+
+QPointF PdfPageCanvas::toWidget(const QPointF &inFrame) const
+{
+    return m_frameToWidget.map(inFrame);
+}
+
+PdfPageCanvas::Handle PdfPageCanvas::handleAt(const QPoint &at) const
+{
+    if (m_frameToWidget.isIdentity() || m_pageSizePt.isEmpty()) {
+        return NoHandle;
+    }
+    const QTransform toFrame = m_frameToWidget.inverted();
+    const QPointF point = toFrame.map(QPointF(at));
+    const QRectF box = boxInFrame();
+    if (box.isEmpty()) {
+        return NoHandle;
+    }
+
+    /// A grip is a screen length, not a page length: on a page shown small a page-sized grip would
+    /// be impossible to hit, and on a big one it would swallow the picture.
+    const qreal reach = GripRadius / qMax(qreal(0.01), m_fit);
+    const auto near = [&reach](const QPointF &a, const QPointF &b) {
+        return (a - b).manhattanLength() <= reach;
+    };
+
+    if (m_mode == ScaleMode) {
+        /// Scale is the whole page's size, so its grips are the corners: a corner drag carries the
+        /// page's proportions and cannot make a page that is stretched.
+        if (near(point, box.topLeft())) {
+            return TopLeftCorner;
+        }
+        if (near(point, box.topRight())) {
+            return TopRightCorner;
+        }
+        if (near(point, box.bottomRight())) {
+            return BottomRightCorner;
+        }
+        if (near(point, box.bottomLeft())) {
+            return BottomLeftCorner;
+        }
+        return NoHandle;
+    }
+
+    if (m_mode == BoxMode) {
+        /// Box is what is inside the page, so its grips are the edges: inwards crops, outwards adds
+        /// a margin, and a corner would have to mean two of them at once.
+        const qreal slack = qMin(reach, qMax(qreal(1), box.height() / 2));
+        const qreal slackX = qMin(reach, qMax(qreal(1), box.width() / 2));
+        if (qAbs(point.x() - box.left()) <= slackX && point.y() >= box.top() - slack
+            && point.y() <= box.bottom() + slack) {
+            return LeftEdge;
+        }
+        if (qAbs(point.x() - box.right()) <= slackX && point.y() >= box.top() - slack
+            && point.y() <= box.bottom() + slack) {
+            return RightEdge;
+        }
+        if (qAbs(point.y() - box.top()) <= slack && point.x() >= box.left() - slackX
+            && point.x() <= box.right() + slackX) {
+            return TopEdge;
+        }
+        if (qAbs(point.y() - box.bottom()) <= slack && point.x() >= box.left() - slackX
+            && point.x() <= box.right() + slackX) {
+            return BottomEdge;
+        }
+        return NoHandle;
+    }
+
+    return NoHandle;
+}
+
+void PdfPageCanvas::dragScale(const QPointF &at)
+{
+    const qreal factor = scaleFromDrag(m_gestureStartDistance,
+                                       QLineF(hub(), at).length(), m_gestureStartScale);
+    if (qFuzzyCompare(factor, m_scale)) {
+        return;
+    }
+    m_scale = factor;
+    update();
+    if (scalePreviewed) {
+        scalePreviewed(factor);
+    }
+}
+
+void PdfPageCanvas::dragBox(const QPointF &at)
+{
+    const QSizeF frame = sheetFrame();
+    if (frame.isEmpty() || m_pageSizePt.isEmpty()) {
+        return;
+    }
+    const QTransform toFrame = m_frameToWidget.inverted();
+    const QPointF point = toFrame.map(at);
+    const qreal perX = m_pageSizePt.width() / frame.width();
+    const qreal perY = m_pageSizePt.height() / frame.height();
+
+    /// In source points, whole ones: the page is a printed size, and a box that moves in hundredths
+    /// of a point is a box nobody can type back.
+    QRectF box = m_gestureStartBox;
+    const qreal x = qRound(point.x() * perX);
+    const qreal y = qRound(point.y() * perY);
+    switch (m_handle) {
+    case LeftEdge:
+        box.setLeft(qMin(x, box.right() - MinBoxSidePt));
+        break;
+    case RightEdge:
+        box.setRight(qMax(x, box.left() + MinBoxSidePt));
+        break;
+    case TopEdge:
+        box.setTop(qMin(y, box.bottom() - MinBoxSidePt));
+        break;
+    case BottomEdge:
+        box.setBottom(qMax(y, box.top() + MinBoxSidePt));
+        break;
+    default:
+        return;
+    }
+
+    /// A margin is allowed to reach past the sheet, but not without bound: twice the sheet on any
+    /// side is more page than anyone drags on purpose and keeps a stray gesture finite.
+    const qreal limitX = m_pageSizePt.width() * 2.0;
+    const qreal limitY = m_pageSizePt.height() * 2.0;
+    box.setLeft(qMax(box.left(), -limitX));
+    box.setTop(qMax(box.top(), -limitY));
+    box.setRight(qMin(box.right(), m_pageSizePt.width() + limitX));
+    box.setBottom(qMin(box.bottom(), m_pageSizePt.height() + limitY));
+
+    if (box == m_box) {
+        return;
+    }
+    m_box = box;
+    update();
+    if (boxPreviewed) {
+        boxPreviewed(box);
+    }
 }
 
 int PdfPageCanvas::directionAt(const QPoint &at) const
@@ -403,31 +742,49 @@ void PdfPageCanvas::paintEvent(QPaintEvent *event)
 
     const QRectF area =
         QRectF(rect()).adjusted(CanvasMargin, CanvasMargin, -CanvasMargin, -CanvasMargin);
-    const QSizeF sheet = m_preview.isNull() ? m_pageSizePt : QSizeF(m_preview.size());
-    if (area.width() < 2 || area.height() < 2 || sheet.isEmpty()) {
+    const QSizeF frame = sheetFrame();
+    if (area.width() < 2 || area.height() < 2 || frame.isEmpty()) {
         return;
     }
 
     /// The turn the picture still needs: the file was made with m_previewRotation already applied,
     /// so drawing the whole angle again would turn an already-sideways page twice.
     const qreal turn = normalizedTurn(m_rotation - m_previewRotation);
-    const qreal radians = qDegreesToRadians(turn);
-    const qreal cosine = qAbs(qCos(radians));
-    const qreal sine = qAbs(qSin(radians));
+
+    /// What the pane has to fit. Turn and Box fit the sheet AND the box together, because a crop
+    /// has to show what it is about to cut away -- that is the one mistake this mode can make that
+    /// the others cannot. Scale fits the page the reader ends up with, so a page being made bigger
+    /// stays on the pane where its corner grips are.
+    const QRectF box = boxInFrame();
+    QRectF view(0, 0, frame.width(), frame.height());
+    view = (m_mode == ScaleMode) ? box : view.united(box);
+    if (view.isEmpty()) {
+        view = QRectF(0, 0, frame.width(), frame.height());
+    }
 
     /// The sheet is scaled so its bounding box -- not the sheet itself -- fits the pane: a page set
     /// down at an angle takes more room than the same page upright, and the pane is what it has.
-    const qreal boxWidth = sheet.width() * cosine + sheet.height() * sine;
-    const qreal boxHeight = sheet.width() * sine + sheet.height() * cosine;
-    const qreal scale = qMin(area.width() / boxWidth, area.height() / boxHeight);
-    const QSizeF drawn(sheet.width() * scale, sheet.height() * scale);
-    const QRectF target(-drawn.width() / 2, -drawn.height() / 2, drawn.width(), drawn.height());
+    const QSizeF boxed = PdfPageRecord::turnedSize(view.size(), int(turn));
+    m_fit = qMin(area.width() / qMax(qreal(1), boxed.width()),
+                 area.height() / qMax(qreal(1), boxed.height()));
+
+    /// The frame the page is drawn in -> the pane. The view's centre goes to the pane's centre, which
+    /// is the point the turn gesture has always measured its angles from.
+    QTransform toWidget;
+    toWidget.translate(area.center().x(), area.center().y());
+    toWidget.rotate(turn);
+    toWidget.scale(m_fit, m_fit);
+    toWidget.translate(-view.center().x(), -view.center().y());
+    m_frameToWidget = toWidget;
 
     /// Prepared at the size the pane is about to paint it at, in DEVICE pixels, and tagged with the
     /// ratio: Qt then puts those pixels on the glass one for one instead of stretching a small
     /// picture by the screen's ratio inside the painter.
+    const QRectF previewRect = previewBoxInFrame();
+    const QRectF previewOnScreen = toWidget.mapRect(previewRect);
     const qreal ratio = devicePixelRatioF() > 0 ? devicePixelRatioF() : 1.0;
-    const QSize logical(qMax(1, qRound(drawn.width())), qMax(1, qRound(drawn.height())));
+    const QSize logical(qMax(1, qRound(previewOnScreen.width())),
+                        qMax(1, qRound(previewOnScreen.height())));
     const QSize deviceNeed(qMax(1, qRound(logical.width() * ratio)),
                            qMax(1, qRound(logical.height() * ratio)));
 
@@ -441,24 +798,67 @@ void PdfPageCanvas::paintEvent(QPaintEvent *event)
         needsPreview(deviceNeed);
     }
 
-    painter.translate(QRectF(rect()).center());
-    painter.rotate(turn);
+    /// Everything below is drawn in the page's own frame, under one transform: the picture, the
+    /// sheet's edge, the box and the grips cannot disagree about where the page is.
+    painter.setTransform(toWidget, true);
+    const qreal pen = 1.0 / qMax(qreal(0.01), m_fit);
 
     if (m_preview.isNull()) {
         /// No preview: the page has never been saved, or a turn dropped the stale one. An empty
-        /// sheet of the page's own proportions still gives the hand something to turn.
-        painter.setPen(QPen(QColor(0xb0, 0xb0, 0xb0), 1));
+        /// sheet of the page's own proportions still gives the hand something to work on.
+        painter.setPen(QPen(QColor(0xb0, 0xb0, 0xb0), pen));
         painter.setBrush(QColor(0xff, 0xff, 0xff));
-        painter.drawRect(target);
-        return;
+        painter.drawRect(previewRect);
+    } else {
+        /// The whole source onto the whole target, explicitly: the target is in frame coordinates
+        /// and the pixmap holds the DEVICE pixels for it, so the painter's own device transform is
+        /// what maps one to the other -- one source pixel per device pixel, and no second scaling by
+        /// the pixmap's ratio tag. The three-argument form because QPainter has no (QRectF, QPixmap)
+        /// overload, and toRect() would throw the pane's fractional position away.
+        painter.drawPixmap(previewRect, m_prepared, QRectF(m_prepared.rect()));
+    }
+    painter.setBrush(Qt::NoBrush);
+
+    if (m_mode == BoxMode) {
+        /// What the crop is about to cut away, painted over the picture itself. The design record
+        /// asks this mode for exactly one thing the others do not need: the user sees the ink that is
+        /// about to go BEFORE Apply. A number in a table does not show it; this does.
+        QPainterPath removed;
+        removed.addRect(QRectF(0, 0, frame.width(), frame.height()));
+        QPainterPath kept;
+        kept.addRect(box);
+        painter.fillPath(removed.subtracted(kept), QColor(0xd0, 0x20, 0x20, 0x80));
+
+        painter.setPen(QPen(QColor(0xb0, 0xb0, 0xb0), pen, Qt::DashLine));
+        painter.drawRect(QRectF(0, 0, frame.width(), frame.height()));
     }
 
-    /// The whole source onto the whole target, explicitly: the target is in logical coordinates
-    /// and the pixmap holds target * ratio device pixels, so the painter's own device transform is
-    /// what maps one to the other -- one source pixel per device pixel, and no second scaling by
-    /// the pixmap's ratio tag. The three-argument form because QPainter has no (QRectF, QPixmap)
-    /// overload, and toRect() would throw the pane's fractional position away.
-    painter.drawPixmap(target, m_prepared, QRectF(m_prepared.rect()));
+    /// The box, when there is one: the page's own edge in blue, or the edge being dragged in red.
+    if (m_mode == BoxMode || m_box.isValid()) {
+        painter.setPen(QPen(m_mode == BoxMode ? QColor(0xff, 0x60, 0x60) : QColor(0x1e, 0x88, 0xe5),
+                            pen * 2));
+        painter.drawRect(box);
+    }
+
+    /// The grips, so the pane says where a drag can take hold before the hand goes there.
+    const qreal grip = GripRadius / qMax(qreal(0.01), m_fit) / 2.5;
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0x1e, 0x88, 0xe5));
+    const auto gripAt = [&painter, grip](const QPointF &at) {
+        painter.drawRect(QRectF(at.x() - grip, at.y() - grip, grip * 2, grip * 2));
+    };
+    if (m_mode == ScaleMode) {
+        gripAt(box.topLeft());
+        gripAt(box.topRight());
+        gripAt(box.bottomRight());
+        gripAt(box.bottomLeft());
+    } else if (m_mode == BoxMode) {
+        gripAt(QPointF(box.left(), box.center().y()));
+        gripAt(QPointF(box.right(), box.center().y()));
+        gripAt(QPointF(box.center().x(), box.top()));
+        gripAt(QPointF(box.center().x(), box.bottom()));
+    }
+    painter.resetTransform();
 }
 
 void PdfPageCanvas::mousePressEvent(QMouseEvent *event)
@@ -469,6 +869,27 @@ void PdfPageCanvas::mousePressEvent(QMouseEvent *event)
     }
 
     const QPointF at = QPointF(mousePosition(event));
+
+    /// Scale and Box take hold of a GRIP, and only a grip: a press on the page itself must not resize
+    /// or crop it by accident. Turn takes hold anywhere on the page, which is what it has always done
+    /// and what the pane's users know.
+    if (m_mode != TurnMode) {
+        m_handle = handleAt(at.toPoint());
+        if (m_handle == NoHandle) {
+            event->accept();
+            return;
+        }
+        m_gesture = true;
+        m_gestureStartAt = at;
+        m_gestureStartScale = m_scale;
+        m_gestureStartBox = m_box.isValid() ? m_box : QRectF(QPointF(0, 0), m_pageSizePt);
+        m_gestureStartDistance = QLineF(hub(), at).length();
+        m_anchored = false;
+        m_twisting = false;
+        event->accept();
+        return;
+    }
+
     beginGesture();
     m_anchored = directionIsMeaningful(at);
     m_grabDirection = directionAt(at.toPoint());
@@ -481,6 +902,18 @@ void PdfPageCanvas::mouseMoveEvent(QMouseEvent *event)
 {
     if (!m_gesture) {
         QWidget::mouseMoveEvent(event);
+        return;
+    }
+
+    /// One mode in force, so a drag cannot be two things at once.
+    if (m_mode == ScaleMode) {
+        dragScale(QPointF(mousePosition(event)));
+        event->accept();
+        return;
+    }
+    if (m_mode == BoxMode) {
+        dragBox(QPointF(mousePosition(event)));
+        event->accept();
         return;
     }
 
@@ -506,7 +939,30 @@ void PdfPageCanvas::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
 
-    /// The hand is up: whatever it landed on becomes the one pending edit of this gesture.
+    /// The hand is up: whatever it landed on becomes the one pending edit of this gesture. Scale and
+    /// Box report theirs the same way -- once, at the end -- so one drag is one change and one undo
+    /// takes the whole gesture back.
+    if (m_mode == ScaleMode) {
+        const bool landed = m_gesture && !qFuzzyCompare(m_scale, m_gestureStartScale);
+        m_gesture = false;
+        m_handle = NoHandle;
+        if (landed && scaled) {
+            scaled(m_scale);
+        }
+        event->accept();
+        return;
+    }
+    if (m_mode == BoxMode) {
+        const bool landed = m_gesture && m_box != m_gestureStartBox;
+        m_gesture = false;
+        m_handle = NoHandle;
+        if (landed && boxChanged) {
+            boxChanged(m_box);
+        }
+        event->accept();
+        return;
+    }
+
     endGesture();
     setCursor(Qt::OpenHandCursor);
     event->accept();
@@ -530,6 +986,43 @@ bool PdfPageCanvas::event(QEvent *event)
 void PdfPageCanvas::handleTouch(QTouchEvent *event)
 {
     const QList<QPointF> positions = liveTouchPositions(event);
+
+    /// Scale and Box work the same way on glass as with a pen: the grip a finger takes hold of is the
+    /// gesture. A two-finger twist is a TURN, so it belongs to Turn mode and means nothing here.
+    if (m_mode != TurnMode) {
+        if (positions.isEmpty()) {
+            const bool landedScale = m_gesture && !qFuzzyCompare(m_scale, m_gestureStartScale);
+            const bool landedBox = m_gesture && m_box != m_gestureStartBox;
+            m_gesture = false;
+            m_handle = NoHandle;
+            if (landedScale && scaled) {
+                scaled(m_scale);
+            }
+            if (landedBox && boxChanged) {
+                boxChanged(m_box);
+            }
+            return;
+        }
+        const QPointF at = positions.first();
+        if (!m_gesture) {
+            m_handle = handleAt(at.toPoint());
+            if (m_handle == NoHandle) {
+                return;
+            }
+            m_gesture = true;
+            m_gestureStartAt = at;
+            m_gestureStartScale = m_scale;
+            m_gestureStartBox = m_box.isValid() ? m_box : QRectF(QPointF(0, 0), m_pageSizePt);
+            m_gestureStartDistance = QLineF(hub(), at).length();
+            return;
+        }
+        if (m_mode == ScaleMode) {
+            dragScale(at);
+        } else {
+            dragBox(at);
+        }
+        return;
+    }
 
     if (positions.size() >= 2) {
         /// Two fingers: the page turns by the angle the line between them turns by, which is the
@@ -771,9 +1264,32 @@ void PdfNotebookOpsDialog::buildUi()
     /// The canvas: the selected page, large, where it can be turned to an angle no button can name.
     /// A turn made here is an edit of the working copy like any other -- it writes nothing.
     auto *preview = new QVBoxLayout;
+
+    /// The mode switch, above the page, exclusive, and always saying which gesture a drag will
+    /// perform. Turn is checked at the start and behaves exactly as it always has: the pane has
+    /// turned pages for weeks, and a regression in that gesture is the first thing a user notices.
+    auto *modeRow = new QHBoxLayout;
+    auto *modeCaption = new QLabel(i18n("Drag mode:"), this);
+    modeRow->addWidget(modeCaption);
+    const auto addMode = [this, modeRow](const QString &text, const QString &name, DragMode mode) {
+        auto *button = new QPushButton(text, this);
+        button->setCheckable(true);
+        button->setObjectName(name);
+        connect(button, &QPushButton::clicked, this, [this, mode]() { setDragMode(mode); });
+        modeRow->addWidget(button);
+        return button;
+    };
+    m_modeTurn = addMode(i18n("Turn"), QStringLiteral("pdfio_ops_mode_turn"), TurnDrag);
+    m_modeScale = addMode(i18n("Scale"), QStringLiteral("pdfio_ops_mode_scale"), ScaleDrag);
+    m_modeBox = addMode(i18n("Box"), QStringLiteral("pdfio_ops_mode_box"), BoxDrag);
+    m_modeTurn->setChecked(true);
+    modeRow->addStretch(1);
+    preview->addLayout(modeRow);
+
     m_canvas = new PdfPageCanvas(this);
-    m_canvas->setToolTip(i18n("Drag the page around its centre to turn it by any angle, or twist "
-                              "two fingers on it."));
+    m_canvas->setToolTip(i18n("Turn: drag the page around its centre, or twist two fingers on it. "
+                              "Scale: drag a corner. Box: drag an edge inwards to crop or outwards "
+                              "for a margin."));
     /// While the hand is down the dialog moves only the readout: the record, the list and the
     /// pending change wait for the gesture to end, and then ONE report becomes one pending edit.
     m_canvas->previewed = [this](int degrees) {
@@ -782,6 +1298,23 @@ void PdfNotebookOpsDialog::buildUi()
         }
     };
     m_canvas->turned = [this](int degrees) { setSelectedTurn(degrees); };
+    m_canvas->scalePreviewed = [this](qreal factor) {
+        if (m_scaleField) {
+            m_updatingScale = true;
+            m_scaleField->setValue(factor * 100.0);
+            m_updatingScale = false;
+        }
+        if (m_angle) {
+            m_angle->setText(i18n("Scale: %1%", qRound(factor * 100.0)));
+        }
+    };
+    m_canvas->scaled = [this](qreal factor) { setSelectedScale(factor); };
+    m_canvas->boxPreviewed = [this](const QRectF &box) {
+        if (m_angle) {
+            m_angle->setText(i18n("Box: %1", boxLabel(box)));
+        }
+    };
+    m_canvas->boxChanged = [this](const QRectF &box) { setSelectedBox(box); };
     /// What the pane is about to draw, in device pixels. When the row's own preview has fewer pixels
     /// than that, the navigator is asked for a fresh one rather than the small one stretched.
     m_canvas->needsPreview = [this](const QSize &devicePixels) {
@@ -791,6 +1324,46 @@ void PdfNotebookOpsDialog::buildUi()
         }
     };
     preview->addWidget(m_canvas, 1);
+
+    /// Scale as a number that can be typed or stepped, the same shape as the memory budget's field,
+    /// because this is a tablet. It follows the corner drag and it drives it: one value, two ways in.
+    auto *scaleRow = new QHBoxLayout;
+    auto *scaleCaption = new QLabel(i18n("Scale"), this);
+    m_scaleField = new QDoubleSpinBox(this);
+    m_scaleField->setObjectName(QStringLiteral("pdfio_ops_scale_value"));
+    m_scaleField->setRange(10.0, 800.0);
+    m_scaleField->setDecimals(0);
+    m_scaleField->setSingleStep(5.0);
+    m_scaleField->setSuffix(i18n("%"));
+    m_scaleField->setToolTip(i18n("How large the page is shown and exported. The source is "
+                                  "unchanged, and a bigger page is rendered at a larger dpi rather "
+                                  "than stretched."));
+    connect(m_scaleField, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            [this](double value) {
+                if (m_updatingScale) {
+                    return;
+                }
+                setSelectedScale(value / 100.0);
+            });
+    m_resetScale = new QPushButton(i18n("Reset scale"), this);
+    m_resetScale->setObjectName(QStringLiteral("pdfio_ops_reset_scale"));
+    connect(m_resetScale, &QPushButton::clicked, this, [this]() { setSelectedScale(1.0); });
+    m_resetBox = new QPushButton(i18n("Reset box"), this);
+    m_resetBox->setObjectName(QStringLiteral("pdfio_ops_reset_box"));
+    connect(m_resetBox, &QPushButton::clicked, this, [this]() { setSelectedBox(QRectF()); });
+    scaleRow->addWidget(scaleCaption);
+    scaleRow->addWidget(m_scaleField);
+    scaleRow->addWidget(m_resetScale);
+    scaleRow->addWidget(m_resetBox);
+    scaleRow->addStretch(1);
+    preview->addLayout(scaleRow);
+
+    /// What a crop is about to cut away, in words, beside the picture that shows it.
+    m_boxWarning = new QLabel(this);
+    m_boxWarning->setObjectName(QStringLiteral("pdfio_ops_box_warning"));
+    m_boxWarning->setWordWrap(true);
+    preview->addWidget(m_boxWarning);
+
     m_angle = new QLabel(this);
     m_angle->setObjectName(QStringLiteral("pdfio_ops_angle"));
     m_angle->setAlignment(Qt::AlignCenter);
@@ -1293,6 +1866,21 @@ void PdfNotebookOpsDialog::loadPreview(Row &row)
     row.previewRotation = row.record.extraRotation;
 }
 
+/// The box a row's preview was made in: the box its page had when the preview was written, which
+/// is the record the change started from. The picture and the crop overlay have to be placed in ONE
+/// frame or the pane shows one page and warns about another.
+QRectF PdfNotebookOpsDialog::previewBoxFor(const Row &row) const
+{
+    const QRectF sheet(0, 0, row.record.sizePt.width(), row.record.sizePt.height());
+    for (const PdfPageRecord &page : m_original.pages) {
+        if (!row.record.kraFile.isEmpty() && page.kraFile == row.record.kraFile) {
+            return page.boxPt.isValid() ? page.boxPt : sheet;
+        }
+    }
+    /// A page this change brought in has no record before it; its own box is the only frame there is.
+    return row.record.boxPt.isValid() ? row.record.boxPt : sheet;
+}
+
 void PdfNotebookOpsDialog::refreshCanvas()
 {
     if (!m_canvas || !m_angle) {
@@ -1303,23 +1891,218 @@ void PdfNotebookOpsDialog::refreshCanvas()
     if (row < 0 || row >= m_rows.size()) {
         m_canvas->clearPage();
         m_angle->setText(i18n("Turn: select a page to turn it."));
+        if (m_boxWarning) {
+            m_boxWarning->clear();
+        }
         return;
     }
 
     Row &selected = m_rows[row];
+    const QRectF previewBox = previewBoxFor(selected);
     if (selected.removed) {
-        /// Marked for deletion: the pending turn is still shown, but there is no page to turn --
+        /// Marked for deletion: the pending size is still shown, but there is no page to work on --
         /// "Keep page" brings it back.
-        m_canvas->setPage(QPixmap(), 0, selected.record.extraRotation, selected.record.sizePt);
+        m_canvas->setPage(QPixmap(), 0, selected.record.extraRotation, selected.record.sizePt,
+                          selected.record.extraScale, selected.record.boxPt, previewBox);
         m_angle->setText(i18n("Turn: %1 (marked for deletion)",
                               turnLabel(selected.record.extraRotation)));
+        if (m_boxWarning) {
+            m_boxWarning->clear();
+        }
         return;
     }
 
     loadPreview(selected);
     m_canvas->setPage(selected.preview, selected.previewRotation, selected.record.extraRotation,
-                      selected.record.sizePt);
-    m_angle->setText(i18n("Turn: %1", turnLabel(selected.record.extraRotation)));
+                      selected.record.sizePt, selected.record.extraScale, selected.record.boxPt,
+                      previewBox);
+
+    /// The field follows the model without writing back to it.
+    if (m_scaleField) {
+        m_updatingScale = true;
+        m_scaleField->setValue(selected.record.extraScale * 100.0);
+        m_updatingScale = false;
+    }
+
+    /// The readout says WHICH MODE IS IN FORCE and what that mode currently has. The pane says what a
+    /// drag will do before the drag starts, which is the whole reason the switch is explicit.
+    switch (m_dragMode) {
+    case ScaleDrag:
+        m_angle->setText(i18n("Scale: %1%", qRound(selected.record.extraScale * 100.0)));
+        break;
+    case BoxDrag:
+        m_angle->setText(i18n("Box: %1", boxLabel(selected.record.boxPt)));
+        break;
+    default:
+        m_angle->setText(i18n("Turn: %1", turnLabel(selected.record.extraRotation)));
+        break;
+    }
+    if (m_boxWarning) {
+        m_boxWarning->setText(m_dragMode == BoxDrag ? boxCropWarning() : QString());
+    }
+}
+
+void PdfNotebookOpsDialog::setDragMode(DragMode mode)
+{
+    m_dragMode = mode;
+    if (m_modeTurn) {
+        m_modeTurn->setChecked(mode == TurnDrag);
+    }
+    if (m_modeScale) {
+        m_modeScale->setChecked(mode == ScaleDrag);
+    }
+    if (m_modeBox) {
+        m_modeBox->setChecked(mode == BoxDrag);
+    }
+    if (m_canvas) {
+        m_canvas->setMode(mode == ScaleDrag ? PdfPageCanvas::ScaleMode
+                                            : (mode == BoxDrag ? PdfPageCanvas::BoxMode
+                                                               : PdfPageCanvas::TurnMode));
+    }
+    refreshCanvas();
+}
+
+void PdfNotebookOpsDialog::setSelectedScale(qreal factor)
+{
+    const int row = m_table->currentRow();
+    if (row < 0 || row >= m_rows.size() || m_rows.at(row).removed) {
+        return;
+    }
+
+    /// The same range the field offers, so a drag and a typed number can never record different
+    /// pages for the same value.
+    const qreal wanted = qBound(qreal(0.1), factor, qreal(8.0));
+    Row &scaling = m_rows[row];
+    if (qFuzzyCompare(scaling.record.extraScale, wanted)) {
+        return;
+    }
+
+    scaling.record.extraScale = wanted;
+    /// The preview was made at the page's old size, so it goes with the change: a stale preview would
+    /// show the old size and the next save makes a new one.
+    dropThumbnail(scaling);
+    restorePreviewIfUnchanged(scaling);
+
+    refresh();
+    m_table->selectRow(row);
+}
+
+void PdfNotebookOpsDialog::setSelectedBox(const QRectF &box)
+{
+    const int row = m_table->currentRow();
+    if (row < 0 || row >= m_rows.size() || m_rows.at(row).removed) {
+        return;
+    }
+
+    Row &cropping = m_rows[row];
+    QRectF wanted = box;
+    if (wanted.isValid()) {
+        /// A box that covers the whole sheet IS the whole sheet: one spelling of "not cropped", so
+        /// Apply and the table can tell a crop from a hand that came back to where it started.
+        const QRectF sheet(0, 0, cropping.record.sizePt.width(), cropping.record.sizePt.height());
+        const qreal slack = 1.0;
+        if (qAbs(wanted.x() - sheet.x()) <= slack && qAbs(wanted.y() - sheet.y()) <= slack
+            && qAbs(wanted.width() - sheet.width()) <= slack
+            && qAbs(wanted.height() - sheet.height()) <= slack) {
+            wanted = QRectF();
+        }
+    }
+    if (cropping.record.boxPt == wanted) {
+        return;
+    }
+
+    cropping.record.boxPt = wanted;
+    /// The preview is a picture of the page in the box it had; the box just changed, so it goes with
+    /// the change rather than showing the page the wrong size. The pane keeps drawing it in the
+    /// frame it was made in (previewBoxFor) until a new one arrives.
+    dropThumbnail(cropping);
+    restorePreviewIfUnchanged(cropping);
+
+    refresh();
+    m_table->selectRow(row);
+}
+
+void PdfNotebookOpsDialog::restorePreviewIfUnchanged(Row &row)
+{
+    /// A page the user put back the way the notebook has it is not a change -- and the preview the
+    /// edit dropped on the way is not one either. Without this, scaling a page and setting it back
+    /// would leave Apply offering to remove the page's own preview: the same "nothing happened but
+    /// the screen says it did" that the ops layer's own comparison exists to prevent.
+    for (const PdfPageRecord &page : m_original.pages) {
+        if (page.kraFile != row.record.kraFile) {
+            continue;
+        }
+        const bool same = page.source == row.record.source && page.index == row.record.index
+            && page.extraRotation == row.record.extraRotation
+            && page.extraScale == row.record.extraScale && page.boxPt == row.record.boxPt
+            && page.sizePt == row.record.sizePt;
+        if (same && row.record.thumbFile.isEmpty() && !page.thumbFile.isEmpty()) {
+            row.record.thumbFile = page.thumbFile;
+            m_removals.removeAll(page.thumbFile);
+        }
+        return;
+    }
+}
+
+QString PdfNotebookOpsDialog::boxCropWarning() const
+{
+    const int row = m_table->currentRow();
+    if (row < 0 || row >= m_rows.size() || m_rows.at(row).removed) {
+        return QString();
+    }
+
+    const Row &selected = m_rows.at(row);
+    const PdfPageRecord &record = selected.record;
+    if (!record.boxPt.isValid()) {
+        return i18n("Box mode: no crop. Drag an edge inwards to cut the page down, or outwards to "
+                    "add a margin.");
+    }
+    if (selected.preview.isNull()) {
+        /// No picture to judge by. Saying "nothing will be lost" would be a guess, and this is the
+        /// one mode where a guess costs the user their ink.
+        return i18n("Box mode: this crop cannot be checked against the page's picture, because there "
+                    "is no preview of it yet.");
+    }
+
+    /// The preview is in the frame of the box the page had when it was written. The part of it
+    /// outside the pending box is exactly the ink this crop destroys, so the warning is counted from
+    /// the picture the user is looking at rather than from a number in the manifest.
+    const QRectF frame = previewBoxFor(selected);
+    const QImage picture = selected.preview.toImage();
+    if (picture.isNull() || frame.isEmpty()) {
+        return QString();
+    }
+
+    const int step = qMax(1, qMax(picture.width(), picture.height()) / 256);
+    int painted = 0;
+    for (int y = 0; y < picture.height(); y += step) {
+        for (int x = 0; x < picture.width(); x += step) {
+            const QRgb pixel = picture.pixel(x, y);
+            if (qAlpha(pixel) < 32) {
+                continue;
+            }
+            /// Painted means ink, not paper: the preview is mostly white, and warning about white
+            /// paper would make the warning meaningless.
+            if (qRed(pixel) + qGreen(pixel) + qBlue(pixel) > 600) {
+                continue;
+            }
+            const QPointF inPage(frame.x() + frame.width() * (qreal(x) + 0.5) / picture.width(),
+                                 frame.y() + frame.height() * (qreal(y) + 0.5) / picture.height());
+            if (!record.boxPt.contains(inPage)) {
+                ++painted;
+            }
+        }
+    }
+
+    if (painted == 0) {
+        return i18n("Box mode: nothing painted is in the part being cut away. What is outside the box "
+                    "is gone from the page when you press Apply.");
+    }
+    return i18np("Box mode: this crop removes painted marks from the page -- %1 sampled pixel of ink "
+                 "is inside the part being cut away, and it is destroyed when you press Apply.",
+                 "Box mode: this crop removes painted marks from the page -- %1 sampled pixels of ink "
+                 "are inside the part being cut away, and they are destroyed when you press Apply.",
+                 painted);
 }
 
 PdfNotebookOpsDialog::PreparedPreview PdfNotebookOpsDialog::cardPreview(int row) const
@@ -1468,7 +2251,8 @@ void PdfNotebookOpsDialog::adoptFreshPreview(int navigatorIndex)
         /// the pane takes the new pixels when the turn is done.
         if (m_canvas && m_table->currentRow() == i && !m_canvas->isTurning()) {
             m_canvas->setPage(row.preview, row.previewRotation, row.record.extraRotation,
-                              row.record.sizePt);
+                              row.record.sizePt, row.record.extraScale, row.record.boxPt,
+                              previewBoxFor(row));
         }
     }
 }
@@ -1574,9 +2358,12 @@ bool PdfNotebookOpsDialog::hasPendingEdits() const
     for (int i = 0; i < now.size(); ++i) {
         const PdfPageRecord &a = now.at(i);
         const PdfPageRecord &b = m_original.pages.at(i);
+        /// Every field that decides what the reader sees, so a scale or a box -- including one put
+        /// BACK to its default -- is a change the screen offers to Apply instead of silently doing
+        /// nothing.
         if (a.kraFile != b.kraFile || a.source != b.source || a.index != b.index
-            || a.extraRotation != b.extraRotation || a.sizePt != b.sizePt
-            || a.thumbFile != b.thumbFile) {
+            || a.extraRotation != b.extraRotation || a.extraScale != b.extraScale
+            || a.boxPt != b.boxPt || a.sizePt != b.sizePt || a.thumbFile != b.thumbFile) {
             return true;
         }
     }
@@ -1632,6 +2419,47 @@ QStringList PdfNotebookOpsDialog::pendingDescriptions() const
     }
     if (turned > 0) {
         parts << i18np("%1 page turned", "%1 pages turned", turned);
+    }
+
+    /// Scale and Box are named apart from a turn and apart from each other, because they are separate
+    /// modes with separate mistakes: a wrong scale is the wrong size, a wrong crop is ink gone. A
+    /// value put BACK to its default counts here too -- the Lead's own rule, and the reason the
+    /// comparison is over the whole value rather than over "is it different from 1".
+    int scaled = 0;
+    int cropped = 0;
+    int uncropped = 0;
+    QHash<QString, PdfPageRecord> wasBefore;
+    for (const PdfPageRecord &page : m_original.pages) {
+        wasBefore.insert(page.kraFile, page);
+    }
+    for (const Row &row : m_rows) {
+        if (row.removed || row.isNew) {
+            continue;
+        }
+        const QHash<QString, PdfPageRecord>::const_iterator before =
+            wasBefore.constFind(row.record.kraFile);
+        if (before == wasBefore.constEnd()) {
+            continue;
+        }
+        if (!qFuzzyCompare(before.value().extraScale, row.record.extraScale)) {
+            ++scaled;
+        }
+        if (before.value().boxPt != row.record.boxPt) {
+            if (row.record.boxPt.isValid()) {
+                ++cropped;
+            } else {
+                ++uncropped;
+            }
+        }
+    }
+    if (scaled > 0) {
+        parts << i18np("%1 page scaled", "%1 pages scaled", scaled);
+    }
+    if (cropped > 0) {
+        parts << i18np("%1 page cropped", "%1 pages cropped", cropped);
+    }
+    if (uncropped > 0) {
+        parts << i18np("%1 page un-cropped", "%1 pages un-cropped", uncropped);
     }
 
     /// The order: the pages that were here, in the order they are in now, against the order they
@@ -1737,6 +2565,11 @@ PdfNotebookOps::PageEdits PdfNotebookOpsDialog::edits() const
     edits.copyExternalDirs = m_copyDirs;
     edits.assetsToMerge = m_assets;
     edits.removeAfter = m_removals;
+    /// Box mode writes the ink, not only the record: a crop that changed the manifest alone would
+    /// leave the whole page's ink on disk for the roll to squeeze into the smaller rectangle. The
+    /// screen built the page list, so it names the artifact step too, and applyPageEdits runs it
+    /// inside the same journal entry and the same commit as everything else.
+    edits.clipper = PdfPageRotator::clipInto;
 
     /// The PDFs the kept pages really name are the ones that travel: a PDF whose pages were all
     /// dropped again is not copied anywhere. The indices are renumbered in order, so a page that

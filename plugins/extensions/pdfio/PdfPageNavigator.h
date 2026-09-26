@@ -293,6 +293,55 @@ public:
     bool scrollFollowEnabled() const;
     void setScrollFollowEnabled(bool enabled);
 
+    /**
+     * How long the page under the centre of the viewport has to stay there before the strip turns to
+     * it, in milliseconds. The value the follow's own log line reports as "settled on page N after
+     * X ms".
+     *
+     * It is the knob the user asked for: a LONGER settle means a burst of scrolling does not drag
+     * the strip through every page it passes -- the candidate is reset on each page the centre
+     * crosses, so only the page the scrolling RESTS on is reached (fewer writes, less churn); a
+     * SHORTER one means the strip follows the finger, and 0 is allowed and turns on the first 150 ms
+     * tick after the page under the centre changes.
+     *
+     * There is no ceiling: no value breaks anything. A value so large that the follow never fires is
+     * the same thing as the "Turn pages by panning" switch being off, and that switch is the honest
+     * way to say it. A negative value is refused at 0, because there is no such thing as settling
+     * before the reading is taken. Persisted under pdfio/scrollSettleMs; 450 by default, which is
+     * what every build before this setting did.
+     */
+    int scrollSettleMs() const;
+    void setScrollSettleMs(int milliseconds);
+
+    /**
+     * How much of the viewport height the ACTIVE page takes when the strip is fitted, in percent:
+     * the three fifths (60) the fit has always used.
+     *
+     * The rule and what it buys: the fit is deliberately not full-screen -- fitting the page exactly
+     * filled the viewport and the page that comes next was then simply not on screen, "even at page
+     * three you cannot see four" -- so two fifths of the height are left for the neighbours. A
+     * SMALLER share shows more of them (the strip looks further ahead, and less scrolling turns the
+     * page); a LARGER one shows less (a page fills more of the screen, and the reading page changes
+     * after more scrolling). It is the knob behind "how much of a page is on screen", and it changes
+     * which page a given scroll leaves under the centre of the viewport.
+     *
+     * Held between minReadingSharePercent() and maxReadingSharePercent(): a share of zero is a page
+     * with no height (and fitZoomFor's own 2% floor would take over), and above 100% the page is
+     * taller than the viewport, so the neighbour this rule exists to show is gone again. Persisted
+     * under pdfio/readingSharePercent; 60 by default.
+     */
+    int readingSharePercent() const;
+    void setReadingSharePercent(int percent);
+    static int minReadingSharePercent();
+    static int maxReadingSharePercent();
+
+    /**
+     * The zoom the fit chooses for a page of \a pageRect in \a viewport at the share in force: the
+     * same arithmetic the strip is fitted with, exposed because "how much scrolling turns the page"
+     * is that zoom times the scroll, and a canvas cannot be built in a test.
+     */
+    qreal fitZoomForViewport(const QSize &viewport, const QRect &pageRect) const;
+
     /// What the export needs to walk the notebook and find its source.
     const PdfSessionManifest &manifest() const;
 
@@ -692,6 +741,22 @@ private:
     /// has to be the number the document in front of the reader really has. 0 until a window is
     /// built, which currentRenderDpi() reports as the 200 dpi default.
     qreal m_renderedDpi = 0.0;
+
+    /// How long the page under the centre must stay there before the follow turns to it, in
+    /// milliseconds. Read from pdfio/scrollSettleMs in the constructor, written by
+    /// setScrollSettleMs(). 450 is what every build before the setting did.
+    int m_scrollSettleMs = 450;
+
+    /// The share of the viewport height the active page takes at fit, in percent. Read from
+    /// pdfio/readingSharePercent in the constructor, written by setReadingSharePercent(). 60 is the
+    /// three fifths every build before the setting used.
+    int m_readingSharePercent = 60;
+
+    /// The share as the fraction the fit arithmetic wants (60 -> 0.6).
+    qreal readingShare() const
+    {
+        return qreal(m_readingSharePercent) / 100.0;
+    }
 
     /**
      * Which pages may stay open, and the rule that keeps closing one from losing ink.

@@ -75,6 +75,24 @@ QSizeF sizeFromJson(const QJsonValue &value)
     return QSizeF(array.at(0).toDouble(), array.at(1).toDouble());
 }
 
+/// A page's box as it is written: [x, y, width, height], the same four numbers QRectF holds.
+QJsonArray rectToJson(const QRectF &rect)
+{
+    return QJsonArray{rect.x(), rect.y(), rect.width(), rect.height()};
+}
+
+/// The box back out of the four numbers, or an invalid rectangle when the value is not one -- which
+/// means "the whole sheet", the shape every page made before the field existed reads back as.
+QRectF rectFromJson(const QJsonValue &value)
+{
+    const QJsonArray array = value.toArray();
+    if (array.size() != 4) {
+        return QRectF();
+    }
+    return QRectF(array.at(0).toDouble(), array.at(1).toDouble(), array.at(2).toDouble(),
+                  array.at(3).toDouble());
+}
+
 void fail(QString *why, const QString &message)
 {
     if (why) {
@@ -134,10 +152,26 @@ QString PdfSessionManifest::displayName() const
     return QFileInfo(sourceFile).completeBaseName();
 }
 
+QSizeF PdfPageRecord::boxedSizePt() const
+{
+    /// An absent box is the whole sheet. sizePt itself stays what the file declares, so the record
+    /// survives a renderer change and a crop is one field beside it rather than a rewritten size.
+    return boxPt.isValid() ? boxPt.size() : sizePt;
+}
+
+bool PdfPageRecord::isResized() const
+{
+    return boxPt.isValid() || extraScale != 1.0;
+}
+
 QSizeF PdfPageRecord::displaySizePt() const
 {
-    /// sizePt itself stays what the file declares, so the record survives a renderer change.
-    return turnedSize(sizePt, extraRotation);
+    /// The order the design record fixes, and the one place it is spelled: the page's own box, then
+    /// the notebook's turn, then the notebook's scale. Box first because a crop is in the source's
+    /// displayed frame; rotation before scale so a scaled page is a bigger page of the same shape
+    /// (turnedSize is linear in its argument, so the two would agree for a right angle either way,
+    /// and for any other angle the turned bounding box of the scaled box is what the reader sees).
+    return turnedSize(boxedSizePt(), extraRotation) * extraScale;
 }
 
 QSizeF PdfPageRecord::turnedSize(const QSizeF &size, int degrees)
@@ -313,6 +347,21 @@ bool PdfSessionManifest::isValid(QString *why) const
                           .arg(page.index + 1).arg(page.extraRotation));
             return false;
         }
+        /// A scale of zero or less, or one that is not a number, is a page with no size: refused
+        /// here rather than divided by later. A factor of exactly 1.0 is "as the source declares".
+        if (!qIsFinite(page.extraScale) || page.extraScale <= 0.0) {
+            fail(why, QStringLiteral("page %1 has a scale of %2, which is not a positive factor")
+                          .arg(page.index + 1).arg(page.extraScale));
+            return false;
+        }
+        /// An absent box is legal and means the whole sheet. A rectangle that is there but has no
+        /// area -- a half-written or hand-edited box -- would make a page of nothing, so it is
+        /// refused. A box outside the sheet is legal: that is a margin.
+        if (!page.boxPt.isNull() && !page.boxPt.isValid()) {
+            fail(why, QStringLiteral("page %1 has a box of %2x%3 points, which is not a rectangle")
+                          .arg(page.index + 1).arg(page.boxPt.width()).arg(page.boxPt.height()));
+            return false;
+        }
         if (page.kraFile.isEmpty()) {
             fail(why, QStringLiteral("the manifest's page %1 ink file is not recorded").arg(page.index + 1));
             return false;
@@ -347,6 +396,14 @@ QJsonObject PdfSessionManifest::toJson() const
         object.insert(QStringLiteral("generation"), page.generation);
         object.insert(QStringLiteral("source"), page.source);
         object.insert(QStringLiteral("extraRotation"), page.extraRotation);
+        /// Written always: it is the page's size, and a reader that has to guess a missing scale is
+        /// exactly the silent size loss the schema bump is for.
+        object.insert(QStringLiteral("extraScale"), page.extraScale);
+        /// Written only when there is one. Absent means the whole sheet, which is every page made
+        /// before this field existed and every page that was never cropped.
+        if (page.boxPt.isValid()) {
+            object.insert(QStringLiteral("boxPt"), rectToJson(page.boxPt));
+        }
         pageArray.append(object);
     }
 
@@ -397,7 +454,7 @@ PdfSessionManifest PdfSessionManifest::fromJson(const QJsonObject &object, QStri
     /// A schema 1 manifest is this shape plus nothing: one source in the legacy object, no
     /// sources[] list, no per-page source and no page-number counter. It is upgraded here, in
     /// memory, which is what keeps every notebook made until now opening.
-    if (manifest.schema == 1) {
+    if (manifest.schema == 1 || manifest.schema == 2) {
         manifest.schema = CurrentSchema;
     }
 
@@ -448,6 +505,10 @@ PdfSessionManifest PdfSessionManifest::fromJson(const QJsonObject &object, QStri
         page.generation = pageObject.value(QStringLiteral("generation")).toInt();
         page.source = pageObject.value(QStringLiteral("source")).toInt();
         page.extraRotation = normalizedTurn(pageObject.value(QStringLiteral("extraRotation")).toInt());
+        /// Absent in a schema 1 or 2 manifest, and every one of them must read back unchanged: no
+        /// scale is exactly 1.0, and no box is the whole sheet.
+        page.extraScale = pageObject.value(QStringLiteral("extraScale")).toDouble(1.0);
+        page.boxPt = rectFromJson(pageObject.value(QStringLiteral("boxPt")));
         manifest.pages.append(page);
     }
 

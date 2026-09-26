@@ -54,6 +54,24 @@ public:
                                                int degrees, QString *why)>;
 
     /**
+     * Clips an artifact into the page's new box: what Box mode does to the ink when a crop is
+     * committed.
+     *
+     * PdfPageRotator::clipInto is what the plugin passes. It becomes the page's new frame -- the
+     * notebook's own turn applied and the box kept, everything outside it gone -- because the other
+     * option is the roll's scaling path squeezing the whole page's ink into the smaller rectangle,
+     * which puts the user's marks back on the paper in the wrong place. Losing the pixels outside a
+     * crop is what a crop means; moving them is a defect.
+     *
+     * \a from and \a to are the page's records before and after the change: the artifact on disk is
+     * in \a from's frame, and \a to is the frame the page must end up in. Records rather than a
+     * rectangle, so the turn and the crop can be one operation and can never be applied twice.
+     */
+    using ArtifactClipper = std::function<bool(const QString &source, const QString &destination,
+                                               const PdfPageRecord &from, const PdfPageRecord &to,
+                                               QString *why)>;
+
+    /**
      * What an operation did, in the terms a caller needs to report it and to reload afterwards.
      */
     struct Outcome {
@@ -209,7 +227,9 @@ public:
      * A turn is NOT listed here: it is read off the records. Whatever extraRotation a page's record
      * has gained over the record it came from -- for a page that stayed, its own record before; for
      * a duplicate, the one it was copied from -- is what its artifact is turned by. One place the
-     * turn lives means the paper and the ink cannot be asked to disagree.
+     * turn lives means the paper and the ink cannot be asked to disagree. The same is true of a box:
+     * a record whose boxPt differs from the record it came from is clipped by \c clipper, and that
+     * clip carries the turn as well.
      */
     struct PageEdits {
         /// The page list the notebook should have afterwards, in order.
@@ -245,6 +265,17 @@ public:
          * rule merging a notebook uses, in one place rather than two.
          */
         QStringList assetsToMerge;
+
+        /**
+         * What clips a page's artifact when the page's own box changed. REQUIRED for a box change:
+         * a change that crops a page without one is refused rather than applied, because proceeding
+         * would leave the whole page's ink under a box that says otherwise -- the exact failure Box
+         * mode exists to avoid. A caller that never crops may leave it empty.
+         *
+         * It runs inside the same journal entry, and the same manifest commit, as everything else:
+         * one undo after a crop has to bring back the size AND the ink.
+         */
+        ArtifactClipper clipper;
     };
 
     /**

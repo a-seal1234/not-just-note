@@ -72,6 +72,19 @@ struct Plan {
         int degrees = 0;
     };
     QList<Rotation> rotations;
+    /// Artifacts to clip into the page's new box, and the records that say which frames the two
+    /// sides are: the artifact on disk is in \c from's frame, and \c to is what the page becomes.
+    /// The clip carries the notebook's turn as well, so a page that is cropped and turned in one
+    /// change is written once, in one frame.
+    struct Clip {
+        QString kraFile;
+        PdfPageRecord from;
+        PdfPageRecord to;
+    };
+    QList<Clip> clips;
+    /// What performs a clip. Empty means "this change crops nothing"; a change that does crop and
+    /// has no clipper is refused before anything is written, never applied with the ink left behind.
+    PdfNotebookOps::ArtifactClipper clipper;
     QString summary;
 };
 
@@ -228,6 +241,10 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
         written << rotation.kraFile << rotation.kraFile + QStringLiteral(".layers")
                 << rotation.kraFile + QStringLiteral(".layers.txt");
     }
+    for (const Plan::Clip &clip : plan.clips) {
+        written << clip.kraFile << clip.kraFile + QStringLiteral(".layers")
+                << clip.kraFile + QStringLiteral(".layers.txt");
+    }
     if (!writeLines(QDir(journal).filePath(QLatin1String(AddedName)), written)) {
         fail(why, QStringLiteral("cannot journal the files this change creates"));
         QDir(journal).removeRecursively();
@@ -284,10 +301,15 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
         }
     }
 
-    /// Three: the pages that are turned. Each artifact is turned into a name beside itself and read
-    /// back by the rotator, then the original is journalled and the turned file takes its place --
-    /// so at every instant there is a complete artifact under one name or the other, and a failure
-    /// here puts back everything already turned before the operation gives up.
+    /// Three: the pages whose artifact is rewritten -- turned, or clipped to a new box. Each is
+    /// written into a name beside itself, the original is journalled, and only then does the new
+    /// file take its place, so at every instant there is a complete artifact under one name or the
+    /// other and a failure here puts back everything already written before the operation gives up.
+    ///
+    /// A clip goes through the same protocol as a turn, deliberately: the clip is part of the same
+    /// journal entry and the same manifest commit, so one undo after a crop brings back the page's
+    /// size AND its ink. A clip that wrote outside the journal would make the undo itself the thing
+    /// that destroyed the pixels.
     QStringList turned;
     const auto removeTemporaryTurn = [](const QString &path) {
         removePath(path);
@@ -309,17 +331,20 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
         }
     };
 
-    for (const Plan::Rotation &rotation : plan.rotations) {
-        const QString original = project.filePath(rotation.kraFile);
+    /// Replaces one artifact under the journal, whatever rewrote it. \a write fills \a temporary
+    /// from the artifact at \a relative; a page that was never drawn on has no artifact and is
+    /// skipped, because then the manifest alone says what the page is.
+    const auto replaceArtifact = [&](const QString &relative, const QString &temporary,
+                                     const QString &what,
+                                     const std::function<bool(QString *)> &write) {
+        const QString original = project.filePath(relative);
         if (!QFileInfo::exists(original)) {
-            /// A page that was never drawn on has no artifact: its turn is the manifest's alone.
-            continue;
+            return true;
         }
 
-        const QString temporary = original + QStringLiteral(".rotating");
-        if (!rotator || !rotator(original, temporary, rotation.degrees, why)) {
+        if (!write(why)) {
             if (!why || why->isEmpty()) {
-                fail(why, QStringLiteral("the page %1 could not be turned").arg(rotation.kraFile));
+                fail(why, QStringLiteral("the page %1 could not be %2").arg(relative, what));
             }
             removeTemporaryTurn(temporary);
             putTurnsBack();
@@ -330,7 +355,7 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
 
         bool swapped = true;
         for (const QString &suffix : { QString(), QStringLiteral(".layers"), QStringLiteral(".layers.txt") }) {
-            if (!moveIntoJournal(projectDir, journal, rotation.kraFile + suffix, why)) {
+            if (!moveIntoJournal(projectDir, journal, relative + suffix, why)) {
                 swapped = false;
                 break;
             }
@@ -339,8 +364,8 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
             for (const QString &suffix : { QString(), QStringLiteral(".layers"), QStringLiteral(".layers.txt") }) {
                 const QString from = temporary + suffix;
                 if (QFileInfo::exists(from) && !QDir().rename(from, original + suffix)) {
-                    fail(why, QStringLiteral("the turned page could not take the place of %1")
-                                  .arg(rotation.kraFile));
+                    fail(why, QStringLiteral("the rewritten page could not take the place of %1")
+                                  .arg(relative));
                     swapped = false;
                     break;
                 }
@@ -354,7 +379,32 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
             return false;
         }
 
-        turned.append(rotation.kraFile);
+        turned.append(relative);
+        return true;
+    };
+
+    for (const Plan::Rotation &rotation : plan.rotations) {
+        const QString temporary = project.filePath(rotation.kraFile) + QStringLiteral(".rotating");
+        if (!replaceArtifact(rotation.kraFile, temporary, QStringLiteral("turned"),
+                             [&](QString *writeWhy) {
+                                 return rotator
+                                     && rotator(project.filePath(rotation.kraFile), temporary,
+                                                rotation.degrees, writeWhy);
+                             })) {
+            return false;
+        }
+    }
+
+    for (const Plan::Clip &clip : plan.clips) {
+        const QString temporary = project.filePath(clip.kraFile) + QStringLiteral(".cropping");
+        if (!replaceArtifact(clip.kraFile, temporary, QStringLiteral("clipped to its box"),
+                             [&](QString *writeWhy) {
+                                 return plan.clipper
+                                     && plan.clipper(project.filePath(clip.kraFile), temporary,
+                                                     clip.from, clip.to, writeWhy);
+                             })) {
+            return false;
+        }
     }
 
     /// Four: the manifest, atomically. This is the commit -- before it the notebook is exactly what
@@ -1220,39 +1270,53 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
     plan.copyExternalDirs = edits.copyExternalDirs;
     plan.removeAfter = edits.removeAfter;
     plan.summary = edits.summary;
-    /// The turns are read off the records rather than listed separately: whatever extraRotation a
-    /// page's record has gained over the record it came from is what its artifact has to be turned
-    /// by. For a page that stayed that is its own record before; for a duplicate it is the record it
-    /// was copied from, found through the copy's source path. One place the turn lives means a
-    /// caller cannot ask for a turned artifact and an unturned record -- which is paper and ink
-    /// disagreeing, the defect this project keeps designing against.
-    QHash<QString, int> turnBefore;
+    plan.clipper = edits.clipper;
+    /// The record each page came from: its own before the change, or the record a copy was taken
+    /// from, found through the copy's source path. Both the turn and the box are read as differences
+    /// from it, so a caller cannot ask for a clipped artifact and an unclipped record -- which is
+    /// paper and ink disagreeing, the defect this project keeps designing against.
+    QHash<QString, PdfPageRecord> recordBefore;
     for (const PdfPageRecord &page : before.pages) {
-        turnBefore.insert(page.kraFile, page.extraRotation);
+        recordBefore.insert(page.kraFile, page);
     }
     QHash<QString, QString> copiedFrom;
     for (const QPair<QString, QString> &pair : plan.copyExternal) {
         copiedFrom.insert(pair.second, pair.first);
     }
     for (const PdfPageRecord &page : plan.after.pages) {
-        int from = 0;
-        const QHash<QString, int>::const_iterator own = turnBefore.constFind(page.kraFile);
-        if (own != turnBefore.constEnd()) {
+        PdfPageRecord from;
+        const QHash<QString, PdfPageRecord>::const_iterator own = recordBefore.constFind(page.kraFile);
+        if (own != recordBefore.constEnd()) {
             from = own.value();
         } else {
             const QString source = copiedFrom.value(page.kraFile);
             const QString sourceName =
                 source.isEmpty() ? QString() : QDir(projectDir).relativeFilePath(source);
-            const QHash<QString, int>::const_iterator origin = turnBefore.constFind(sourceName);
-            if (origin == turnBefore.constEnd()) {
+            const QHash<QString, PdfPageRecord>::const_iterator origin =
+                recordBefore.constFind(sourceName);
+            if (origin == recordBefore.constEnd()) {
                 /// A page arriving from another notebook or PDF: its artifact is copied as it was
-                /// stored, so there is nothing to turn.
+                /// stored, so there is nothing to turn and nothing to clip.
                 continue;
             }
             from = origin.value();
         }
 
-        const int turn = ((page.extraRotation - from) % 360 + 360) % 360;
+        /// A box change is a CLIP. The ink on disk is in the frame the page had, and the page now
+        /// has a different one: leaving the artifact as it is would let the roll's scaling path
+        /// squeeze the whole page into the crop, i.e. move the user's marks instead of removing
+        /// what the crop removes. The clip carries the notebook's turn as well, so a page cropped
+        /// and turned in one change is written once, in one frame.
+        if (from.boxPt != page.boxPt) {
+            Plan::Clip clip;
+            clip.kraFile = page.kraFile;
+            clip.from = from;
+            clip.to = page;
+            plan.clips.append(clip);
+            continue;
+        }
+
+        const int turn = ((page.extraRotation - from.extraRotation) % 360 + 360) % 360;
         if (turn == 0) {
             continue;
         }
@@ -1260,6 +1324,18 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
         rotation.kraFile = page.kraFile;
         rotation.degrees = turn;
         plan.rotations.append(rotation);
+    }
+
+    /// A crop with nothing to clip with is refused, not applied with the ink left behind. a edits
+    /// .clipper is what the ops screen itself passes (PdfPageRotator::clipInto); a caller that
+    /// builds a crop by hand and forgets it hears about it here, before the journal exists.
+    if (!plan.clips.isEmpty() && !plan.clipper) {
+        return refused(QStringLiteral("this change crops %1 and carries no artifact clip, so the "
+                                      "page's ink would be left in the frame the box no longer "
+                                      "describes. A crop needs a clipper")
+                           .arg(plan.clips.size() == 1
+                                    ? QStringLiteral("a page")
+                                    : QStringLiteral("%1 pages").arg(plan.clips.size())));
     }
 
     /// The PDFs this change brings in, copied and named here so that an insert commits together
@@ -1381,10 +1457,18 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
             return false;
         }
         for (int i = 0; i < a.size(); ++i) {
+            /// Every field that decides what the reader sees is here. A field missing from this
+            /// comparison is a change Apply reports as nothing, which shows up as "I resized it and
+            /// nothing happened" -- and for a reset it is worse: putting a scale back to 1.0 or a
+            /// box back to the whole sheet has to be a change too, or Cancel and Apply look the
+            /// same. c boxPt and c extraScale are compared as whole values, so both directions
+            /// work.
             if (a.at(i).kraFile != b.at(i).kraFile || a.at(i).thumbFile != b.at(i).thumbFile
                 || a.at(i).source != b.at(i).source || a.at(i).index != b.at(i).index
                 || a.at(i).sizePt != b.at(i).sizePt
                 || a.at(i).extraRotation != b.at(i).extraRotation
+                || a.at(i).extraScale != b.at(i).extraScale
+                || a.at(i).boxPt != b.at(i).boxPt
                 || a.at(i).rotation != b.at(i).rotation) {
                 return false;
             }
@@ -1402,7 +1486,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
         }
     }
     if (plan.copyExternal.isEmpty() && plan.copyExternalDirs.isEmpty() && plan.rotations.isEmpty()
-        && plan.removeAfter.isEmpty() && sameSources
+        && plan.clips.isEmpty() && plan.removeAfter.isEmpty() && sameSources
         && samePageList(plan.after.pages, before.pages)) {
         Outcome nothing;
         nothing.ok = true;

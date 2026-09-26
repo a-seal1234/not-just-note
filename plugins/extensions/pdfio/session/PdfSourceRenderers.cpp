@@ -7,6 +7,7 @@
 #include "session/PdfSourceRenderers.h"
 
 #include <QDir>
+#include <QPainter>
 #include <QTransform>
 
 namespace {
@@ -16,6 +17,42 @@ void fail(QString *why, const QString &message)
     if (why) {
         *why = message;
     }
+}
+
+/**
+ * \a rendered -- the source page as the renderer displays it, at \a sourceDpi -- reduced to
+ * \a boxPt, the page's own rectangle in source points.
+ *
+ * The box is cut out of the raster rather than the raster scaled into it, because the two mean
+ * opposite things: a crop removes what is outside the box, and a squeeze would put it back on the
+ * paper in the wrong place. The part of the box that lies outside the sheet -- a margin the user
+ * dragged outwards -- comes back as paper white, because the page really is bigger there; leaving it
+ * transparent would show the desk through a page that has paper on it.
+ *
+ * The alpha channel is kept even though the box starts white: a turn that is not a right angle
+ * exposes corners the sheet never covered, and turnedForDisplay() needs somewhere to put the
+ * nothing that is really there.
+ */
+QImage croppedToBox(const QImage &rendered, const QRectF &boxPt, qreal sourceDpi)
+{
+    const qreal perPoint = sourceDpi / 72.0;
+    const QRect wanted(qRound(boxPt.x() * perPoint), qRound(boxPt.y() * perPoint),
+                       qMax(1, qRound(boxPt.width() * perPoint)),
+                       qMax(1, qRound(boxPt.height() * perPoint)));
+
+    QImage cropped(wanted.size(), QImage::Format_ARGB32_Premultiplied);
+    if (cropped.isNull()) {
+        return QImage();
+    }
+    cropped.fill(Qt::white);
+
+    const QRect fromSource = wanted.intersected(rendered.rect());
+    if (!fromSource.isEmpty()) {
+        QPainter painter(&cropped);
+        painter.drawImage(QRect(fromSource.topLeft() - wanted.topLeft(), fromSource.size()),
+                          rendered, fromSource);
+    }
+    return cropped;
 }
 
 } // namespace
@@ -85,8 +122,22 @@ QImage PdfSourceRenderers::renderPage(const PdfSessionManifest &manifest,
     if (!backend) {
         return QImage();
     }
-    return turnedForDisplay(backend->renderPage(manifest.pages.at(page).index, dpi),
-                            manifest.pages.at(page).extraRotation);
+
+    const PdfPageRecord &record = manifest.pages.at(page);
+
+    /// A scaled page is rendered at a larger SOURCE dpi and never upscaled: the same source at more
+    /// dpi is more pixels of the same page, which is what keeps the pen's ink sharp and what makes
+    /// the memory budget the thing that decides how far a scale can go. turnedSize() is linear in
+    /// its argument, so the turn below still lands the page in exactly displaySizePt() * dpi / 72.
+    const qreal scale = record.extraScale > 0.0 ? record.extraScale : 1.0;
+    const qreal sourceDpi = dpi * scale;
+
+    const QImage rendered = backend->renderPage(record.index, sourceDpi);
+    if (rendered.isNull() || !record.boxPt.isValid()) {
+        /// The whole sheet is the common case and stays byte for byte what it was.
+        return turnedForDisplay(rendered, record.extraRotation);
+    }
+    return turnedForDisplay(croppedToBox(rendered, record.boxPt, sourceDpi), record.extraRotation);
 }
 
 QImage PdfSourceRenderers::turnedForDisplay(const QImage &rendered, int extraRotation)

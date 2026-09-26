@@ -259,26 +259,31 @@ constexpr int ReloadSettleMs = 700;
 /// The gap the strip decoration leaves between pages, in widget pixels.
 constexpr qreal GapWidgetPixels = 16;
 
-/// The zoom that fits \a pageRect into \a viewport, with the active page taking about three fifths
-/// of it, or 0 when there is nothing to fit.
+/// The zoom that fits \a pageRect into \a viewport, with the active page taking \a share of its
+/// height, or 0 when there is nothing to fit.
 ///
 /// Three fifths rather than all of it, because fitting the page exactly filled the viewport and the
 /// page that comes next was then simply not on screen however the view was centred -- "even at page
 /// three you cannot see four". Two fifths of the height left free puts the top of the next page and
 /// the bottom of the previous one on screen, with the active page between them.
 ///
+/// \a share is the reading share in force (PdfPageNavigator::readingSharePercent()), passed in
+/// rather than read from a constant here because it is the user's to set now. Which page a scroll
+/// leaves under the centre depends on this zoom: the same finger movement covers zoom-times fewer
+/// document pixels as the share grows, so a bigger page changes the reading page after more
+/// scrolling and a smaller one after less.
+///
 /// One place, because a window move that RESIZES the document has to fit again: the fit is placed
 /// once per document (see showImage), which was right while a roll could not change the size.
-qreal fitZoomFor(const QSize &viewport, const QRect &pageRect)
+qreal fitZoomFor(const QSize &viewport, const QRect &pageRect, qreal share)
 {
-    if (viewport.isEmpty() || pageRect.isEmpty()) {
+    if (viewport.isEmpty() || pageRect.isEmpty() || share <= 0.0) {
         return 0.0;
     }
 
-    constexpr qreal ActivePageShare = 0.6;
     return qBound(qreal(0.02),
                   qMin(qreal(viewport.width()) / pageRect.width(),
-                       (qreal(viewport.height()) * ActivePageShare) / pageRect.height()),
+                       (qreal(viewport.height()) * share) / pageRect.height()),
                   qreal(8.0));
 }
 
@@ -321,6 +326,23 @@ const char *const MemoryBudgetMbKey = "pdfio/memoryBudgetMb";
 /// leaves StripPagesKey exactly where it was, and turning the strip back on reads it again.
 const char *const StripPagesKey = "pdfio/stripPages";
 const char *const StripOnKey = "pdfio/stripOn";
+
+/// Where the page-loading trigger is kept: how long the page under the centre must stay there before
+/// the strip turns to it, and how much of the viewport the active page takes at fit.
+const char *const ScrollSettleMsKey = "pdfio/scrollSettleMs";
+const char *const ReadingSharePercentKey = "pdfio/readingSharePercent";
+
+/// What a reading share is held between, and the three fifths every build before the setting used.
+///
+/// The floor is the fraction's own domain rather than a quality guess: a share of zero is a page with
+/// no height at all, and the fit's own 2% floor (see fitZoomFor) would silently take over. The
+/// ceiling is where the rule stops doing what it is for: above 100% the page is taller than the
+/// viewport, so the top of the next page and the bottom of the previous one -- the two fifths the
+/// three fifths deliberately leave free, because "even at page three you cannot see four" -- are
+/// gone again.
+constexpr int MinReadingSharePercent = 1;
+constexpr int MaxReadingSharePercent = 100;
+constexpr int DefaultReadingSharePercent = 60;
 
 /// What a TYPED budget is held between.
 ///
@@ -397,6 +419,22 @@ PdfPageNavigator::PdfPageNavigator()
         m_scope = QSettings().value(QLatin1String(StripOnKey), true).toBool() ? m_stripPageCount : 1;
     }
 
+    /// The page-loading trigger, read here so the first tick of the first notebook already uses the
+    /// value the user chose. Both are clamped exactly as their setters clamp them, so a value written
+    /// by another build -- or edited by hand -- cannot put the follow in a state the menu could not.
+    ///
+    /// Neither has a ceiling for the settle delay: a value so large that the trigger never fires is
+    /// what the "Turn pages by panning" switch already says, so there is nothing to protect the code
+    /// from. The reading share is held between the fraction's own ends; see MinReadingSharePercent.
+    {
+        const QSettings settings;
+        m_scrollSettleMs = qMax(0, settings.value(QLatin1String(ScrollSettleMsKey), int(SettleMs)).toInt());
+        m_readingSharePercent = qBound(MinReadingSharePercent,
+                                       settings.value(QLatin1String(ReadingSharePercentKey),
+                                                      DefaultReadingSharePercent).toInt(),
+                                       MaxReadingSharePercent);
+    }
+
     /// The window's save is the plugin's own page save: the ink-only document, the crop when the
     /// page lives in a strip, and the asynchronous write saveCurrentPage already owns. Wired once
     /// here rather than at each call site, so no page switch can run without it -- and through
@@ -464,6 +502,101 @@ void PdfPageNavigator::setScrollFollowEnabled(bool enabled)
     m_scrollFollow = enabled;
     say(QStringLiteral("turning pages by panning is now %1").arg(enabled ? "on" : "off"));
     Q_EMIT pageChanged(m_index, pageCount(), QFileInfo(m_manifest.sourceFile).completeBaseName());
+}
+
+int PdfPageNavigator::scrollSettleMs() const
+{
+    return m_scrollSettleMs;
+}
+
+void PdfPageNavigator::setScrollSettleMs(int milliseconds)
+{
+    /// Only the floor is a clamp: a negative settle has no meaning, and there is no ceiling because
+    /// nothing above one breaks. See the declaration for why.
+    const int settle = qMax(0, milliseconds);
+
+    /// Written whether or not the value changed, like the budget: the menu offers values, and the one
+    /// in memory may not be the one another build wrote to the file.
+    QSettings settings;
+    settings.setValue(QLatin1String(ScrollSettleMsKey), settle);
+
+    if (settle == m_scrollSettleMs) {
+        return;
+    }
+    m_scrollSettleMs = settle;
+
+    /// The value in force, on the [pdfio] line the user already reads. The next tick uses it; there
+    /// is nothing else to apply, because the follow reads it as it decides.
+    say(settle == 0
+            ? QStringLiteral("the strip turns on the next tick after the view settles on a page")
+            : QStringLiteral("the strip turns %1 ms after the view settles on a page").arg(settle));
+}
+
+int PdfPageNavigator::readingSharePercent() const
+{
+    return m_readingSharePercent;
+}
+
+int PdfPageNavigator::minReadingSharePercent()
+{
+    return MinReadingSharePercent;
+}
+
+int PdfPageNavigator::maxReadingSharePercent()
+{
+    return MaxReadingSharePercent;
+}
+
+qreal PdfPageNavigator::fitZoomForViewport(const QSize &viewport, const QRect &pageRect) const
+{
+    return fitZoomFor(viewport, pageRect, readingShare());
+}
+
+void PdfPageNavigator::setReadingSharePercent(int percent)
+{
+    const int share = qBound(MinReadingSharePercent, percent, MaxReadingSharePercent);
+
+    QSettings settings;
+    settings.setValue(QLatin1String(ReadingSharePercentKey), share);
+
+    if (share == m_readingSharePercent) {
+        return;
+    }
+    m_readingSharePercent = share;
+
+    say(QStringLiteral("the active page now takes %1% of the viewport when the strip is fitted")
+            .arg(share));
+
+    /// Applied to what is on screen, because a share the user has just set has to be visible: the fit
+    /// is the only thing it changes, so the zoom is re-set for the page that is open and the CENTRE
+    /// is deliberately left where the reader put it (the fit itself centres on the active page, but
+    /// this is not that gesture -- it is the same choice the roll's resize makes). The view-settle
+    /// guard is pushed out so the follow does not read the transient zoom.
+    if (!m_view || !m_view->canvasBase() || !m_view->canvasController() || !m_document
+        || !m_document->image()) {
+        return;
+    }
+
+    QWidget *widget = m_view->canvasBase()->canvasWidget();
+    if (!widget || widget->size().isEmpty()) {
+        return;
+    }
+
+    const QRect pageRect = (m_stripActiveSlot >= 0 && m_stripActiveSlot < m_stripRects.size())
+        ? m_stripRects.at(m_stripActiveSlot)
+        : m_document->image()->bounds();
+    const qreal zoom = fitZoomForViewport(widget->size(), pageRect);
+    if (zoom <= 0.0) {
+        return;
+    }
+
+    say(QStringLiteral("zoom: the reading share is %1%, so a %2x%3 page fits the %4x%5 viewport at %6")
+            .arg(share)
+            .arg(pageRect.width()).arg(pageRect.height())
+            .arg(widget->width()).arg(widget->height())
+            .arg(zoom));
+    m_view->canvasController()->setZoom(KoZoomMode::ZOOM_CONSTANT, zoom);
+    m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 800;
 }
 
 int PdfPageNavigator::windowSlotFor(const QPointF &point) const
@@ -672,7 +805,11 @@ void PdfPageNavigator::checkScrollFollow()
         return;
     }
 
-    if (now - m_candidateSince < SettleMs || now - m_lastTurn < TurnCooldownMs) {
+    /// The settle delay is the user's (pdfio/scrollSettleMs, 450 ms by default): a longer one makes
+    /// a burst of scrolling rest before anything turns, a shorter one follows the finger, and 0
+    /// turns on the next tick. The cooldown is not a setting: it is the same pause the turn itself
+    /// needs, so that one gesture cannot turn two pages.
+    if (now - m_candidateSince < m_scrollSettleMs || now - m_lastTurn < TurnCooldownMs) {
         return;
     }
 
@@ -725,8 +862,15 @@ void PdfPageNavigator::ensureThumbnail(int index)
         connect(m_thumbnailTimer, &QTimer::timeout, this, &PdfPageNavigator::makeOneThumbnail);
     }
     if (!m_thumbnailTimer->isActive()) {
-        /// One at a time, slow enough that the window keeps redrawing while a long notebook fills
-        /// in.
+        /// One at a time, slow enough that the window keeps redrawing while a long notebook fills in.
+        ///
+        /// Deliberately NOT one of the settings beside the page-loading trigger, and the reason is
+        /// that it is a YIELD rather than a threshold: the wall time of one preview is the manifest
+        /// read, the page render, the ink load and the PNG write, all of them tens of milliseconds,
+        /// and this interval only decides how much of the main loop is left for the canvas BETWEEN
+        /// them. Halving it would not make a long notebook fill in noticeably sooner, and it would
+        /// take exactly that time away from redrawing the page the reader is on. What the user asked
+        /// to move -- when the strip loads and turns -- is the settle delay and the reading share.
         m_thumbnailTimer->start(40);
     }
 }
@@ -1277,6 +1421,24 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
     m_stripActiveSlot = -1;
     m_windowSlot = -1;
 
+    /// AND THE RENDERERS ARE THE NOTEBOOK'S OWN, so they must not outlive it.
+    ///
+    /// PdfSourceRenderers caches one open backend per RELATIVE source file name the manifest
+    /// records, and two notebooks can hold different PDFs with the same name: every Android import
+    /// is a copy called "pdfio-picked.pdf" in its own project directory. Left open, the second
+    /// notebook's pages were rendered through the FIRST notebook's still-open file -- the new
+    /// manifest's page count, sizes and rotation, which is the new "proportion", with the old
+    /// notebook's pixels drawn into them. That is the report this path answers. closeNotebook() has
+    /// always cleared them; a notebook that REPLACES another has to as well, so the shared relative
+    /// name becomes a cache miss and the right file is opened from the new project directory.
+    m_sourceRenderers.clear();
+
+    /// And the queued thumbnails and write stamps, which name pages of the notebook being left: a
+    /// preview of a page that now means something else, and stamps that belong to the old ink.
+    /// finishReload() clears the same two for the same reason.
+    m_thumbnailQueue.clear();
+    m_saveStamps.clear();
+
     /// And with no ink-change history: the clock the idle write waits on starts at the first
     /// stroke actually made in this notebook, not wherever the last one left it.
     ///
@@ -1707,7 +1869,8 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         if (m_view && m_view->canvasBase() && m_view->canvasController()) {
             QWidget *widget = m_view->canvasBase()->canvasWidget();
             const QRect pageRect = target.slots().at(target.activeSlot()).rect;
-            const qreal zoom = fitZoomFor(widget ? widget->size() : QSize(), pageRect);
+            const qreal zoom = fitZoomFor(widget ? widget->size() : QSize(), pageRect,
+                                        readingShare());
             if (zoom > 0.0) {
                 say(QStringLiteral("zoom: the window is %1x%2 now, so a %3x%4 page fits at %5")
                         .arg(targetSize.width()).arg(targetSize.height())
@@ -2922,8 +3085,9 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
                 return;
             }
 
-            /// Sized so the active page takes about three fifths of the viewport: see fitZoomFor().
-            const qreal zoom = fitZoomFor(viewport, pageRect);
+            /// Sized so the active page takes the reading share of the viewport (three fifths by
+            /// default): see fitZoomFor().
+            const qreal zoom = fitZoomFor(viewport, pageRect, readingShare());
 
             say(QStringLiteral("zoom: fitting a %1x%2 page into a %3x%4 viewport gives %5")
                     .arg(pageRect.width()).arg(pageRect.height())

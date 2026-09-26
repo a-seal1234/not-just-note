@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <unistd.h>
 
 #include <QActionGroup>
@@ -461,10 +462,27 @@ void openNotebookReplacing(const QString &pdfPath,
     /// The document that is open is still in the way while Krita closes it, and the close is
     /// deferred, so this waits rather than spinning: each attempt gives the event loop 700 ms.
     if (navigator->currentDocument() && attemptsLeft > 0) {
-        if (KisDocument *document = navigator->currentDocument()) {
-            /// Its ink was written just before this was called; leaving it modified would make
-            /// Krita ask whether to save it while the close is already under way.
-            document->setModified(false);
+        /// WHAT IS STILL UNSAVED IS WRITTEN HERE, before the document is allowed to close.
+        ///
+        /// This used to clear the modified flag and leave it at that, with a comment saying the ink
+        /// had been written already. It had not: the view's own pre-close handler asks
+        /// prepareForClose(), sees a clean document and returns without touching the notebook, so
+        /// importing straight after drawing silently dropped the stroke. The gate is the
+        /// navigator's own -- every page the open document holds, waited for -- and a write that
+        /// cannot be made REFUSES the open and leaves the notebook where it is, which is the one
+        /// outcome that cannot lose ink. With nothing unsaved the gate is not asked at all, so a
+        /// clean notebook still closes as cheaply as it did.
+        KisDocument *document = navigator->currentDocument();
+        if (document->isModified()) {
+            QString saveWhy;
+            if (!navigator->prepareForNotebookChange(&saveWhy)) {
+                say(QStringLiteral("refusing to replace the open notebook: it could not be written "
+                                   "(%1)").arg(saveWhy));
+                QMessageBox::warning(nullptr, i18n("Import PDF as notebook"),
+                                     i18n("The notebook that is open could not be written, so it was "
+                                          "left as it is and %1 was not opened: %2", pdfPath, saveWhy));
+                return;
+            }
         }
         if (KisView *view = navigator->currentView()) {
             view->closeView();
@@ -522,10 +540,22 @@ void openProjectDirReplacing(const QString &projectDir, int attemptsLeft,
     }
 
     if (navigator->currentDocument() && attemptsLeft > 0) {
-        if (KisDocument *document = navigator->currentDocument()) {
-            /// Its ink was written by whoever asked for this open; leaving it modified would have
-            /// Krita ask whether to save it while the close is already under way.
-            document->setModified(false);
+        /// The same write-before-close gate openNotebookReplacing() uses, and for the same reason:
+        /// the ops paths run prepareForNotebookChange() before they ask for an open, but Recent
+        /// notebooks and the Start screen come straight here, and clearing the modified flag
+        /// without writing is how a notebook closed on ink that had never reached disk.
+        KisDocument *document = navigator->currentDocument();
+        if (document->isModified()) {
+            QString saveWhy;
+            if (!navigator->prepareForNotebookChange(&saveWhy)) {
+                say(QStringLiteral("refusing to replace the open notebook: it could not be written "
+                                   "(%1)").arg(saveWhy));
+                QMessageBox::warning(nullptr, i18n("Open a notebook"),
+                                     i18n("The notebook that is open could not be written, so it was "
+                                          "left as it is and %1 was not opened: %2",
+                                          projectDir, saveWhy));
+                return;
+            }
         }
         if (KisView *view = navigator->currentView()) {
             view->closeView();
@@ -2285,6 +2315,363 @@ void addStripPagesMenu(QMenu *menu, const std::function<void(int)> &applyPages)
     refresh();
 }
 
+
+/// The page-loading trigger's two sentences, on every entry of its menus and in its dialogs: what
+/// the settle delay changes and what the reading share changes.
+QString settleDelayCaveat()
+{
+    return i18n(
+        "How long the page under the middle of the viewport has to stay there before the strip turns "
+        "to it.\n\n"
+        "A longer wait means a burst of scrolling does not drag the strip through every page it "
+        "passes: the candidate page is reset every time a different page comes under the middle, so "
+        "only the page the scrolling RESTS on is opened, which is fewer writes and less churn. A "
+        "shorter one means the strip follows your finger.\n\n"
+        "Zero is allowed: the strip then turns on the first 150 ms tick after the page under the "
+        "middle changes. There is no upper limit, because no value breaks anything -- a wait so long "
+        "that it never fires is the same thing as turning \"Turn pages by panning\" off, and that "
+        "switch is the honest way to say it.");
+}
+
+QString readingShareCaveat()
+{
+    return i18n(
+        "How much of the viewport height the active page takes when the strip is fitted. Three fifths "
+        "(60%) is what the notebook has always used.\n\n"
+        "It is deliberately not full screen: a page fitted exactly filled the viewport and the page "
+        "that comes next was then not on screen at all -- \"even at page three you cannot see "
+        "four\". A smaller share shows more of the next and previous pages, and less scrolling turns "
+        "the reading page; a larger one fills more of the screen and needs more scrolling to change "
+        "it.\n\n"
+        "Held between 1% and 100%: a share of zero is a page with no height, and above 100% the page "
+        "is taller than the viewport, so the neighbour this rule exists to show is gone again.");
+}
+
+/// What a settle delay buys, said the same way in every label: short is "follows your finger" and
+/// long is "a burst settles before anything turns". A function rather than a chain in the lambda so
+/// the preset and a typed value are described by the same rule.
+QString settleDelayMeaning(int milliseconds)
+{
+    if (milliseconds <= 0) {
+        return i18n("turn on the next tick");
+    }
+    if (milliseconds <= 150) {
+        return i18n("follows your finger");
+    }
+    if (milliseconds <= 300) {
+        return i18n("a short beat");
+    }
+    if (milliseconds <= 450) {
+        return i18n("today's value: a burst settles first");
+    }
+    return i18n("only a deliberate pause turns");
+}
+
+/// The typed settle delay, in milliseconds.
+///
+/// No maximum: the declaration of scrollSettleMs() says why -- a value that never fires is the
+/// switch's job to say, not a ceiling's. The step is 50 ms because that is a visible change to a
+/// 450 ms pause and still fine enough for a tablet's +/- buttons.
+///
+/// No Q_OBJECT: it has no signals or slots of its own, so it needs no moc.
+class PdfSettleDelayDialog : public QDialog
+{
+public:
+    PdfSettleDelayDialog(int current, QWidget *parent)
+        : QDialog(parent)
+    {
+        setWindowTitle(i18n("Turn after a scroll"));
+
+        auto *intro = new QLabel(i18n("How long the view has to rest on a page before the strip turns "
+                                      "to it, in milliseconds:"), this);
+        intro->setWordWrap(true);
+
+        m_value = new QSpinBox(this);
+        m_value->setObjectName(QStringLiteral("pdfio_scroll_settle_value"));
+        m_value->setRange(0, std::numeric_limits<int>::max());
+        m_value->setSuffix(QStringLiteral(" ms"));
+        m_value->setSingleStep(50);
+        m_value->setValue(qMax(0, current));
+        m_value->setToolTip(settleDelayCaveat());
+
+        auto *sentences = new QLabel(settleDelayCaveat(), this);
+        sentences->setWordWrap(true);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+        auto *layout = new QVBoxLayout(this);
+        layout->addWidget(intro);
+        layout->addWidget(m_value);
+        layout->addWidget(sentences);
+        layout->addWidget(buttons);
+    }
+
+    int milliseconds() const { return m_value->value(); }
+
+private:
+    QSpinBox *m_value = nullptr;
+};
+
+/// What a reading share buys, in the words a menu can carry.
+QString readingShareMeaning(int percent)
+{
+    if (percent <= 40) {
+        return i18n("shows the most of the neighbours");
+    }
+    if (percent <= 50) {
+        return i18n("half the height, half for the neighbours");
+    }
+    if (percent <= 60) {
+        return i18n("today's: three fifths");
+    }
+    if (percent < 100) {
+        return i18n("a bigger page, turns after more scrolling");
+    }
+    return i18n("full screen: the next page is off screen");
+}
+
+/// The typed reading share, in percent, with what it leaves for the pages either side under it.
+///
+/// No Q_OBJECT: it has no signals or slots of its own, so it needs no moc.
+class PdfReadingShareDialog : public QDialog
+{
+public:
+    PdfReadingShareDialog(int current, QWidget *parent)
+        : QDialog(parent)
+    {
+        setWindowTitle(i18n("Reading page share"));
+
+        auto *intro = new QLabel(i18n("How much of the viewport height the active page takes when the "
+                                      "strip is fitted, in percent:"), this);
+        intro->setWordWrap(true);
+
+        m_value = new QSpinBox(this);
+        m_value->setObjectName(QStringLiteral("pdfio_reading_share_value"));
+        /// The range the setter holds a typed value to, asked of the navigator rather than written
+        /// down again here, so the spin box cannot offer what the setter would refuse.
+        m_value->setRange(PdfPageNavigator::minReadingSharePercent(),
+                          PdfPageNavigator::maxReadingSharePercent());
+        m_value->setSuffix(QStringLiteral(" %"));
+        m_value->setSingleStep(5);
+        m_value->setValue(qBound(PdfPageNavigator::minReadingSharePercent(), current,
+                                 PdfPageNavigator::maxReadingSharePercent()));
+        m_value->setToolTip(readingShareCaveat());
+
+        m_leaves = new QLabel(this);
+        m_leaves->setObjectName(QStringLiteral("pdfio_reading_share_leaves"));
+        m_leaves->setWordWrap(true);
+
+        auto *sentences = new QLabel(readingShareCaveat(), this);
+        sentences->setWordWrap(true);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+        auto *layout = new QVBoxLayout(this);
+        layout->addWidget(intro);
+        layout->addWidget(m_value);
+        layout->addWidget(m_leaves);
+        layout->addWidget(sentences);
+        layout->addWidget(buttons);
+
+        const auto update = [this]() {
+            const int share = m_value->value();
+            m_leaves->setText(i18n("The page takes %1% of the height and %2% is left for the pages "
+                                   "either side of it.", share, 100 - share));
+        };
+        QObject::connect(m_value, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                         [update](int) { update(); });
+        update();
+    }
+
+    int percent() const { return m_value->value(); }
+
+private:
+    QSpinBox *m_value = nullptr;
+    QLabel *m_leaves = nullptr;
+};
+
+/// How long the strip waits after the view settles on a page before it turns to it: the switch's
+/// own companion, one submenu of presets and a typed value.
+///
+/// The value is in milliseconds; 450 is what the notebook has always used and is the default, so
+/// nobody who does not touch this sees a change. Zero turns on the next 150 ms tick. There is no
+/// maximum: the declaration of PdfPageNavigator::scrollSettleMs() says why.
+void addScrollSettleMenu(QMenu *menu)
+{
+    if (!menu) {
+        return;
+    }
+
+    /// Deduped like the entries around it: registerActions() runs again for a second view and is
+    /// retried while the first screen has no window.
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_scroll_settle_menu"))) {
+        menu->removeAction(previous->menuAction());
+        previous->deleteLater();
+    }
+
+    QMenu *settle = menu->addMenu(i18n("Turn after a scroll"));
+    settle->setObjectName(QStringLiteral("pdfio_scroll_settle_menu"));
+
+    auto *group = new QActionGroup(settle);
+    const auto addPreset = [settle, group](int milliseconds, const QString &name) {
+        QAction *action = settle->addAction(QString());
+        action->setObjectName(name);
+        action->setCheckable(true);
+        action->setData(milliseconds);
+        group->addAction(action);
+        QObject::connect(action, &QAction::triggered, settle, [milliseconds]() {
+            PdfPageNavigator::instance()->setScrollSettleMs(milliseconds);
+        });
+        return action;
+    };
+
+    QAction *immediate = addPreset(0, QStringLiteral("pdfio_scroll_settle_0"));
+    QAction *finger = addPreset(150, QStringLiteral("pdfio_scroll_settle_150"));
+    QAction *beat = addPreset(300, QStringLiteral("pdfio_scroll_settle_300"));
+    QAction *shipped = addPreset(450, QStringLiteral("pdfio_scroll_settle_450"));
+    QAction *pause = addPreset(900, QStringLiteral("pdfio_scroll_settle_900"));
+
+    /// The typed value. Its own action rather than a preset with a sentinel: it is not a delay that
+    /// can be applied, it is a dialog.
+    QAction *custom = settle->addAction(QString());
+    custom->setObjectName(QStringLiteral("pdfio_scroll_settle_custom"));
+    custom->setCheckable(true);
+    custom->setData(-1);
+    group->addAction(custom);
+    QObject::connect(custom, &QAction::triggered, settle, [settle]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        PdfSettleDelayDialog dialog(navigator->scrollSettleMs(), settle->parentWidget());
+        if (dialog.exec() == QDialog::Accepted) {
+            navigator->setScrollSettleMs(dialog.milliseconds());
+        }
+    });
+
+    /// Filled every time the submenu opens: the mark is the navigator's own value and every label
+    /// says what that value buys, because the number alone does not.
+    const auto refresh = [immediate, finger, beat, shipped, pause, custom]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        const int current = navigator->scrollSettleMs();
+        const QString caveat = settleDelayCaveat();
+
+        const auto fill = [current, &caveat](QAction *action) {
+            const int milliseconds = action->data().toInt();
+
+            if (milliseconds < 0) {
+                const bool typed = current != 0 && current != 150 && current != 300 && current != 450
+                    && current != 900;
+                action->setText(typed ? i18n("Custom... (%1 ms)", current) : i18n("Custom..."));
+                action->setToolTip(caveat);
+                action->setChecked(typed);
+                return;
+            }
+
+            action->setText(i18n("%1 ms — %2", milliseconds, settleDelayMeaning(milliseconds)));
+            action->setToolTip(caveat);
+            action->setChecked(milliseconds == current);
+        };
+
+        fill(immediate);
+        fill(finger);
+        fill(beat);
+        fill(shipped);
+        fill(pause);
+        fill(custom);
+    };
+
+    QObject::connect(settle, &QMenu::aboutToShow, settle, refresh);
+    refresh();
+}
+
+/// How much of the viewport the active page takes when the strip is fitted: the three fifths the fit
+/// has always used, as a share the user can move.
+///
+/// Smaller shows more of the neighbours and turns the reading page after less scrolling; 100% fills
+/// the viewport, which is the state the three fifths exists to avoid. The default is 60 and changes
+/// nothing for anyone who does not touch it.
+void addReadingShareMenu(QMenu *menu)
+{
+    if (!menu) {
+        return;
+    }
+
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_reading_share_menu"))) {
+        menu->removeAction(previous->menuAction());
+        previous->deleteLater();
+    }
+
+    QMenu *share = menu->addMenu(i18n("Reading page share"));
+    share->setObjectName(QStringLiteral("pdfio_reading_share_menu"));
+
+    auto *group = new QActionGroup(share);
+    const auto addPreset = [share, group](int percent, const QString &name) {
+        QAction *action = share->addAction(QString());
+        action->setObjectName(name);
+        action->setCheckable(true);
+        action->setData(percent);
+        group->addAction(action);
+        QObject::connect(action, &QAction::triggered, share, [percent]() {
+            PdfPageNavigator::instance()->setReadingSharePercent(percent);
+        });
+        return action;
+    };
+
+    QAction *twoFifths = addPreset(40, QStringLiteral("pdfio_reading_share_40"));
+    QAction *half = addPreset(50, QStringLiteral("pdfio_reading_share_50"));
+    QAction *threeFifths = addPreset(60, QStringLiteral("pdfio_reading_share_60"));
+    QAction *fourFifths = addPreset(80, QStringLiteral("pdfio_reading_share_80"));
+    QAction *full = addPreset(100, QStringLiteral("pdfio_reading_share_100"));
+
+    QAction *custom = share->addAction(QString());
+    custom->setObjectName(QStringLiteral("pdfio_reading_share_custom"));
+    custom->setCheckable(true);
+    custom->setData(-1);
+    group->addAction(custom);
+    QObject::connect(custom, &QAction::triggered, share, [share]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        PdfReadingShareDialog dialog(navigator->readingSharePercent(), share->parentWidget());
+        if (dialog.exec() == QDialog::Accepted) {
+            navigator->setReadingSharePercent(dialog.percent());
+        }
+    });
+
+    const auto refresh = [twoFifths, half, threeFifths, fourFifths, full, custom]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        const int current = navigator->readingSharePercent();
+        const QString caveat = readingShareCaveat();
+
+        const auto fill = [current, &caveat](QAction *action) {
+            const int percent = action->data().toInt();
+
+            if (percent < 0) {
+                const bool typed = current != 40 && current != 50 && current != 60 && current != 80
+                    && current != 100;
+                action->setText(typed ? i18n("Custom... (%1%)", current) : i18n("Custom..."));
+                action->setToolTip(caveat);
+                action->setChecked(typed);
+                return;
+            }
+
+            action->setText(i18n("%1% — %2", percent, readingShareMeaning(percent)));
+            action->setToolTip(caveat);
+            action->setChecked(percent == current);
+        };
+
+        fill(twoFifths);
+        fill(half);
+        fill(threeFifths);
+        fill(fourFifths);
+        fill(full);
+        fill(custom);
+    };
+
+    QObject::connect(share, &QMenu::aboutToShow, share, refresh);
+    refresh();
+}
+
 /// Puts the "Recent notebooks" submenu at the top of \a menu: the entry the user reaches for
 /// first, open document or not. Rebuilt every time it opens, so it is never stale; deduped like the
 /// entries around it.
@@ -2803,6 +3190,12 @@ void PdfIoPlugin::registerActions()
                             QTimer::singleShot(0, this, [this, page]() { rebuildForScope(page, 6); });
                         });
     });
+
+    /// The page-loading trigger, beside the two strip controls: WHEN the follow is allowed to turn
+    /// and how much of a page is on screen when the strip is fitted. One addXxxMenu() each and one
+    /// line each here, so a later setting cannot collide with either by editing a shared block.
+    addScrollSettleMenu(menu);
+    addReadingShareMenu(menu);
 
     /// A switch rather than a plain action: turning pages by panning is the same gesture as
     /// looking at the bottom of a page, and whoever reads that way will want it off.
