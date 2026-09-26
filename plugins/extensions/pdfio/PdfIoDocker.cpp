@@ -364,6 +364,11 @@ void PdfIoDocker::updateThumbnail(int index)
                                   .filePath(navigator->manifest().pages.at(index).thumbFile);
     const QPixmap pixmap(thumbPath);
     if (pixmap.isNull()) {
+        /// The preview is gone rather than late: a turn or a notebook change drops it, and the
+        /// next save writes a new one. Left as it was, the item keeps the picture of the page as
+        /// it used to be -- which is how a page that was turned went on showing its old preview
+        /// and looked like the wrong page in the list.
+        m_pages->item(index)->setIcon(QIcon());
         return;
     }
 
