@@ -13,8 +13,10 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
+#include <QPolygonF>
 #include <QSaveFile>
 #include <QStringList>
+#include <QTransform>
 #include <QtMath>
 
 namespace {
@@ -134,24 +136,32 @@ QString PdfSessionManifest::displayName() const
 
 QSizeF PdfPageRecord::displaySizePt() const
 {
-    /// A right angle swaps the sheet's sides exactly, and that is worth keeping exact: the strip
-    /// layout, the page image, the artifact and the exporter all compare sizes, and a quarter turn
-    /// that came back as 595.0000000000001 would not match the page it describes. sizePt itself
-    /// stays what the file declares, so the record survives a renderer change.
-    if (extraRotation == 0 || extraRotation == 180) {
-        return sizePt;
+    /// sizePt itself stays what the file declares, so the record survives a renderer change.
+    return turnedSize(sizePt, extraRotation);
+}
+
+QSizeF PdfPageRecord::turnedSize(const QSizeF &size, int degrees)
+{
+    const int turn = ((degrees % 360) + 360) % 360;
+
+    /// A right angle is exact and has to stay exact: the strip layout, the page image, the artifact
+    /// and the exporter all compare sizes, and a quarter turn that came back as 595.0000000000001
+    /// would not match the page it describes.
+    if (turn == 0 || turn == 180) {
+        return size;
     }
-    if (extraRotation == 90 || extraRotation == 270) {
-        return QSizeF(sizePt.height(), sizePt.width());
+    if (turn == 90 || turn == 270) {
+        return QSizeF(size.height(), size.width());
     }
 
-    /// Any other angle shows the whole sheet inside the rectangle that holds it when it is turned,
-    /// which is the rectangle the renderer turns the paper into and the artifact is saved in.
-    const qreal radians = qDegreesToRadians(qreal(extraRotation));
-    const qreal cosine = qAbs(qCos(radians));
-    const qreal sine = qAbs(qSin(radians));
-    return QSizeF(sizePt.width() * cosine + sizePt.height() * sine,
-                  sizePt.width() * sine + sizePt.height() * cosine);
+    /// Any other angle is the rectangle the sheet's four corners land in, taken from the corners
+    /// themselves rather than from |cos| and |sin|: the same number for a plain turn, and the shape
+    /// that stays right the moment a page is placed rather than only turned -- an offset, a scale or
+    /// a second transform of any kind moves the extremes, and the box is whatever they came to.
+    QPolygonF corners;
+    corners << QPointF(0, 0) << QPointF(size.width(), 0) << QPointF(size.width(), size.height())
+            << QPointF(0, size.height());
+    return QTransform().rotate(turn).map(corners).boundingRect().size();
 }
 
 int PdfSessionManifest::sourceCount() const

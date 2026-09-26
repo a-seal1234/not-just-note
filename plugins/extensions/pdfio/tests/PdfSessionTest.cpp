@@ -607,6 +607,25 @@ void PdfSessionTest::testDisplaySizeFollowsTheNotebooksOwnRotation()
     QCOMPARE(qRound(atAnAngle.height()), 1016);
     QVERIFY(atAnAngle.width() > page.sizePt.width() && atAnAngle.height() > page.sizePt.height());
 
+    /// The box is the shape of the turn and not of the arithmetic that found it: half a turn is the
+    /// same box, a right angle on top of an angle is that box with its sides swapped, and the record
+    /// answers with exactly the box this helper gives rather than a second computation of it. A page
+    /// whose size moved with the way the box is worked out would fail here.
+    for (int angle : {10, 37, 120, 200}) {
+        const QSizeF box = PdfPageRecord::turnedSize(QSizeF(595, 842), angle);
+        const QSizeF half = PdfPageRecord::turnedSize(QSizeF(595, 842), angle + 180);
+        QCOMPARE(qRound(half.width()), qRound(box.width()));
+        QCOMPARE(qRound(half.height()), qRound(box.height()));
+
+        const QSizeF plusRightAngle = PdfPageRecord::turnedSize(QSizeF(595, 842), angle + 90);
+        QVERIFY(qAbs(qRound(plusRightAngle.width()) - qRound(box.height())) <= 1);
+        QVERIFY(qAbs(qRound(plusRightAngle.height()) - qRound(box.width())) <= 1);
+
+        page.extraRotation = angle;
+        QVERIFY(qAbs(qRound(page.displaySizePt().width()) - qRound(box.width())) <= 1);
+        QVERIFY(qAbs(qRound(page.displaySizePt().height()) - qRound(box.height())) <= 1);
+    }
+
     /// Any angle in range is a manifest this code accepts -- a page can be set down at 37 degrees --
     /// and one it records survives being written and read back, which is the whole point of storing
     /// an angle rather than turning the paper and forgetting how.

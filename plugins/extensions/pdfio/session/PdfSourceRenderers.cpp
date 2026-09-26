@@ -102,8 +102,35 @@ QImage PdfSourceRenderers::turnedForDisplay(const QImage &rendered, int extraRot
     /// about which way is clockwise.
     const int turn = ((extraRotation % 360) + 360) % 360;
     const bool rightAngle = turn % 90 == 0;
-    return rendered.transformed(QTransform().rotate(extraRotation),
-                                rightAngle ? Qt::FastTransformation : Qt::SmoothTransformation);
+    const Qt::TransformationMode mode =
+        rightAngle ? Qt::FastTransformation : Qt::SmoothTransformation;
+
+    /// A turn that is not a right angle exposes corners the sheet never covered, and transformed()
+    /// fills those with zero. In an opaque format zero is BLACK -- a page set down at an angle would
+    /// come back with black triangles at its corners instead of the nothing that is really there.
+    /// Given an alpha channel first, so the paper's corners are as empty as the artifact's, which is
+    /// turned the same way and does have one. A right angle exposes nothing and is left alone: it
+    /// stays byte-identical, which is what the tests over the transposed page assert.
+    QImage source = rendered;
+    if (!rightAngle && !source.hasAlphaChannel()) {
+        source = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    }
+
+    QImage turned = source.transformed(QTransform().rotate(turn), mode);
+
+    /// The transform sizes the result as the bounding box rounded outwards, which lands a pixel or
+    /// two past the box the record, the layout, the artifact and the exporter all measure. Rescaled
+    /// to that box rather than left as it comes: a raster 2729 wide in a slot 2728 wide is drawn
+    /// past its own rectangle, and every later reader of the size would have to know which is which.
+    /// A right angle is already exact and is left alone -- byte-identical, which is what the tests
+    /// over the transposed page assert.
+    const QSizeF box = PdfPageRecord::turnedSize(QSizeF(rendered.size()), turn);
+    const QSize wanted(qRound(box.width()), qRound(box.height()));
+    if (!wanted.isEmpty() && turned.size() != wanted) {
+        turned = turned.scaled(wanted, Qt::IgnoreAspectRatio, mode);
+    }
+
+    return turned;
 }
 
 PdfRenderBackend *PdfSourceRenderers::backendForFile(const QString &sourceFile,

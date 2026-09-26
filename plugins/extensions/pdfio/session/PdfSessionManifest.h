@@ -79,6 +79,22 @@ struct PdfPageRecord {
     /// The size the user sees: sizePt with extraRotation applied. A right angle swaps the sides
     /// exactly; any other angle gives the rectangle the turned sheet fits in.
     QSizeF displaySizePt() const;
+
+    /**
+     * The size a \a size rectangle has once it is turned by \a degrees. The same arithmetic as
+     * displaySizePt(), for any rectangle rather than for a page's own sheet.
+     *
+     * Here rather than beside the code that first needed it, because three of them need it and they
+     * have to agree: the record, the artifact the rotator produces, and the raster the renderer
+     * turns. Two spellings of "the box a turned sheet occupies" is how a page ends up a pixel wider
+     * than the rectangle every other part of the notebook measured.
+     *
+     * A whole number of right angles is exact -- sides swapped, or the same sheet back -- because
+     * every later reader compares sizes. Any other angle is the rectangle the four corners land in,
+     * taken from the corners rather than from a closed form: the same answer for a plain turn, and
+     * the one that stays right when a page is placed rather than only turned.
+     */
+    static QSizeF turnedSize(const QSizeF &size, int degrees);
 };
 
 /**

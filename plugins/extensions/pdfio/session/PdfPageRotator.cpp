@@ -10,6 +10,7 @@
 
 #include "session/PdfInkLoader.h"
 #include "session/PdfPageSaver.h"
+#include "session/PdfSessionManifest.h"
 
 #include <QDir>
 #include <QEventLoop>
@@ -107,26 +108,6 @@ bool PdfPageRotator::isRightAngle(int degrees)
     return turn == 0 || turn == 90 || turn == 180 || turn == 270;
 }
 
-/// The bounds a \a size rectangle has once it is turned by \a degrees. The same arithmetic as
-/// PdfPageRecord::displaySizePt(), in pixels rather than points, because this is what the turned
-/// artifact has to measure for its ink to be lying on the page it was drawn on.
-QSize turnedSizeOf(const QSize &size, int degrees)
-{
-    const int turn = ((degrees % 360) + 360) % 360;
-    if (turn == 0 || turn == 180) {
-        return size;
-    }
-    if (turn == 90 || turn == 270) {
-        return QSize(size.height(), size.width());
-    }
-
-    const qreal radians = qDegreesToRadians(qreal(turn));
-    const qreal cosine = qAbs(qCos(radians));
-    const qreal sine = qAbs(qSin(radians));
-    return QSize(qRound(size.width() * cosine + size.height() * sine),
-                 qRound(size.width() * sine + size.height() * cosine));
-}
-
 bool PdfPageRotator::rotateInto(const QString &sourceKra, const QString &destinationKra,
                                 int degrees, QString *why)
 {
@@ -180,7 +161,11 @@ bool PdfPageRotator::rotateInto(const QString &sourceKra, const QString &destina
     /// correct, and was refused as "a turn that did not happen" while a quarter turn was the only
     /// turn there was.
     const QSize turned = image->bounds().size();
-    const QSize expected = turnedSizeOf(pageSize, degrees);
+    /// The box the record, the layout, the renderer and this all have to agree about, from the one
+    /// place that computes it: the artifact is in pixels, the record is in points, and two spellings
+    /// of the arithmetic would drift by the rounding of a dpi.
+    const QSizeF expectedBox = PdfPageRecord::turnedSize(QSizeF(pageSize), degrees);
+    const QSize expected(qRound(expectedBox.width()), qRound(expectedBox.height()));
     const auto closeEnough = [](int a, int b) { return qAbs(a - b) <= 1; };
     if (turned.isEmpty() || !closeEnough(turned.width(), expected.width())
         || !closeEnough(turned.height(), expected.height())) {

@@ -7,6 +7,7 @@
 #include "backends/poppler/PopplerRenderBackend.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
+#include "session/PdfSourceRenderers.h"
 
 #include <kis_group_layer.h>
 #include <kis_image.h>
@@ -27,6 +28,10 @@ private Q_SLOTS:
     void testPageImageStructure();
     void testRotatedPageUsesItsDisplayedSize();
     void testFailsWithoutGeometry();
+
+    /// A page set down at an angle has nothing at its corners, rather than the black an opaque
+    /// render comes back with when the turn exposes the pixels around it.
+    void testAnAngledPageHasEmptyCorners();
 
 private:
     QString fixturePath(const QString &name) const
@@ -127,6 +132,41 @@ void PdfProjectBuilderTest::testFailsWithoutGeometry()
     const KisImageSP image = PdfProjectBuilder::buildPageImage(broken, backend, 72.0, &why);
     QVERIFY(!image);
     QVERIFY(!why.isEmpty());
+}
+
+/**
+ * The corners of a turned page are empty, not black.
+ *
+ * A PDF page is rendered opaque -- there is no alpha in the source -- and QImage::transformed()
+ * fills whatever a turn exposes with zero. In an opaque format zero is BLACK, so a page set down at
+ * an angle would have come back with black triangles around the sheet. Given an alpha channel first,
+ * the corners are the nothing that is really there, which is also what the artifact's own turned
+ * pixels have.
+ *
+ * The right angle is asserted here too, because it is the case that must NOT change: it exposes
+ * nothing, so it stays in the format it came in and is never resampled.
+ */
+void PdfProjectBuilderTest::testAnAngledPageHasEmptyCorners()
+{
+    QImage source(200, 400, QImage::Format_RGB32);
+    source.fill(Qt::white);
+
+    /// 200x400 set down at 37 degrees is 400x440 to the nearest pixel: the box, not the sheet.
+    const QImage turned = PdfSourceRenderers::turnedForDisplay(source, 37);
+    QVERIFY(!turned.isNull());
+    QCOMPARE(turned.size(), QSize(400, 440));
+    QVERIFY2(turned.hasAlphaChannel(), "an angled page has to be able to be empty at its corners");
+
+    /// Two corners the sheet no longer covers, and the middle of the sheet, which it still does.
+    QCOMPARE(qAlpha(turned.pixel(turned.width() - 1, 0)), 0);
+    QCOMPARE(qAlpha(turned.pixel(0, turned.height() - 1)), 0);
+    QCOMPARE(qAlpha(turned.pixel(turned.width() / 2, turned.height() / 2)), 255);
+
+    /// A right angle exposes nothing: the same transpose as before, in the format it came in.
+    const QImage rightAngle = PdfSourceRenderers::turnedForDisplay(source, 90);
+    QCOMPARE(rightAngle.size(), QSize(400, 200));
+    QCOMPARE(rightAngle.format(), source.format());
+    QCOMPARE(qAlpha(rightAngle.pixel(200, 100)), 255);
 }
 
 QTEST_MAIN(PdfProjectBuilderTest)
