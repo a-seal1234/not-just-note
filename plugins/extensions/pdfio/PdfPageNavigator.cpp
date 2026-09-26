@@ -1023,12 +1023,18 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         return false;
     }
 
-    /// Only if the image would come out the same size, which it does whenever every slot is the
-    /// same cell. Otherwise the document really does have to be built again.
-    if (target.imageSize() != QSize(m_document->image()->width(), m_document->image()->height())) {
-        fail(why, QStringLiteral("the new window is a different size"));
-        return false;
-    }
+    /// The size the window arriving needs, and the size the document has now. They differ whenever
+    /// the pages on screen change size -- a notebook of mixed sizes, or a page the notebook has
+    /// turned by a free angle -- and the document is RESIZED to the target below rather than the
+    /// roll being refused. The refusal used to hand the move to showPage(), which then built the
+    /// whole document and view again: that is the cost a window move must not pay, and it is what
+    /// the layout's constant size existed to avoid. The layout is now the size of the window that
+    /// is up (see PdfStripLayout::forWindow), so the two are allowed to differ here.
+    ///
+    /// A notebook whose pages are all one size never differs, which is the common case and the one
+    /// that must stay exactly as fast as it is: nothing below runs for it.
+    const QSize targetSize = target.imageSize();
+    const QSize sizeNow(m_document->image()->width(), m_document->image()->height());
     if (m_stripPaper.size() != target.slots().size()) {
         fail(why, QStringLiteral("the strip does not have the slots it should"));
         return false;
@@ -1156,6 +1162,46 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
                                  "the strip is unchanged"));
         say(QStringLiteral("strip: roll refused: the document is not the one this roll started for"));
         return false;
+    }
+
+    /// The document is made the size of the window that is arriving, when it is not already.
+    ///
+    /// Shrinking is cropImage() and not resizeImage() on purpose: cropImage is the one that DROPS
+    /// the pixels outside the new rectangle, and those pixels are the memory the user watched
+    /// climb. resizeImage() keeps every pixel it had, which is right for a pure growth and wrong
+    /// here. Nothing is lost that the repaint below does not put back out of the artifacts: after a
+    /// roll, nothing on screen comes from before it.
+    if (targetSize != sizeNow) {
+        say(QStringLiteral("strip: the window is %1x%2, not %3x%4; resizing the document")
+                .arg(targetSize.width()).arg(targetSize.height())
+                .arg(sizeNow.width()).arg(sizeNow.height()));
+
+        KisImageSP image = m_document->image();
+        if (targetSize.width() < sizeNow.width() || targetSize.height() < sizeNow.height()) {
+            image->cropImage(QRect(QPoint(0, 0), targetSize));
+        } else {
+            image->resizeImage(QRect(QPoint(0, 0), targetSize));
+        }
+
+        /// Both are asynchronous -- the operation runs on the image's own scheduler -- and the
+        /// repaint below must not write into a layer that is still being resized, so the wait is
+        /// part of the operation. It waits inside an event loop, and anything the application
+        /// queued can run there: the document is asked about again afterwards, exactly as it is
+        /// above.
+        image->waitForDone();
+        if (documentGoneAfterWritesForTests() || m_document.data() != documentThisRollIsFor
+            || !m_document || !m_document->image()) {
+            m_savingPages = wasSaving;
+            fail(why, QStringLiteral("the document went away while the strip was being resized; "
+                                     "the strip is unchanged"));
+            say(QStringLiteral("strip: roll refused: the document went away during the resize"));
+            return false;
+        }
+
+        /// Nothing else has to be repainted for the new size: there is no desk layer any more
+        /// (PdfStripBuilder makes each slot's band carry the colour), and the repaint below fills
+        /// every slot's paper over its cell -- and the cells tile the image the window arrives with,
+        /// so every row of the new size is covered by a band.
     }
 
     /// Phase two: redraw the WHOLE window from what was just written -- every slot, paper and

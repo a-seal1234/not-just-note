@@ -21,7 +21,7 @@ class PdfStripLayoutTest : public QObject
 private Q_SLOTS:
     void testWindowIsCentred();
     void testWindowClampsAtTheEnds();
-    void testImageSizeDoesNotDependOnTheActivePage();
+    void testAWindowIsSizedForThePagesInIt();
     void testSlotsHoldWholePages();
     void testPageAtDistinguishesGapsFromPages();
     void testEvenScopeIsMadeOdd();
@@ -29,7 +29,7 @@ private Q_SLOTS:
     void testRefusesNonsense();
     void testCellBandsCoverTheirPagesAndTheImage();
     void testAngledPageFillsItsBoundingBox();
-    void testAngledPageDoesNotChangeTheImage();
+    void testTheTiltedPagesWindowIsTheBiggerOne();
     void testRightAnglesAreUnchanged();
     void testAWindowMoveLeavesBandsOutsideTheNewCells();
 
@@ -103,6 +103,32 @@ private:
         return manifest;
     }
 
+    /// The reported notebook's shape, smaller: A4 pages, then the wide slides a merged deck brought
+    /// in, then A4-shaped pages again, so a window can hold one kind or the other. Two sizes rather
+    /// than the reported five, because two are enough to show which one a window is sized for.
+    static PdfSessionManifest mixedDeckBook()
+    {
+        const QSizeF sizes[] = { QSizeF(612, 792),   QSizeF(612, 792),   QSizeF(612, 792),
+                                 QSizeF(1672, 941),  QSizeF(1672, 941),  QSizeF(1672, 941),
+                                 QSizeF(1536, 1024), QSizeF(595, 842),   QSizeF(595, 842),
+                                 QSizeF(595, 842) };
+
+        PdfSessionManifest manifest;
+        manifest.sourceFile = QStringLiteral("fixture.pdf");
+        manifest.sourceSha256 = QByteArrayLiteral("0000");
+        manifest.sourceByteSize = 1;
+
+        for (int i = 0; i < 10; ++i) {
+            PdfPageRecord page;
+            page.index = i;
+            page.sizePt = sizes[i];
+            page.kraFile = QStringLiteral("pages/p%1.kra").arg(i + 1, 4, 10, QLatin1Char('0'));
+            page.thumbFile = QStringLiteral("thumbs/p%1.png").arg(i + 1, 4, 10, QLatin1Char('0'));
+            manifest.pages.append(page);
+        }
+        return manifest;
+    }
+
     /// One page of \a size turned by \a turn, alone: the plainest possible question.
     static PdfSessionManifest onePageManifest(const QSizeF &size, int turn)
     {
@@ -168,15 +194,61 @@ void PdfStripLayoutTest::testWindowClampsAtTheEnds()
     QCOMPARE(last.slots().at(last.activeSlot()).page, 2);
 }
 
-void PdfStripLayoutTest::testImageSizeDoesNotDependOnTheActivePage()
+/**
+ * A window is the size the pages IN IT need.
+ *
+ * This replaces a test that asserted the opposite: every window of one scope used to be the same
+ * size -- the widest page of the whole notebook by the tallest window of the whole notebook -- so
+ * that a window move never had to resize the document. The reported notebook is 38 pages of five
+ * sizes, one of them a merged deck 1672 pt wide, and a window of A4 pages was a 4644x14432
+ * document: 1.6 GiB by Krita's own report, 2.04 GB of PSS measured, and climbing while scrolling
+ * because every roll repainted every slot into those layers. The roll resizes now, so the size is
+ * the window's own.
+ */
+void PdfStripLayoutTest::testAWindowIsSizedForThePagesInIt()
 {
-    const PdfStripLayout a = PdfStripLayout::forWindow(manifest(), 0, 3, 200.0);
-    const PdfStripLayout b = PdfStripLayout::forWindow(manifest(), 1, 3, 200.0);
-    const PdfStripLayout c = PdfStripLayout::forWindow(manifest(), 2, 3, 200.0);
+    const PdfSessionManifest manifest = mixedDeckBook();
+    const int scope = 3;
+    const int gap = 112;
 
-    QVERIFY(!a.imageSize().isEmpty());
-    QCOMPARE(a.imageSize(), b.imageSize());
-    QCOMPARE(b.imageSize(), c.imageSize());
+    const PdfStripLayout a4 = PdfStripLayout::forWindow(manifest, 1, scope, 200.0);
+    const PdfStripLayout wide = PdfStripLayout::forWindow(manifest, 4, scope, 200.0);
+    QVERIFY(a4.isValid());
+    QVERIFY(wide.isValid());
+
+    /// One window of A4 pages and one of the wide slides, and neither holds the other's kind.
+    QCOMPARE(a4.slots().at(0).page, 0);
+    QVERIFY(a4.slots().last().page < 3);
+    QCOMPARE(wide.slots().at(0).page, 3);
+    QCOMPARE(wide.slots().last().page, 5);
+
+    const int a4Width = qRound(612.0 * 200.0 / 72.0);
+    const int a4Height = qRound(792.0 * 200.0 / 72.0);
+    const int wideWidth = qRound(1672.0 * 200.0 / 72.0);
+    const int wideHeight = qRound(941.0 * 200.0 / 72.0);
+
+    QCOMPARE(a4.imageSize().width(), a4Width);
+    QCOMPARE(wide.imageSize().width(), wideWidth);
+    QVERIFY2(a4.imageSize().width() < wide.imageSize().width(),
+             "the A4 window is still paying for the widest page in the notebook");
+
+    /// The height is that window's own packed height plus the one gap of slack the last cell
+    /// absorbs, so there is no desk beyond the last page's band: the cells still end the image.
+    QCOMPARE(a4.imageSize().height(), scope * (a4Height + gap) + gap);
+    QCOMPARE(wide.imageSize().height(), scope * (wideHeight + gap) + gap);
+    QCOMPARE(a4.slots().last().cell.bottom() + 1, a4.imageSize().height());
+    QCOMPARE(wide.slots().last().cell.bottom() + 1, wide.imageSize().height());
+
+    /// And the pages are centred in their own column, which is now the column this window needs.
+    QCOMPARE(a4.slots().at(0).rect.x(), 0);
+    QCOMPARE(a4.slots().at(0).rect.width(), a4Width);
+    QCOMPARE(wide.slots().at(0).rect.x(), 0);
+    QCOMPARE(wide.slots().at(0).rect.width(), wideWidth);
+
+    /// What the old rule cost, said as a number: the A4 window was as wide as the slide and as tall
+    /// as the window holding the tallest page (1536x1024 pt), which is none of the pages in it.
+    QVERIFY2(a4.imageSize().height() < scope * (qRound(1024.0 * 200.0 / 72.0) + gap) + gap,
+             "the A4 window is still as tall as the tallest window in the notebook");
 }
 
 void PdfStripLayoutTest::testSlotsHoldWholePages()
@@ -335,30 +407,36 @@ void PdfStripLayoutTest::testAngledPageFillsItsBoundingBox()
 }
 
 /**
- * The invariant that makes the strip cheap survives the angle: the image is as tall as the tallest
- * window of the scope whatever page is active, so rolling the window still repaints a slot rather
- * than resizing the document. An angled page is taller than both its neighbours, which is exactly
- * the case where a per-window height would move.
+ * The window that holds the tilted page is the big one, and the window that does not is A4.
+ *
+ * This replaces a test that asserted the opposite -- that the image stayed the same size whatever
+ * page was active, so the angled page's box was paid for by every window. That is the rule the
+ * reported 4644x14432 document came from, and the roll resizes now, so a window is sized for what
+ * it holds: A4 where the pages are A4, the tilted box where the tilted page is.
  */
-void PdfStripLayoutTest::testAngledPageDoesNotChangeTheImage()
+void PdfStripLayoutTest::testTheTiltedPagesWindowIsTheBiggerOne()
 {
-    const PdfSessionManifest manifest = angledManifest();
-    const PdfStripLayout a = PdfStripLayout::forWindow(manifest, 0, 3, 200.0);
-    const PdfStripLayout b = PdfStripLayout::forWindow(manifest, 1, 3, 200.0);
-    const PdfStripLayout c = PdfStripLayout::forWindow(manifest, 2, 3, 200.0);
+    const PdfSessionManifest manifest = letterBook(18, 0, 221);
+    const int scope = 5;
+    const int gap = 112;
 
-    QVERIFY(a.isValid());
-    QCOMPARE(a.imageSize(), b.imageSize());
-    QCOMPARE(b.imageSize(), c.imageSize());
+    const PdfStripLayout holding = PdfStripLayout::forWindow(manifest, 0, scope, 200.0);
+    const PdfStripLayout a4 = PdfStripLayout::forWindow(manifest, 8, scope, 200.0);
+    QVERIFY(holding.isValid());
+    QVERIFY(a4.isValid());
 
-    /// The angled page is the tall one, and the image has to be at least as tall as it in every
-    /// window -- not only in the window that happens to hold it.
-    const QList<PdfStripLayout::Slot> slots = b.slots();
-    QVERIFY(slots.at(1).rect.height() > slots.at(0).rect.height());
-    QVERIFY(slots.at(1).rect.height() > slots.at(2).rect.height());
-    QVERIFY(b.imageSize().height() >= slots.at(1).rect.height());
-    QVERIFY(a.imageSize().height() >= slots.at(1).rect.height());
-    QVERIFY(QRect(QPoint(0, 0), a.imageSize()).contains(slots.at(1).rect));
+    QCOMPARE(holding.slots().at(0).page, 0);
+    QCOMPARE(a4.slots().at(0).page, 6);
+
+    /// The window that does not hold it is A4 and only A4.
+    QCOMPARE(a4.imageSize().width(), qRound(612.0 * 200.0 / 72.0));
+    QCOMPARE(a4.imageSize().height(), scope * (qRound(792.0 * 200.0 / 72.0) + gap) + gap);
+
+    /// The one that does is bigger in both directions, because the tilted sheet's box is bigger.
+    QVERIFY(holding.imageSize().width() > a4.imageSize().width());
+    QVERIFY(holding.imageSize().height() > a4.imageSize().height());
+    QVERIFY(QRect(QPoint(0, 0), holding.imageSize())
+                .contains(holding.slots().at(0).rect));
 }
 
 /**
@@ -398,10 +476,10 @@ void PdfStripLayoutTest::testRightAnglesAreUnchanged()
  * freely rotated page to one that does not hold it, and back, leaves the top of every slot's old
  * band OUTSIDE the band it owns afterwards.
  *
- * This is why the roll has to clear the paper over the old band as well as the new one. The image
- * is the same size in both windows -- that is what lets the roll run at all, and the reason the
- * layout sizes it from the tallest window of the whole notebook -- so nothing resizes, nothing
- * refuses, and the bands simply do not line up.
+ * This is why the roll has to clear the paper over the old band as well as the new one. The two
+ * windows are now DIFFERENT sizes -- the one holding the tilted page is the bigger one, and the
+ * roll resizes the document between them -- so the bands move as well as the pages: the top of a
+ * slot's old band can end up outside the band it owns afterwards, and that band has to be cleared.
  */
 void PdfStripLayoutTest::testAWindowMoveLeavesBandsOutsideTheNewCells()
 {
@@ -413,12 +491,14 @@ void PdfStripLayoutTest::testAWindowMoveLeavesBandsOutsideTheNewCells()
     QVERIFY(holding.isValid());
     QVERIFY(away.isValid());
 
-    /// The two windows are the user's: the first holds the tilted page, the second does not, and
-    /// the two have to be the same image or the move would be refused instead of made.
+    /// The two windows are the user's: the first holds the tilted page, the second does not. They
+    /// need different sizes, which is the resize the roll now does between them.
     QCOMPARE(holding.slots().at(0).page, 0);
     QCOMPARE(away.slots().at(0).page, 6);
     QVERIFY(holding.slots().at(0).rect.height() > away.slots().at(0).rect.height());
-    QCOMPARE(holding.imageSize(), away.imageSize());
+    QVERIFY2(holding.imageSize().width() > away.imageSize().width()
+                 && holding.imageSize().height() > away.imageSize().height(),
+             "the two windows have to need different sizes or this test says nothing about a resize");
 
     /// And the bands really do not line up: every slot but the first starts lower in the window
     /// holding the tilted page, so the top of its previous band sticks out above the new one.

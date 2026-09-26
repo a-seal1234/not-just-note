@@ -59,52 +59,40 @@ PdfStripLayout PdfStripLayout::forWindow(const PdfSessionManifest &manifest,
     }
     scope = qMin(scope, manifest.pages.size());
 
-    /// The width is the widest page of the notebook, so every page is centred in the same column
-    /// whichever pages the window happens to hold; the heights are collected for the image size
-    /// below, because the pages are packed by their own heights.
-    QList<int> pageHeights;
-    int cellWidth = 0;
-    for (const PdfPageRecord &page : manifest.pages) {
-        const QSize size = pageSizeInPixels(manifest, page, dpi);
-        pageHeights.append(size.height());
-        cellWidth = qMax(cellWidth, size.width());
-    }
-    if (cellWidth <= 0) {
-        return layout;
-    }
-
     const int half = scope / 2;
 
     /// The window is centred on the active page as far as the ends of the notebook allow.
     int first = activePage - half;
     first = qBound(0, first, qMax(0, manifest.pages.size() - scope));
+    const int last = qMin(manifest.pages.size(), first + scope);
 
-    /// The image is as tall as the TALLEST window of this scope, not as this window's own packed
-    /// height.
+    /// The image is the size THIS window needs: the widest page it holds, and its own packed height.
     ///
-    /// Packing the pages by their own heights makes the height of a window depend on which pages
-    /// it holds. If the image followed that, a notebook of mixed page sizes -- the fifty page
-    /// fixture is exactly that, four geometries cycling -- would change the document's size on
-    /// every window move, and the roll, which writes every page the window holds before it moves
-    /// and is the reason a page turn neither rebuilds the document nor loses ink, refuses a window
-    /// of a different size. The tallest window keeps the size constant, so the roll still runs.
-    /// For a notebook whose pages are all one size, which is the common case, every window is that
-    /// tall and this is exactly sum(h_i + SlotGap) + SlotGap.
-    const auto packedHeight = [&pageHeights, scope](int from) {
-        int sum = 0;
-        for (int i = from; i < from + scope; ++i) {
-            sum += pageHeights.at(i);
-        }
-        return sum + scope * SlotGap;
-    };
-    int imageHeight = 0;
-    const int lastFirst = qMax(0, pageHeights.size() - scope);
-    for (int from = 0; from <= lastFirst; ++from) {
-        imageHeight = qMax(imageHeight, packedHeight(from));
+    /// It used to be the widest page of the WHOLE notebook and the tallest window of the whole
+    /// notebook, so that the size would never change and the roll could refuse a differently sized
+    /// window instead of resizing the document. That rule is gone: the window that is up is the only
+    /// one being shown, and paying for the widest page a merged deck brought in made the document --
+    /// and the desk, the paper and every content layer in it -- 4644x14432 px for a window of A4
+    /// pages, measured on the tablet at 1.6 GiB and 2 GB of PSS. The roll resizes the document when
+    /// it moves to a window of another size (PdfPageNavigator::rollToPage), so the size is free to
+    /// be the window's own.
+    ///
+    /// One gap of slack under the last page, on top of the gaps the pages carry, so the last page's
+    /// half-gap band and the bottom edge of the image are not the same line. For a notebook whose
+    /// pages are all one size this is exactly sum(h_i + SlotGap) + SlotGap, which is what it always
+    /// was: the common case does not change size from one window to the next, and so never resizes.
+    QList<QSize> pageSizes;
+    int cellWidth = 0;
+    int imageHeight = SlotGap;
+    for (int page = first; page < last; ++page) {
+        const QSize size = pageSizeInPixels(manifest, manifest.pages.at(page), dpi);
+        pageSizes.append(size);
+        cellWidth = qMax(cellWidth, size.width());
+        imageHeight += size.height() + SlotGap;
     }
-    /// One gap of slack under the tallest window, on top of the gaps the pages carry, so the last
-    /// page's half-gap band and the bottom edge of the image are not the same line.
-    imageHeight += SlotGap;
+    if (cellWidth <= 0 || pageSizes.isEmpty()) {
+        return layout;
+    }
 
     /// Each page is placed by its own height: y_0 = 0 and y_i = y_{i-1} + h_{i-1} + SlotGap.
     ///
@@ -112,30 +100,28 @@ PdfStripLayout PdfStripLayout::forWindow(const PdfSessionManifest &manifest,
     /// so the space between a small page and a large one was SlotGap plus the centring slack of
     /// both -- a small page sat in a hole, which is what the user saw. Packed by their own heights,
     /// every consecutive pair is separated by exactly SlotGap whatever the two pages' sizes are.
+    /// Horizontally the pages are centred in the column the WINDOW needs, which is the widest page
+    /// this window holds.
     const int halfGap = SlotGap / 2;
     int y = 0;
-    for (int i = 0; i < scope; ++i) {
-        const int pageIndex = first + i;
-
+    for (int i = 0; i < pageSizes.size(); ++i) {
         Slot slot;
-        slot.page = pageIndex < manifest.pages.size() ? pageIndex : -1;
+        slot.page = first + i;
 
-        const QSize pageSize = slot.page >= 0
-            ? pageSizeInPixels(manifest, manifest.pages.at(slot.page), dpi)
-            : QSize();
+        const QSize pageSize = pageSizes.at(i);
 
-        /// Centred horizontally, as before. Vertically there is no cell to centre in any more:
-        /// the page sits at the top of its own band, which is what makes the gaps equal.
+        /// Centred horizontally. Vertically there is no cell to centre in: the page sits at the top
+        /// of its own band, which is what makes the gaps equal.
         const int x = (cellWidth - pageSize.width()) / 2;
         slot.rect = QRect(x, y, pageSize.width(), pageSize.height());
 
         /// The band the roll wipes and repaints: the page plus half a gap above and below, so the
         /// bands meet in the middle of every gap. The last band runs to the bottom of the image,
-        /// absorbing the slack a shorter window leaves under the tallest one: the roll clears what
-        /// it repaints band by band, so the bands have to cover every pixel of the image and no
-        /// window may leave stale pixels below its last page.
+        /// absorbing the one gap of slack under it: the roll clears what it repaints band by band,
+        /// so the bands have to cover every pixel of the image and no window may leave stale pixels
+        /// below its last page.
         int cellBottom = y + pageSize.height() + halfGap;
-        if (i == scope - 1) {
+        if (i == pageSizes.size() - 1) {
             cellBottom = imageHeight;
         }
         slot.cell = QRect(0, y - halfGap, cellWidth, cellBottom - (y - halfGap));

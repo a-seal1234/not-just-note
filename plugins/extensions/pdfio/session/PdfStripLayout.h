@@ -22,11 +22,16 @@
  *
  * The strip is vertical and every page is centred in the same column, packed under the page above
  * it by its own height: the space between two pages is exactly the gap whatever their sizes are.
- * The image is as tall as the tallest window of the scope -- not as this window -- so a window move
- * never changes the document's size and rolling the window repaints the slots that changed rather
- * than rebuilding the document, which is what makes a page turn cost a render instead of a
- * document and a view. For a notebook whose pages are all one size, the tallest window is every
- * window and the image is exactly the pages plus one gap each.
+ * The image is the size THIS window needs -- the widest page it holds, and its own packed height --
+ * because that is the only size being shown. It used to be the widest page of the WHOLE notebook
+ * and the tallest window of the whole notebook, so that a window move could never change the
+ * document's size: measured on the tablet, a notebook of 38 pages of five sizes (the widest from a
+ * merged deck) was a 4644x14432 document holding a window of A4 pages, 1.6 GiB, and every roll
+ * repainted every slot into those layers until the application was holding 2 GB. The roll now
+ * RESIZES the document when the window it moves to needs a different size (see
+ * PdfPageNavigator::rollToPage), so the constant size it used to depend on is not needed. For a
+ * notebook whose pages are all one size every window is the same size, which is the common case and
+ * the one that must never resize anything: the image is then exactly the pages plus one gap each.
  *
  * Pages are laid out in page order, so the strip reads downwards, and the window is centred on
  * the active page as far as the ends of the notebook allow.

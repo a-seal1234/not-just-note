@@ -127,6 +127,8 @@ private Q_SLOTS:
     /// A roll whose document goes away between its writes and its redraw refuses cleanly, which is
     /// the state a reload landing inside the write phase's event loops reaches.
     void testARollRefusesWhenItsDocumentGoesAway();
+    /// The other half of the resize: a notebook of one page size must never resize anything.
+    void testARollBetweenSameSizeWindowsDoesNotResize();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -182,9 +184,10 @@ KisPaintLayer *inkLayer(const KisImageSP &image)
 /// The STRIP's ink layer, found the way the plugin itself finds it: by name.
 ///
 /// PdfProjectBuilder::inkStrokeLayer() answers for a page document -- a root whose second layer
-/// is the Ink group -- and a strip image is a Desk, one paper layer per slot, and an Ink group
-/// above all of them with the stroke layer inside it. Asking the page-shaped helper about a strip
-/// image hands back nothing, which is what this test hit on its first run.
+/// is the Ink group -- and a strip image is one paper layer per slot, each carrying the desk colour
+/// over its own band, and an Ink group above all of them with the stroke layer inside it. Asking
+/// the page-shaped helper about a strip image hands back nothing, which is what this test hit on
+/// its first run.
 KisPaintLayer *stripInkLayer(const KisImageSP &image)
 {
     if (!image) {
@@ -1868,13 +1871,17 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     const PdfSessionManifest opened = navigator()->manifest();
     QCOMPARE(opened.pages.at(0).extraRotation, 221);
 
-    /// The window holding the tilted page and the one the user switched to. Same image, different
-    /// bands -- that sameness is what lets the roll run at all, and the difference is the trap.
+    /// The window holding the tilted page and the one the user switched to. They need DIFFERENT
+    /// sizes -- the tilted page's box is the bigger one -- which is what the roll resizes the
+    /// document between, and their bands do not line up either, which is what the rest of this test
+    /// is about.
     const PdfStripLayout holding = PdfStripLayout::forWindow(opened, 0, 5, 200.0);
     const PdfStripLayout away = PdfStripLayout::forWindow(opened, 8, 5, 200.0);
     QVERIFY(holding.isValid());
     QVERIFY(away.isValid());
-    QCOMPARE(holding.imageSize(), away.imageSize());
+    QVERIFY2(holding.imageSize().width() > away.imageSize().width()
+                 && holding.imageSize().height() > away.imageSize().height(),
+             "the two windows have to need different sizes or this test says nothing about a resize");
     QCOMPARE(holding.slots().at(0).page, 0);
     QVERIFY2(holding.slots().at(0).rect.height() > away.slots().at(0).rect.height(),
              "the tilted page is not the tall one, so this test would prove nothing");
@@ -1915,14 +1922,21 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     Q_EMIT strip->sigImageModified();
 
     /// Away: the window moves off the tilted page, writing every page it held -- the inserted image
-    /// among them.
+    /// among them -- and the document SHRINKS to the window it moved to. That shrink is the memory
+    /// the user watched climb: the tilted page's box was in every layer until this happened.
     QVERIFY2(navigator()->showPage(8, &why), qPrintable(why));
     QCOMPARE(navigator()->currentIndex(), 8);
     QVERIFY2(QFileInfo::exists(artifactFor(0)), "the roll did not write the tilted page");
+    QCOMPARE(QSize(navigator()->currentDocument()->image()->width(),
+                   navigator()->currentDocument()->image()->height()),
+             away.imageSize());
 
-    /// And back. This second roll is the one the report is about.
+    /// And back. This second roll is the one the report is about, and it grows the document again.
     QVERIFY2(navigator()->showPage(0, &why), qPrintable(why));
     QCOMPARE(navigator()->currentIndex(), 0);
+    QCOMPARE(QSize(navigator()->currentDocument()->image()->width(),
+                   navigator()->currentDocument()->image()->height()),
+             holding.imageSize());
 
     /// The document is the same one: a roll moves the window, it does not rebuild it. Without this
     /// the assertions below could be reading a freshly built strip and pass without proving
@@ -3224,6 +3238,100 @@ void PdfNavigatorIntegrationTest::testARollRefusesWhenItsDocumentGoesAway()
 
     /// And the tab is closed the way the other tests that leave one open close it, with the queued
     /// work drained on both sides of the close.
+    navigator()->currentDocument()->setModified(false);
+    navigator()->setScope(1);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
+/**
+ * A roll between two windows of the same size resizes nothing.
+ *
+ * This is the common case and the one the roll exists for: a notebook whose pages are all one size
+ * never needs the document resized, and the same-size path must stay exactly as cheap as it was --
+ * the resize is new, and it must not creep into the case that never needed it. The image size and
+ * every layer device's extent have to be identical before and after.
+ */
+void PdfNavigatorIntegrationTest::testARollBetweenSameSizeWindowsDoesNotResize()
+{
+    /// A notebook of one page size, built here rather than taken from a fixture: every fixture with
+    /// enough pages to roll through is a mix of sizes, which is the other half of this test.
+    const QString project = m_dir.filePath(QStringLiteral("roll-same-size-project"));
+    const QString source = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(source), qPrintable(source));
+
+    PopplerRenderBackend backend;
+    QString why;
+    PdfSessionManifest manifest = PdfSession::createProject(project, source, backend, &why);
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    /// Eight letter pages, all out of the fixture's letter page, so nothing but the window can make
+    /// one window a different size from another.
+    manifest.pages.clear();
+    for (int i = 0; i < 8; ++i) {
+        PdfPageRecord page;
+        page.index = 2;
+        page.sizePt = QSizeF(612, 792);
+        page.kraFile = PdfSession::pageFileName(i);
+        page.thumbFile = PdfSession::thumbFileName(i);
+        manifest.pages.append(page);
+    }
+    manifest.refreshNextPageNumber();
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+    QVERIFY2(manifest.writeTo(PdfSession::manifestPath(project), &why), qPrintable(why));
+
+    navigator()->setScope(5);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+    QCOMPARE(navigator()->pageCount(), 8);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    /// The two windows really are the same size, or this test would prove nothing.
+    const PdfStripLayout first = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
+    const PdfStripLayout second = PdfStripLayout::forWindow(navigator()->manifest(), 6, 5, 200.0);
+    QCOMPARE(first.imageSize(), second.imageSize());
+
+    KisDocument *const document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisImageSP strip = document->image();
+    QVERIFY(strip);
+    QCOMPARE(QSize(strip->width(), strip->height()), first.imageSize());
+
+    /// The layer devices as their allocated extents: a crop or a resize changes them, a repaint
+    /// over the same bands does not.
+    const auto deviceSizes = [](const KisImageSP &image) {
+        QList<QSize> sizes;
+        for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+            KisNodeSP child = image->root()->at(i);
+            if (KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(child.data())) {
+                sizes.append(layer->paintDevice()->extent().size());
+            }
+        }
+        return sizes;
+    };
+    const QList<QSize> sizesBefore = deviceSizes(strip);
+
+    /// Page 7 is outside [0..4], so this is a window move and not a turn to a page already in the
+    /// strip.
+    QVERIFY2(navigator()->showPage(6, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 6);
+    QVERIFY(navigator()->currentDocument() == document);
+
+    KisImageSP after = navigator()->currentDocument()->image();
+    QVERIFY(after);
+    QCOMPARE(QSize(after->width(), after->height()), first.imageSize());
+    const QList<QSize> sizesAfter = deviceSizes(after);
+    QVERIFY2(sizesAfter == sizesBefore,
+             qPrintable(QStringLiteral("the layer devices changed size (%1 before, %2 after) with "
+                                       "no size change to make")
+                            .arg(sizesBefore.size()).arg(sizesAfter.size())));
+
+    /// The tab is closed the way the other tests that leave one open close it, with the queued work
+    /// drained on both sides of the close.
     navigator()->currentDocument()->setModified(false);
     navigator()->setScope(1);
     if (KisView *view = navigator()->currentView()) {

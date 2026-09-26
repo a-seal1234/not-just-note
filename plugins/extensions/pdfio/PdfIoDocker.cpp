@@ -278,6 +278,23 @@ void PdfIoDocker::refitCards()
     qWarning() << "pdfio: cards refit for a" << viewportWidth << "px viewport ->" << columns
                << "column(s), icon" << iconSize << "grid" << gridSize;
 
+    /// And every card that is no longer on screen gives its picture back. A card's picture is
+    /// prepared at the size the screen draws it -- 3.6 MB at a 2.5 ratio -- so keeping one for every
+    /// page of a long notebook is a hundred megabytes of pictures nobody is looking at, and scrolling
+    /// through the notebook is what fills that in. The visible cards are asked for again by
+    /// queueThumbnails() the moment they come back, so nothing is lost but the memory.
+    const QRect visible = m_pages->viewport()->rect();
+    for (int i = 0; i < m_pages->count(); ++i) {
+        QListWidgetItem *item = m_pages->item(i);
+        if (!item || i == PdfPageNavigator::instance()->currentIndex()) {
+            continue;
+        }
+        if (m_pages->visualItemRect(item).intersects(visible)) {
+            continue;
+        }
+        item->setData(CardPreviewRole, QVariant());
+    }
+
     /// The thumbnails already on screen were scaled for the size the cards had a moment ago;
     /// re-reading them is what keeps a resize from leaving the old-sized icons behind.
     for (int i = 0; i < m_pages->count(); ++i) {
