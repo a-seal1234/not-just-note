@@ -949,6 +949,81 @@ void mergeNotebookFolder()
     mergeNotebookFrom(picked);
 }
 
+/// Picks a PDF for the screen's insert button and reads what the screen needs: the path and every
+/// page's displayed size, which is what the notebook records.
+bool pickPdfForScreen(PdfNotebookOpsDialog::PdfToAdd *pdf)
+{
+    const QString picked = QFileDialog::getOpenFileName(
+        nullptr, i18n("Insert pages from a PDF"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        i18n("PDF documents (*.pdf)"));
+    if (picked.isEmpty()) {
+        return false;
+    }
+
+    QScopedPointer<PdfRenderBackend> backend(PdfRenderBackend::create());
+    if (!backend || !backend->open(picked)) {
+        say(QStringLiteral("%1 could not be opened as a PDF").arg(picked));
+        QMessageBox::warning(nullptr, i18n("Insert pages from a PDF"),
+                             i18n("%1 could not be opened as a PDF.", picked));
+        return false;
+    }
+
+    pdf->path = picked;
+    pdf->displayedSizes.clear();
+    for (int i = 0; i < backend->pageCount(); ++i) {
+        pdf->displayedSizes.append(backend->pageInfo(i).sizePt);
+    }
+    return !pdf->displayedSizes.isEmpty();
+}
+
+/// Picks a notebook FILE for the screen's merge button and hands over where its files are.
+///
+/// A .pnb is unpacked into a directory of its own under the notebook folder; \a temporary is set to
+/// it so the caller can remove it once Apply has read every file out of it. The merge itself works
+/// on notebook files, and the unpacked copy is only transport.
+bool pickNotebookForScreen(PdfNotebookOpsDialog::NotebookToMerge *notebook, QString *temporary)
+{
+    const QString picked = QFileDialog::getOpenFileName(
+        nullptr, i18n("Merge a notebook in"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        PdfNotebookBundle::fileFilter());
+    if (picked.isEmpty()) {
+        return false;
+    }
+
+    QString why;
+    const PdfNotebookBundle::Info info = PdfNotebookBundle::inspect(picked, &why);
+    if (!info.isValid()) {
+        say(QStringLiteral("that file cannot be merged in: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+        return false;
+    }
+
+    const QString unpacked =
+        QDir(QDir(PdfSession::projectRoot())
+                 .filePath(QStringLiteral(".merging-%1").arg(QCoreApplication::applicationPid())))
+            .filePath(PdfNotebookBundle::extractDirName(info.manifest));
+    QDir(unpacked).removeRecursively();
+    if (!PdfNotebookBundle::extract(picked, unpacked, &why)) {
+        say(QStringLiteral("the notebook file could not be unpacked: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+        return false;
+    }
+
+    notebook->dir = unpacked;
+    notebook->manifest = PdfSession::openProject(unpacked, &why);
+    if (!notebook->manifest.isValid()) {
+        say(QStringLiteral("the unpacked notebook cannot be read: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Merge a notebook in"), why);
+        QDir(unpacked).removeRecursively();
+        return false;
+    }
+
+    *temporary = unpacked;
+    return true;
+}
+
 /// Opens the Notebook ops screen: the notebook's pages as one list, applied as one change.
 ///
 /// The screen reads the list as it is on disk, so the pages that are open are written first -- the
@@ -981,29 +1056,46 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
     }
 
     PdfNotebookOpsDialog dialog(navigator->projectDir(), manifest, navigator->currentIndex());
+
+    /// Insert and merge are edits the screen builds itself: it is handed only the picking and the
+    /// reading, so a PDF added here and a notebook merged in join the same Apply as everything else.
+    PdfNotebookOpsDialog::SourceAdder adder;
+    adder.pickAndRead = [](PdfNotebookOpsDialog::PdfToAdd *pdf) { return pickPdfForScreen(pdf); };
+    adder.askRange = [](int available, int *first, int *count) {
+        return askForPageRange(
+            i18n("Insert pages from a PDF"),
+            i18n("That PDF has %1 page(s). Which of them should be inserted?", available), available,
+            first, count);
+    };
+    dialog.setSourceAdder(adder);
+
+    QString unpackedNotebook;
+    PdfNotebookOpsDialog::NotebookMerger merger;
+    merger.pickNotebook = [&unpackedNotebook](PdfNotebookOpsDialog::NotebookToMerge *notebook) {
+        return pickNotebookForScreen(notebook, &unpackedNotebook);
+    };
+    dialog.setNotebookMerger(merger);
+
     if (dialog.exec() != QDialog::Accepted) {
-        /// Cancel is the whole promise: nothing was written, so there is nothing to undo.
+        /// Cancel is the whole promise: nothing was written, so there is nothing to undo -- and the
+        /// unpacked copy of a notebook that was only being read goes with it.
+        if (!unpackedNotebook.isEmpty()) {
+            QDir(unpackedNotebook).removeRecursively();
+        }
         return;
     }
 
-    /// Insert, extract and merge are entered here and run as the single operations they already
-    /// are: the screen is a door to them, not a second implementation. They are only offered while
-    /// the page list is untouched, so nothing of the user's is lost by running one.
-    switch (dialog.requestedAction()) {
-    case PdfNotebookOpsDialog::InsertPagesAction:
-        if (plugin) {
-            plugin->slotInsertPages();
+    /// Extract writes a notebook of its own, so it stays its own operation and waits for the page
+    /// list to be settled rather than being folded into this one.
+    if (dialog.requestedAction() == PdfNotebookOpsDialog::ExtractRangeAction) {
+        if (!unpackedNotebook.isEmpty()) {
+            QDir(unpackedNotebook).removeRecursively();
         }
-        return;
-    case PdfNotebookOpsDialog::ExtractRangeAction:
         extractPageRange();
         return;
-    case PdfNotebookOpsDialog::MergeNotebookAction:
-        mergeNotebookFile();
-        return;
-    case PdfNotebookOpsDialog::NoAction:
-        break;
     }
+
+    Q_UNUSED(plugin);
 
     const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(
         navigator->projectDir(), dialog.edits(), PdfPageRotator::rotateInto);
@@ -1011,6 +1103,11 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
         say(QStringLiteral("the notebook ops screen was refused: %1").arg(outcome.why));
         QMessageBox::warning(nullptr, i18n("Notebook ops"), outcome.why);
         return;
+    }
+
+    /// The unpacked copy has been read from; the notebook keeps its own files now.
+    if (!unpackedNotebook.isEmpty()) {
+        QDir(unpackedNotebook).removeRecursively();
     }
 
     say(outcome.summary);
@@ -1491,6 +1588,7 @@ PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
             QTimer::singleShot(4000, qApp, []() { showNotebookOpsMenuForShot(20); });
         }
     }
+
 
     /// Once per process: a view plugin is created for every view.
     registerPdfIoDocker();

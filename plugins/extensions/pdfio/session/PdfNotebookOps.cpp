@@ -456,6 +456,24 @@ QString freeRelativeName(const QString &projectDir, const QString &incoming, con
     return candidate;
 }
 
+/// Places one of an incoming notebook's asset files in the target's assets/: under its own name, an
+/// ordinal when the target has that name holding different bytes, and not copied at all when the
+/// target already has the same bytes. The rule wherever a notebook's files are brought into another.
+void planAssetCopy(const QString &projectDir, const QString &absoluteAsset, Plan *plan)
+{
+    const QString inTarget = QStringLiteral("assets/") + QFileInfo(absoluteAsset).fileName();
+    const QString existing = QDir(projectDir).filePath(inTarget);
+    if (QFileInfo::exists(existing)
+        && PdfSessionManifest::sha256OfFile(existing)
+               == PdfSessionManifest::sha256OfFile(absoluteAsset)) {
+        return;
+    }
+
+    const QString relative = freeRelativeName(projectDir, inTarget, QByteArray());
+    plan->copyExternal.append(qMakePair(absoluteAsset, relative));
+    plan->added.append(relative);
+}
+
 bool loadManifest(const QString &projectDir, PdfSessionManifest *manifest, QString *why)
 {
     *manifest = PdfSession::openProject(projectDir, why);
@@ -1067,16 +1085,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::mergeNotebook(const QString &projectDir,
     /// is not copied twice; one it has with other bytes gets an ordinal name, so neither is lost.
     const QDir incomingAssets(from.filePath(QStringLiteral("assets")));
     for (const QString &name : incomingAssets.entryList(QDir::Files, QDir::Name)) {
-        const QString inTarget = QStringLiteral("assets/") + name;
-        const QString existing = QDir(projectDir).filePath(inTarget);
-        if (QFileInfo::exists(existing)
-            && PdfSessionManifest::sha256OfFile(existing)
-                   == PdfSessionManifest::sha256OfFile(incomingAssets.filePath(name))) {
-            continue;
-        }
-        const QString relative = freeRelativeName(projectDir, inTarget, QByteArray());
-        plan.copyExternal.append(qMakePair(incomingAssets.filePath(name), relative));
-        plan.added.append(relative);
+        planAssetCopy(projectDir, incomingAssets.filePath(name), &plan);
     }
 
     plan.anchorBefore = currentPage;
@@ -1250,6 +1259,87 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
         plan.rotations.append(rotation);
     }
 
+    /// The PDFs this change brings in, copied and named here so that an insert commits together
+    /// with everything around it. Where each one lands is remembered: a PDF the notebook already has
+    /// is drawn from its existing entry, and the pages that named the addition are re-pointed at it.
+    QHash<int, int> additionLandedAt;
+    for (int k = 0; k < edits.additions.size(); ++k) {
+        const QString &pdfPath = edits.additions.at(k);
+        if (!QFileInfo::exists(pdfPath)) {
+            return refused(QStringLiteral("there is no PDF at %1").arg(pdfPath));
+        }
+        const QByteArray sha = PdfSessionManifest::sha256OfFile(pdfPath);
+        if (sha.isEmpty()) {
+            return refused(QStringLiteral("%1 cannot be read").arg(pdfPath));
+        }
+
+        const int existing = plan.after.sourceIndexForSha(sha);
+        if (existing >= 0) {
+            additionLandedAt.insert(k, existing);
+            continue;
+        }
+
+        const QString base = safeSourceBase(pdfPath);
+        QString relative = sourceRelativeName(sha, base, 1);
+        const QDir project(projectDir);
+        int ordinal = 1;
+        while (QFileInfo::exists(project.filePath(relative))
+               && PdfSessionManifest::sha256OfFile(project.filePath(relative)) != sha) {
+            relative = sourceRelativeName(sha, base, ++ordinal);
+        }
+
+        PdfSourceRecord source;
+        source.file = relative;
+        source.sha256 = sha;
+        source.byteSize = QFileInfo(pdfPath).size();
+        additionLandedAt.insert(k, plan.after.sources.size());
+        plan.after.sources.append(source);
+
+        /// A file with that name and that content is already there -- a leftover nothing references.
+        /// Copying over it would be pointless, and listing it as created would make an undo delete a
+        /// file the notebook already had.
+        if (!QFileInfo::exists(project.filePath(relative))) {
+            plan.copyExternal.append(qMakePair(pdfPath, relative));
+            plan.added.append(relative);
+        }
+    }
+
+    /// The assets an incoming notebook brought with it, by the same rule a merge uses.
+    for (const QString &asset : edits.assetsToMerge) {
+        if (!QFileInfo::exists(asset)) {
+            return refused(QStringLiteral("there is no file at %1 to bring into the notebook")
+                               .arg(asset));
+        }
+        planAssetCopy(projectDir, asset, &plan);
+    }
+
+    /// And every page that named an addition is pointed at where that PDF really landed.
+    for (PdfPageRecord &page : plan.after.pages) {
+        if (page.source < edits.sources.size()) {
+            continue;
+        }
+        const int k = page.source - edits.sources.size();
+        if (!additionLandedAt.contains(k)) {
+            return refused(QStringLiteral("page %1 of the change names a PDF that is not being "
+                                          "brought in")
+                               .arg(page.kraFile));
+        }
+        page.source = additionLandedAt.value(k);
+    }
+
+    /// Two pages cannot share a file: a caller that allocated the same number twice would write one
+    /// page's ink over the other's.
+    QSet<QString> namedPages;
+    for (const PdfPageRecord &page : plan.after.pages) {
+        if (page.kraFile.isEmpty()) {
+            continue;
+        }
+        if (namedPages.contains(page.kraFile)) {
+            return refused(QStringLiteral("two pages of the change would share %1").arg(page.kraFile));
+        }
+        namedPages.insert(page.kraFile);
+    }
+
     /// Every path this change creates goes into the rollback's and the undo's list -- and none of
     /// them may be a path the notebook already names. A screen that miscounted its numbers would
     /// otherwise write over a page's ink, which is the one thing the allocator exists to prevent.
@@ -1278,6 +1368,45 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
         if (!acceptDestination(pair.second)) {
             return refused(why);
         }
+    }
+
+    /// A change that changes nothing is not a change: no journal, no manifest write, no reload. The
+    /// screen keeps Apply off while its list is the list on disk, and this is the same rule where it
+    /// matters most -- nothing is written even if a caller asks for a no-op.
+    const auto samePageList = [](const QList<PdfPageRecord> &a, const QList<PdfPageRecord> &b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.size(); ++i) {
+            if (a.at(i).kraFile != b.at(i).kraFile || a.at(i).thumbFile != b.at(i).thumbFile
+                || a.at(i).source != b.at(i).source || a.at(i).index != b.at(i).index
+                || a.at(i).sizePt != b.at(i).sizePt
+                || a.at(i).extraRotation != b.at(i).extraRotation
+                || a.at(i).rotation != b.at(i).rotation) {
+                return false;
+            }
+        }
+        return true;
+    };
+    bool sameSources = plan.after.sources.size() == before.sources.size();
+    if (sameSources) {
+        for (int i = 0; i < plan.after.sources.size(); ++i) {
+            if (plan.after.sources.at(i).file != before.sources.at(i).file
+                || plan.after.sources.at(i).sha256 != before.sources.at(i).sha256) {
+                sameSources = false;
+                break;
+            }
+        }
+    }
+    if (plan.copyExternal.isEmpty() && plan.copyExternalDirs.isEmpty() && plan.rotations.isEmpty()
+        && plan.removeAfter.isEmpty() && sameSources
+        && samePageList(plan.after.pages, before.pages)) {
+        Outcome nothing;
+        nothing.ok = true;
+        nothing.anchorPage = 0;
+        nothing.summary =
+            QStringLiteral("nothing was changed: the page list is the one the notebook has");
+        return nothing;
     }
 
     /// The list the caller built is checked BEFORE anything is written: the commit below would

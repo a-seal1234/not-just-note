@@ -223,6 +223,27 @@ public:
         QStringList removeAfter;
         /// One line for the log and the user.
         QString summary;
+        /**
+         * PDFs this change brings into the notebook, as absolute paths, in the order the pages refer
+         * to them: a page whose \c source is at or beyond \c sources .size() names the addition
+         * \c source - sources.size().
+         *
+         * The engine copies each one in, names it \c sources/<sha8>-<name>.pdf, records it in
+         * \c sources, and re-points those pages at where it really landed -- all inside the one
+         * commit, so an insert is part of the same change as the moves and turns around it rather
+         * than an operation of its own. A PDF the notebook already has is not copied twice: its
+         * pages are drawn from the entry that is already there.
+         */
+        QStringList additions;
+        /**
+         * Files to place in the notebook's \c assets/ , as absolute paths: a notebook being merged
+         * in keeps whatever its content layers point at.
+         *
+         * The engine gives each one its own name, skips a file the notebook already has with the
+         * same bytes, and gives it an ordinal when the name is held by different bytes -- the same
+         * rule merging a notebook uses, in one place rather than two.
+         */
+        QStringList assetsToMerge;
     };
 
     /**

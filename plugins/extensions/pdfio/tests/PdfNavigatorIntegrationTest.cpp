@@ -1602,11 +1602,14 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
              "the screen wrote a file: it must only edit its own copy");
     QVERIFY(button("pdfio_ops_apply")->isEnabled());
 
-    /// While a change is pending, the whole-notebook entries wait: a notebook is not two changes at
-    /// once, and the hint says so.
-    QVERIFY(!button("pdfio_ops_insert")->isEnabled());
+    /// Insert and merge are edits of THIS list, so they stay available with a change pending; extract
+    /// writes a notebook of its own and waits, with the reason in the hint rather than a mute button.
+    QVERIFY2(button("pdfio_ops_insert")->isEnabled(),
+             "insert is an edit of this notebook's list and must not wait for the change");
+    QVERIFY2(button("pdfio_ops_merge_notebook")->isEnabled(),
+             "a merge-in is an edit of this notebook's list and must not wait for the change");
     QVERIFY(!button("pdfio_ops_extract")->isEnabled());
-    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("applied or")),
+    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("Extract writes a notebook of its own")),
              qPrintable(label("pdfio_ops_hint")));
 
     /// Turning the open page: the record carries the turn, the preview goes with the change, and the
@@ -1632,6 +1635,73 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
     button("pdfio_ops_keep_page")->click();
     QCOMPARE(dialog.edits().pages.size(), 4);
     QVERIFY(!dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile));
+
+    /// The insert button is a real edit: given a PDF to add, its pages join THIS list and the PDF is
+    /// named in the change, so it commits with everything else rather than as its own operation.
+    {
+        PdfNotebookOpsDialog withPdf(project, manifest, 0);
+        const QString addedPdf = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-rotations.pdf");
+        PdfNotebookOpsDialog::SourceAdder adder;
+        adder.pickAndRead = [&addedPdf](PdfNotebookOpsDialog::PdfToAdd *pdf) {
+            pdf->path = addedPdf;
+            pdf->displayedSizes << QSizeF(300, 400) << QSizeF(300, 400);
+            return true;
+        };
+        adder.askRange = [](int, int *first, int *count) {
+            *first = 0;
+            *count = 2;
+            return true;
+        };
+        withPdf.setSourceAdder(adder);
+        withPdf.findChild<QPushButton *>(QStringLiteral("pdfio_ops_insert"))->click();
+
+        const PdfNotebookOps::PageEdits withInsertion = withPdf.edits();
+        QCOMPARE(withInsertion.pages.size(), 5);
+        QCOMPARE(withInsertion.additions.size(), 1);
+        QCOMPARE(withInsertion.additions.at(0), addedPdf);
+        /// source sources.size() names the first addition, and the pages say so.
+        QCOMPARE(withInsertion.pages.at(1).source, 1);
+        QCOMPARE(withInsertion.pages.at(1).index, 0);
+        QCOMPARE(withInsertion.pages.at(2).source, 1);
+        QCOMPARE(withInsertion.pages.at(2).index, 1);
+        QCOMPARE(withInsertion.pages.at(1).sizePt, QSizeF(300, 400));
+        /// Named from the notebook's allocator, so nothing lands on a page the notebook has.
+        QCOMPARE(withInsertion.pages.at(1).kraFile, PdfSession::pageFileNameForNumber(4));
+        QVERIFY2(!QFileInfo::exists(QDir(project).filePath(withInsertion.pages.at(1).kraFile)),
+                 "the screen wrote a file for the inserted page");
+        QVERIFY(withPdf.findChild<QPushButton *>(QStringLiteral("pdfio_ops_apply"))->isEnabled());
+    }
+
+    /// And the merge button: another notebook's pages arrive with their files named in the change.
+    {
+        const QString otherDir = dir.filePath(QStringLiteral("incoming"));
+        PopplerRenderBackend otherBackend;
+        const PdfSessionManifest otherManifest = PdfSession::createProject(
+            otherDir, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-rotations.pdf"), otherBackend);
+        QVERIFY2(otherManifest.isValid(), "the notebook this test merges in could not be made");
+
+        PdfNotebookOpsDialog merging(project, manifest, 0);
+        PdfNotebookOpsDialog::NotebookMerger merger;
+        merger.pickNotebook = [&otherDir, &otherManifest](
+                                  PdfNotebookOpsDialog::NotebookToMerge *notebook) {
+            notebook->dir = otherDir;
+            notebook->manifest = otherManifest;
+            return true;
+        };
+        merging.setNotebookMerger(merger);
+        merging.findChild<QPushButton *>(QStringLiteral("pdfio_ops_merge_notebook"))->click();
+
+        const PdfNotebookOps::PageEdits withMerge = merging.edits();
+        QCOMPARE(withMerge.pages.size(), 3 + otherManifest.pages.size());
+        QCOMPARE(withMerge.additions.size(), 1);
+        QCOMPARE(withMerge.additions.at(0), QDir(otherDir).filePath(otherManifest.sourceFile));
+        /// After the page the selection is on, which is row 1 in a fresh screen.
+        QCOMPARE(withMerge.pages.at(1).source, 1);
+        QCOMPARE(withMerge.pages.at(1).index, otherManifest.pages.at(0).index);
+        QCOMPARE(withMerge.pages.at(1).sizePt, otherManifest.pages.at(0).sizePt);
+        QVERIFY2(!withMerge.copyExternal.isEmpty(), "the incoming page's files are not in the change");
+        QVERIFY2(!withMerge.copyExternalDirs.isEmpty(), "the incoming sidecar is not in the change");
+    }
 
     /// A one-page notebook cannot lose its only page, and says so.
     PdfSessionManifest single = manifest;

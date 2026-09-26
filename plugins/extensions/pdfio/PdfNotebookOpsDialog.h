@@ -10,7 +10,10 @@
 #include <QDialog>
 #include <QList>
 #include <QPair>
+#include <QSizeF>
 #include <QStringList>
+
+#include <functional>
 
 class QLabel;
 class QPushButton;
@@ -53,20 +56,44 @@ public:
     /**
      * The whole-notebook action the user asked for instead of a page-list change, if any.
      *
-     * Insert, extract and merge bring a change of their own -- a source to copy in, a notebook to
-     * write -- and they are entered from this screen so that everything a person can do to a
-     * notebook is in one place. They are offered only while the page list is untouched: a notebook
-     * cannot be both half-edited and merged into, and saying so is better than quietly applying one
-     * of the two. Folding an insert into the same commit needs the engine to describe a source
-     * addition ahead of the commit, which is the next step rather than this one.
+     * Insert and merge are NOT here: they change this notebook, so they are edits of the page list
+     * like any other, and they join the pending change (their PDF and their files are described in
+     * PageEdits before anything is committed). Extract is: it writes a notebook of its own somewhere
+     * else, so it cannot be part of this notebook's Apply and is offered only while the list is
+     * untouched.
      */
     enum RequestedAction {
         NoAction,
-        InsertPagesAction,
         ExtractRangeAction,
-        MergeNotebookAction,
     };
     RequestedAction requestedAction() const { return m_requested; }
+
+    /// What the screen needs from the application to add pages from a PDF: the picker, the one range
+    /// dialog, and the reading of that PDF's pages. The screen knows nothing about renderers.
+    struct PdfToAdd {
+        QString path;
+        QList<QSizeF> displayedSizes;
+    };
+    struct SourceAdder {
+        std::function<bool(PdfToAdd *pdf)> pickAndRead;
+        std::function<bool(int available, int *first, int *count)> askRange;
+    };
+    void setSourceAdder(const SourceAdder &adder);
+
+    /**
+     * What the screen needs to merge another notebook in: where its files are and what it holds.
+     *
+     * The application owns that directory -- for a .pnb it is a temporary unpack -- and keeps it
+     * alive until Apply has read every file out of it.
+     */
+    struct NotebookToMerge {
+        QString dir;
+        PdfSessionManifest manifest;
+    };
+    struct NotebookMerger {
+        std::function<bool(NotebookToMerge *notebook)> pickNotebook;
+    };
+    void setNotebookMerger(const NotebookMerger &merger);
 
 private:
     struct Row {
@@ -77,6 +104,10 @@ private:
         bool removed = false;
         /// It did not exist when the screen opened.
         bool isNew = false;
+        /// Where a new page came from, for the words the legend uses: a PDF added here, or another
+        /// notebook merged in.
+        bool fromAddedPdf = false;
+        bool fromMergedNotebook = false;
     };
 
     void buildUi();
@@ -88,6 +119,26 @@ private:
     void keepSelected();
     void rotateSelected(int degrees);
     void dropThumbnail(Row &row);
+    void insertPagesFromPdf();
+    void mergeNotebookIn();
+    void addPagesFromSource(const PdfToAdd &pdf, int first, int count);
+    void addNotebook(const NotebookToMerge &notebook);
+    /**
+     * The source index a record of another file should carry: the entry this notebook already has
+     * for that content, an addition already registered here, or a new addition. -1 when it cannot be
+     * resolved, with \a why filled.
+     */
+    int sourceIndexFor(const PdfSourceRecord &source, const QString &absoluteFile, QString *why);
+
+    /// A PDF this change brings in: where it is and the content that identifies it, which is what
+    /// decides whether a second copy is needed at all.
+    struct Addition {
+        QString path;
+        QByteArray sha256;
+    };
+    /// The additions in index order, and the assets another notebook carried.
+    QList<Addition> m_additions;
+    QStringList m_assets;
 
     int selectedRow() const;
     void selectRow(int row);
@@ -98,6 +149,9 @@ private:
     QStringList pendingDescriptions() const;
     QString availabilityHint() const;
     QString summaryLine() const;
+    /// Where a page comes from, in words: the PDF and the page inside it. A page of a PDF this change
+    /// is bringing in says so with that file's name, not the notebook's own.
+    QString sourceLabel(const PdfPageRecord &record) const;
 
     QString m_projectDir;
     PdfSessionManifest m_original;
@@ -129,6 +183,8 @@ private:
     QPushButton *m_extract = nullptr;
     QPushButton *m_merge = nullptr;
     RequestedAction m_requested = NoAction;
+    SourceAdder m_adder;
+    NotebookMerger m_merger;
 };
 
 #endif // PDFNOTEBOOKOPSDIALOG_H

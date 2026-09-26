@@ -37,16 +37,6 @@ enum Column {
     ColumnCount,
 };
 
-/// Where a page comes from, in the words someone reading the list needs: the PDF's name and the page
-/// inside it. That is what the manifest records, and the design asks for it to be visible.
-QString sourceLabel(const PdfSessionManifest &manifest, const PdfPageRecord &record)
-{
-    const QString file = record.source > 0 && record.source < manifest.sourceCount()
-                             ? QFileInfo(manifest.sourceAt(record.source).file).fileName()
-                             : QFileInfo(manifest.sourceFile).fileName();
-    return i18n("%1, page %2", file, record.index + 1);
-}
-
 QString sizeLabel(const PdfPageRecord &record)
 {
     const QSizeF size = record.displaySizePt();
@@ -147,24 +137,19 @@ void PdfNotebookOpsDialog::buildUi()
     m_rotateRight->setObjectName(QStringLiteral("pdfio_ops_turn_right"));
     buttons->addSpacing(18);
 
-    /// The whole-notebook actions live here too, so one screen covers what a person can do to a
-    /// notebook. They are available while the page list is untouched, and the hint says why when
-    /// they are not.
-    const auto addAction = [this, buttons](const QString &text, RequestedAction action) {
-        auto *button = new QPushButton(text, this);
-        connect(button, &QPushButton::clicked, this, [this, action]() {
-            m_requested = action;
-            accept();
-        });
-        buttons->addWidget(button);
-        return button;
-    };
-    m_insert = addAction(i18n("Insert pages from a PDF..."), InsertPagesAction);
+    /// Pages can be brought in from another PDF, and another notebook can be merged in: both are
+    /// edits of THIS notebook's list, so they join the pending change like any other button.
+    m_insert = addButton(i18n("Insert pages from a PDF..."), [this]() { insertPagesFromPdf(); });
     m_insert->setObjectName(QStringLiteral("pdfio_ops_insert"));
-    m_extract = addAction(i18n("Extract a page range..."), ExtractRangeAction);
-    m_extract->setObjectName(QStringLiteral("pdfio_ops_extract"));
-    m_merge = addAction(i18n("Merge a notebook in..."), MergeNotebookAction);
+    m_merge = addButton(i18n("Merge a notebook in..."), [this]() { mergeNotebookIn(); });
     m_merge->setObjectName(QStringLiteral("pdfio_ops_merge_notebook"));
+    /// Extract writes a notebook of its own, somewhere else: it cannot be part of this notebook's
+    /// Apply, so it is the one entry that waits for the list to be settled.
+    m_extract = addButton(i18n("Extract a page range..."), [this]() {
+        m_requested = ExtractRangeAction;
+        accept();
+    });
+    m_extract->setObjectName(QStringLiteral("pdfio_ops_extract"));
 
     buttons->addStretch(1);
     middle->addLayout(buttons);
@@ -221,14 +206,18 @@ void PdfNotebookOpsDialog::refresh()
             m_table->setItem(i, column, item);
         };
         cell(PositionColumn, row.removed ? i18n("(gone)") : QString::number(position));
-        cell(SourceColumn, sourceLabel(m_original, row.record));
+        cell(SourceColumn, sourceLabel(row.record));
         cell(SizeColumn, sizeLabel(row.record));
         cell(TurnColumn, turnLabel(row.record.extraRotation));
 
         /// The ink column answers "has this page ever been drawn on": the artifact is the ink, and a
         /// page that was never drawn on has none.
         const bool inked = QFileInfo::exists(QDir(row.fromDir).filePath(row.record.kraFile));
-        cell(InkColumn, row.isNew ? i18n("new copy") : (inked ? i18n("drawn on") : i18n("blank")));
+        cell(InkColumn, row.fromMergedNotebook ? i18n("from the merged notebook")
+                                               : (row.fromAddedPdf ? i18n("new page")
+                                                                   : (row.isNew ? i18n("new copy")
+                                                                                : (inked ? i18n("drawn on")
+                                                                                         : i18n("blank")))));
     }
 
     if (keepSelection >= 0 && keepSelection < m_rows.size()) {
@@ -265,12 +254,12 @@ void PdfNotebookOpsDialog::refreshFooter()
     m_rotateLeft->setEnabled(live);
     m_rotateRight->setEnabled(live);
 
-    /// A notebook cannot be half-edited and merged into at the same time: these wait for Apply or
-    /// Cancel, and the hint says so.
-    const bool wholeNotebook = !dirty;
-    m_insert->setEnabled(wholeNotebook);
-    m_extract->setEnabled(wholeNotebook);
-    m_merge->setEnabled(wholeNotebook);
+    /// Insert and merge are edits of this notebook's page list, so they stay available with a change
+    /// pending, like every other button. Extract writes a notebook of its own and waits, with the
+    /// hint saying why.
+    m_insert->setEnabled(true);
+    m_merge->setEnabled(true);
+    m_extract->setEnabled(!dirty);
 
     m_hint->setText(availabilityHint());
 }
@@ -462,15 +451,28 @@ QStringList PdfNotebookOpsDialog::pendingDescriptions() const
 
     int deleted = 0;
     int duplicated = 0;
+    int inserted = 0;
+    int mergedIn = 0;
     for (const Row &row : m_rows) {
         if (row.removed) {
             ++deleted;
+        } else if (row.fromMergedNotebook) {
+            ++mergedIn;
+        } else if (row.fromAddedPdf) {
+            ++inserted;
         } else if (row.isNew) {
             ++duplicated;
         }
     }
     if (deleted > 0) {
         parts << i18np("%1 page deleted", "%1 pages deleted", deleted);
+    }
+    if (inserted > 0) {
+        parts << i18np("%1 page inserted from a PDF", "%1 pages inserted from a PDF", inserted);
+    }
+    if (mergedIn > 0) {
+        parts << i18np("%1 page merged in from another notebook",
+                       "%1 pages merged in from another notebook", mergedIn);
     }
     if (duplicated > 0) {
         parts << i18np("%1 page duplicated", "%1 pages duplicated", duplicated);
@@ -539,8 +541,7 @@ QString PdfNotebookOpsDialog::availabilityHint() const
     if (!hasPendingEdits()) {
         notes << i18n("Apply is off because nothing has changed yet.");
     } else {
-        notes << i18n("Insert, extract and merge are off until this change is applied or "
-                      "cancelled: a notebook is not two changes at once.");
+        notes << i18n("Extract writes a notebook of its own, so finish this change first.");
     }
     if (keptCount() <= 1) {
         notes << i18n("A notebook keeps at least one page, so this page cannot be deleted.");
@@ -555,6 +556,25 @@ QString PdfNotebookOpsDialog::availabilityHint() const
         return i18n("The whole change is applied in one step, and one undo takes it back.");
     }
     return notes.join(QStringLiteral(" "));
+}
+
+QString PdfNotebookOpsDialog::sourceLabel(const PdfPageRecord &record) const
+{
+    const int primary = m_original.sources.size();
+
+    /// A page of a PDF this change is bringing in: that file's name, because that is where its
+    /// background will come from once this is applied.
+    if (record.source >= primary) {
+        const int k = record.source - primary;
+        if (k < m_additions.size()) {
+            return i18n("%1, page %2", QFileInfo(m_additions.at(k).path).fileName(), record.index + 1);
+        }
+    }
+
+    const QString file = record.source > 0 && record.source < primary
+                             ? m_original.sourceAt(record.source).file
+                             : m_original.sourceFile;
+    return i18n("%1, page %2", QFileInfo(file).fileName(), record.index + 1);
 }
 
 QString PdfNotebookOpsDialog::summaryLine() const
@@ -577,9 +597,204 @@ PdfNotebookOps::PageEdits PdfNotebookOpsDialog::edits() const
     }
     edits.copyExternal = m_copies;
     edits.copyExternalDirs = m_copyDirs;
+    edits.assetsToMerge = m_assets;
     edits.removeAfter = m_removals;
+
+    /// The PDFs the kept pages really name are the ones that travel: a PDF whose pages were all
+    /// dropped again is not copied anywhere. The indices are renumbered in order, so a page that
+    /// named addition 2 now names whichever position it has among the kept ones.
+    const int primary = m_original.sources.size();
+    QHash<int, int> keptIndex;
+    for (int k = 0; k < m_additions.size(); ++k) {
+        for (const Row &row : m_rows) {
+            if (!row.removed && row.record.source == primary + k) {
+                keptIndex.insert(k, edits.additions.size());
+                edits.additions.append(m_additions.at(k).path);
+                break;
+            }
+        }
+    }
+    for (PdfPageRecord &page : edits.pages) {
+        if (page.source >= primary) {
+            page.source = primary + keptIndex.value(page.source - primary, 0);
+        }
+    }
+
     edits.summary = summaryLine();
     return edits;
+}
+
+void PdfNotebookOpsDialog::setSourceAdder(const SourceAdder &adder)
+{
+    m_adder = adder;
+}
+
+void PdfNotebookOpsDialog::setNotebookMerger(const NotebookMerger &merger)
+{
+    m_merger = merger;
+}
+
+int PdfNotebookOpsDialog::sourceIndexFor(const PdfSourceRecord &source, const QString &absoluteFile,
+                                         QString *why)
+{
+    /// A PDF this notebook already has: its pages are drawn from that entry, and no second copy of
+    /// the bytes is made.
+    for (int i = 0; i < m_original.sources.size(); ++i) {
+        if (!source.sha256.isEmpty() && m_original.sources.at(i).sha256 == source.sha256) {
+            return i;
+        }
+    }
+
+    /// A PDF this change is already bringing in.
+    for (int i = 0; i < m_additions.size(); ++i) {
+        if (!source.sha256.isEmpty() && m_additions.at(i).sha256 == source.sha256) {
+            return m_original.sources.size() + i;
+        }
+    }
+
+    if (!QFileInfo::exists(absoluteFile)) {
+        if (why) {
+            *why = i18n("there is no file at %1", absoluteFile);
+        }
+        return -1;
+    }
+
+    Addition addition;
+    addition.path = absoluteFile;
+    addition.sha256 = source.sha256.isEmpty() ? PdfSessionManifest::sha256OfFile(absoluteFile)
+                                             : source.sha256;
+    if (addition.sha256.isEmpty()) {
+        if (why) {
+            *why = i18n("%1 cannot be read", absoluteFile);
+        }
+        return -1;
+    }
+
+    m_additions.append(addition);
+    return m_original.sources.size() + m_additions.size() - 1;
+}
+
+void PdfNotebookOpsDialog::insertPagesFromPdf()
+{
+    if (!m_adder.pickAndRead) {
+        return;
+    }
+
+    PdfToAdd pdf;
+    if (!m_adder.pickAndRead(&pdf) || pdf.path.isEmpty() || pdf.displayedSizes.isEmpty()) {
+        return;
+    }
+
+    int first = 0;
+    int count = pdf.displayedSizes.size();
+    if (m_adder.askRange && !m_adder.askRange(pdf.displayedSizes.size(), &first, &count)) {
+        return;
+    }
+    if (first < 0 || count < 1 || first + count > pdf.displayedSizes.size()) {
+        return;
+    }
+
+    addPagesFromSource(pdf, first, count);
+}
+
+void PdfNotebookOpsDialog::addPagesFromSource(const PdfToAdd &pdf, int first, int count)
+{
+    PdfSourceRecord source;
+    source.sha256 = PdfSessionManifest::sha256OfFile(pdf.path);
+    source.byteSize = QFileInfo(pdf.path).size();
+
+    QString why;
+    const int sourceIndex = sourceIndexFor(source, pdf.path, &why);
+    if (sourceIndex < 0) {
+        qWarning("[pdfio] the screen could not add %s: %s", qPrintable(pdf.path), qPrintable(why));
+        return;
+    }
+
+    /// After the page the user is on, which is where a reader expects new pages to land -- and it is
+    /// the same place the menu's insert entry uses.
+    const int at = qBound(0, m_table->currentRow() + 1, m_rows.size());
+    for (int i = 0; i < count; ++i) {
+        Row row;
+        row.record.index = first + i;
+        row.record.sizePt = pdf.displayedSizes.value(first + i);
+        row.record.source = sourceIndex;
+        const int number = m_nextNumber++;
+        row.record.kraFile = PdfSession::pageFileNameForNumber(number);
+        row.record.thumbFile = PdfSession::thumbFileNameForNumber(number);
+        /// Nothing to copy: the page is new, and a page that has never been drawn on has no artifact.
+        row.isNew = true;
+        row.fromAddedPdf = true;
+        m_rows.insert(at + i, row);
+    }
+
+    refresh();
+    m_table->selectRow(at);
+}
+
+void PdfNotebookOpsDialog::mergeNotebookIn()
+{
+    if (!m_merger.pickNotebook) {
+        return;
+    }
+
+    NotebookToMerge notebook;
+    if (!m_merger.pickNotebook(&notebook) || !notebook.manifest.isValid()) {
+        return;
+    }
+
+    addNotebook(notebook);
+}
+
+void PdfNotebookOpsDialog::addNotebook(const NotebookToMerge &notebook)
+{
+    const QDir from(notebook.dir);
+    const int at = qBound(0, m_table->currentRow() + 1, m_rows.size());
+
+    int placed = 0;
+    for (const PdfPageRecord &page : notebook.manifest.pages) {
+        const PdfSourceRecord incoming = notebook.manifest.sourceForPage(page);
+
+        QString why;
+        const int sourceIndex = sourceIndexFor(incoming, from.filePath(incoming.file), &why);
+        if (sourceIndex < 0) {
+            qWarning("[pdfio] the screen could not merge in %s: %s", qPrintable(notebook.dir),
+                     qPrintable(why));
+            return;
+        }
+
+        Row row;
+        row.record = page;
+        row.record.source = sourceIndex;
+        row.record.generation = 0;
+        const int number = m_nextNumber++;
+        row.record.kraFile = PdfSession::pageFileNameForNumber(number);
+        row.record.thumbFile = PdfSession::thumbFileNameForNumber(number);
+        /// Its files are read from where the notebook being merged in lives, which is what lets the
+        /// list show its previews before anything has been copied.
+        row.fromDir = notebook.dir;
+        row.isNew = true;
+        row.fromMergedNotebook = true;
+
+        m_copies.append(qMakePair(from.filePath(page.kraFile), row.record.kraFile));
+        if (!page.thumbFile.isEmpty()) {
+            m_copies.append(qMakePair(from.filePath(page.thumbFile), row.record.thumbFile));
+        }
+        m_copyDirs.append(qMakePair(from.filePath(page.kraFile + QStringLiteral(".layers")),
+                                    row.record.kraFile + QStringLiteral(".layers")));
+
+        m_rows.insert(at + placed, row);
+        ++placed;
+    }
+
+    /// And whatever the incoming notebook kept in assets/, because its pages' content layers point at
+    /// those files rather than at the manifest.
+    const QDir assets(from.filePath(QStringLiteral("assets")));
+    for (const QString &name : assets.entryList(QDir::Files, QDir::Name)) {
+        m_assets << assets.filePath(name);
+    }
+
+    refresh();
+    m_table->selectRow(at);
 }
 
 int PdfNotebookOpsDialog::keptCount() const

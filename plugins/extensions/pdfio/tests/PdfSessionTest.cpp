@@ -151,6 +151,8 @@ private Q_SLOTS:
     /// The model the Notebook ops screen stands on: a whole page-list change -- a move, a delete, a
     /// duplicate and a turn together -- is ONE commit, one journal entry and one undo step.
     void testAWholePageListChangeIsOneCommit();
+    void testAWholeChangeThatInsertsFromANewPdfIsOneCommit();
+    void testAWholeChangeThatMergesANotebookInIsOneCommit();
 
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
@@ -1714,6 +1716,267 @@ void PdfSessionTest::testAWholePageListChangeIsOneCommit()
     /// Nothing was written at all: the refusal happens before the journal is even made.
     QCOMPARE(PdfSessionManifest::writeCountForTests(), 0);
     QVERIFY(!PdfNotebookOps::canUndo(project));
+}
+
+/**
+ * A change that brings pages in from a NEW PDF is still ONE commit.
+ *
+ * This is what lets the screen's insert button join the pending Apply instead of being an operation
+ * of its own: the PDF is copied in, named, recorded and its pages allocated as part of the same
+ * journal entry and the same manifest write as the moves, turns, duplicates and deletes around it,
+ * and one undo takes the copy away again along with everything else.
+ */
+void PdfSessionTest::testAWholeChangeThatInsertsFromANewPdfIsOneCommit()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    const PdfPageRecord a = before.pages.at(0);
+    const PdfPageRecord b = before.pages.at(1);
+    const PdfPageRecord c = before.pages.at(2);
+    writeBytes(QDir(project).filePath(a.kraFile), QByteArrayLiteral("ink of A"));
+    writeBytes(QDir(project).filePath(a.kraFile + QStringLiteral(".layers/Ink.png")),
+               QByteArrayLiteral("a layer"));
+    writeBytes(QDir(project).filePath(a.thumbFile), QByteArrayLiteral("preview of A"));
+    writeBytes(QDir(project).filePath(b.kraFile), QByteArrayLiteral("ink of B"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    /// The PDF being inserted, read the way the screen reads it: the path, and each page's displayed
+    /// size, which is what the notebook records.
+    const QString incoming = fixturePath(QStringLiteral("ex-rotations.pdf"));
+    PopplerRenderBackend incomingBackend;
+    QVERIFY2(incomingBackend.open(incoming), "the PDF this test inserts could not be opened");
+    QVERIFY(incomingBackend.pageCount() >= 2);
+
+    /// One plan: C first, two pages from the new PDF, A turned, a copy of A -- and B deleted.
+    const int free = PdfNotebookOps::nextFreePageNumber(project);
+    QCOMPARE(free, 4);
+
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = before.sources;
+    edits.additions << incoming;
+
+    PdfPageRecord firstAdded;
+    firstAdded.index = 0;
+    firstAdded.sizePt = incomingBackend.pageInfo(0).sizePt;
+    firstAdded.kraFile = PdfSession::pageFileNameForNumber(free);
+    firstAdded.thumbFile = PdfSession::thumbFileNameForNumber(free);
+    firstAdded.source = 1; ///< sources.size() + 0: the first addition
+    PdfPageRecord secondAdded = firstAdded;
+    secondAdded.index = 1;
+    secondAdded.sizePt = incomingBackend.pageInfo(1).sizePt;
+    secondAdded.kraFile = PdfSession::pageFileNameForNumber(free + 1);
+    secondAdded.thumbFile = PdfSession::thumbFileNameForNumber(free + 1);
+
+    PdfPageRecord turned = a;
+    turned.extraRotation = 90;
+    PdfPageRecord copy = a;
+    copy.kraFile = PdfSession::pageFileNameForNumber(free + 2);
+    copy.thumbFile = PdfSession::thumbFileNameForNumber(free + 2);
+
+    edits.pages << c << firstAdded << secondAdded << turned << copy;
+    edits.copyExternal << qMakePair(QDir(project).filePath(a.kraFile), copy.kraFile)
+                       << qMakePair(QDir(project).filePath(a.thumbFile), copy.thumbFile);
+    edits.copyExternalDirs
+        << qMakePair(QDir(project).filePath(a.kraFile + QStringLiteral(".layers")),
+                     copy.kraFile + QStringLiteral(".layers"));
+    edits.removeAfter << b.kraFile << b.thumbFile;
+    edits.summary = QStringLiteral("two pages inserted, one moved, one turned, one copied, one gone");
+
+    StubRotator rotator;
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(project, edits, rotator.fn());
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// ONE manifest write and ONE journal entry for the whole change, the insert included.
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    QVERIFY2(PdfNotebookOps::canUndo(project), "the change left nothing to undo");
+    QCOMPARE(readBytes(QDir(PdfNotebookOps::journalDir(project))
+                           .filePath(QStringLiteral("before.json"))),
+             manifestBefore);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 5);
+    QCOMPARE(after.sourceCount(), 2);
+
+    /// The inserted pages are the new PDF's, in the order they were asked for, and they arrived
+    /// without an artifact because nothing has been drawn on them.
+    QCOMPARE(after.pages.at(1).source, 1);
+    QCOMPARE(after.pages.at(1).index, 0);
+    QCOMPARE(after.pages.at(1).sizePt, incomingBackend.pageInfo(0).sizePt);
+    QCOMPARE(after.pages.at(2).source, 1);
+    QCOMPARE(after.pages.at(2).index, 1);
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(after.pages.at(1).kraFile)));
+
+    /// The PDF itself is in the notebook, byte for byte, under the name the manifest records.
+    const QString copiedPdf = QDir(project).filePath(after.sourceAt(1).file);
+    QVERIFY(QFileInfo::exists(copiedPdf));
+    QCOMPARE(readBytes(copiedPdf), readBytes(incoming));
+    QCOMPARE(after.sourceAt(1).sha256, PdfSessionManifest::sha256OfFile(incoming));
+
+    /// And the rest of the change happened at the same time.
+    QCOMPARE(after.pages.at(0).kraFile, c.kraFile);
+    QCOMPARE(after.pages.at(3).kraFile, a.kraFile);
+    QCOMPARE(after.pages.at(3).extraRotation, 90);
+    QCOMPARE(rotator.calls.size(), 1);
+    QCOMPARE(rotator.calls.at(0).degrees, 90);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("turned"));
+    QCOMPARE(after.pages.at(4).kraFile, copy.kraFile);
+    QCOMPARE(readBytes(QDir(project).filePath(copy.kraFile)), QByteArrayLiteral("ink of A"));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(b.kraFile)));
+
+    /// ONE undo takes all of it back: the manifest, the turned artifact, the copy's files, the
+    /// deleted page -- and the PDF that was copied in.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("ink of A"));
+    QCOMPARE(readBytes(QDir(project).filePath(b.kraFile)), QByteArrayLiteral("ink of B"));
+    QCOMPARE(readBytes(QDir(project).filePath(a.thumbFile)), QByteArrayLiteral("preview of A"));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile)));
+    QVERIFY2(!QFileInfo::exists(copiedPdf), "the PDF the insert copied in was left behind");
+
+    /// And a change that changes nothing writes nothing at all: no manifest, no journal, no reload
+    /// for a no-op.
+    PdfNotebookOps::PageEdits quiet;
+    quiet.sources = before.sources;
+    quiet.pages = before.pages;
+    quiet.summary = QStringLiteral("nothing");
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome nothing =
+        PdfNotebookOps::applyPageEdits(project, quiet, rotator.fn());
+    QVERIFY2(nothing.ok, qPrintable(nothing.why));
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 0);
+    QVERIFY(!PdfNotebookOps::canUndo(project));
+}
+
+/**
+ * A change that merges ANOTHER NOTEBOOK in is one commit too.
+ *
+ * A merge is the same shape as an insert, only with more of the other notebook travelling: its PDF
+ * as an addition, its pages' artifacts, sidecars and previews as copies, and its assets placed by the
+ * rule a merge uses. All of it lands in the same journal entry and the same manifest write as the
+ * reorder and delete around it, and one undo takes the whole thing back out.
+ */
+void PdfSessionTest::testAWholeChangeThatMergesANotebookInIsOneCommit()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+    const QString other = dir.filePath(QStringLiteral("other"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    const PdfPageRecord a = before.pages.at(0);
+    const PdfPageRecord b = before.pages.at(1);
+    const PdfPageRecord c = before.pages.at(2);
+    writeBytes(QDir(project).filePath(a.kraFile), QByteArrayLiteral("ink of A"));
+    writeBytes(QDir(project).filePath(b.kraFile), QByteArrayLiteral("ink of B"));
+    writeBytes(QDir(project).filePath(c.kraFile), QByteArrayLiteral("ink of C"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    /// The notebook being merged in, with ink, a sidecar, a preview and an asset of its own.
+    PopplerRenderBackend otherBackend;
+    const PdfSessionManifest incoming =
+        PdfSession::createProject(other, fixturePath(QStringLiteral("ex-rotations.pdf")), otherBackend);
+    QVERIFY(incoming.isValid());
+    QVERIFY(incoming.pages.size() >= 2);
+    const PdfPageRecord incomingFirst = incoming.pages.at(0);
+    writeBytes(QDir(other).filePath(incomingFirst.kraFile), QByteArrayLiteral("ink of the other page"));
+    writeBytes(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers/Ink.png")),
+               QByteArrayLiteral("the other layer"));
+    writeBytes(QDir(other).filePath(incomingFirst.thumbFile), QByteArrayLiteral("the other preview"));
+    writeBytes(QDir(other).filePath(QStringLiteral("assets/picture.png")),
+               QByteArrayLiteral("an incoming asset"));
+
+    /// One plan: B first, A after it, then the other notebook's two pages -- and C deleted.
+    const int free = PdfNotebookOps::nextFreePageNumber(project);
+    QCOMPARE(free, 4);
+
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = before.sources;
+    edits.additions << QDir(other).filePath(incoming.sourceFile);
+    edits.assetsToMerge << QDir(other).filePath(QStringLiteral("assets/picture.png"));
+
+    PdfPageRecord firstIn = incoming.pages.at(0);
+    firstIn.kraFile = PdfSession::pageFileNameForNumber(free);
+    firstIn.thumbFile = PdfSession::thumbFileNameForNumber(free);
+    firstIn.source = 1; ///< sources.size() + 0: the addition
+    firstIn.generation = 0;
+    PdfPageRecord secondIn = incoming.pages.at(1);
+    secondIn.kraFile = PdfSession::pageFileNameForNumber(free + 1);
+    secondIn.thumbFile = PdfSession::thumbFileNameForNumber(free + 1);
+    secondIn.source = 1;
+    secondIn.generation = 0;
+
+    edits.pages << b << a << firstIn << secondIn;
+    edits.copyExternal
+        << qMakePair(QDir(other).filePath(incomingFirst.kraFile), firstIn.kraFile)
+        << qMakePair(QDir(other).filePath(incomingFirst.thumbFile), firstIn.thumbFile);
+    edits.copyExternalDirs
+        << qMakePair(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers")),
+                     firstIn.kraFile + QStringLiteral(".layers"));
+    edits.removeAfter << c.kraFile << c.thumbFile;
+    edits.summary = QStringLiteral("a notebook merged in, one deleted");
+
+    StubRotator rotator;
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(project, edits, rotator.fn());
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// ONE write and ONE journal entry for the merge and the reorder together.
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    QVERIFY(PdfNotebookOps::canUndo(project));
+    QCOMPARE(readBytes(QDir(PdfNotebookOps::journalDir(project))
+                           .filePath(QStringLiteral("before.json"))),
+             manifestBefore);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 4);
+    QCOMPARE(after.sourceCount(), 2);
+    QCOMPARE(after.pages.at(0).kraFile, b.kraFile);
+    QCOMPARE(after.pages.at(1).kraFile, a.kraFile);
+    QCOMPARE(after.pages.at(2).kraFile, firstIn.kraFile);
+    QCOMPARE(after.pages.at(2).source, 1);
+    QCOMPARE(after.pages.at(2).index, incomingFirst.index);
+    QCOMPARE(after.pages.at(2).sizePt, incomingFirst.sizePt);
+
+    /// Everything the other notebook carried: the PDF, the ink, its sidecar and its asset.
+    const QString copiedPdf = QDir(project).filePath(after.sourceAt(1).file);
+    QVERIFY(QFileInfo::exists(copiedPdf));
+    QCOMPARE(readBytes(copiedPdf), readBytes(QDir(other).filePath(incoming.sourceFile)));
+    QCOMPARE(readBytes(QDir(project).filePath(firstIn.kraFile)),
+             QByteArrayLiteral("ink of the other page"));
+    QCOMPARE(readBytes(QDir(project).filePath(firstIn.kraFile
+                                              + QStringLiteral(".layers/Ink.png"))),
+             QByteArrayLiteral("the other layer"));
+    QCOMPARE(readBytes(QDir(project).filePath(firstIn.thumbFile)),
+             QByteArrayLiteral("the other preview"));
+    QCOMPARE(readBytes(QDir(project).filePath(QStringLiteral("assets/picture.png"))),
+             QByteArrayLiteral("an incoming asset"));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(c.kraFile)));
+
+    /// ONE undo: the manifest, the deleted page, and everything the merge brought.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QCOMPARE(readBytes(QDir(project).filePath(c.kraFile)), QByteArrayLiteral("ink of C"));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(firstIn.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("assets/picture.png"))));
+    QVERIFY2(!QFileInfo::exists(copiedPdf), "the merged-in notebook's PDF was left behind");
 }
 
 /**
