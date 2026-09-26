@@ -24,6 +24,7 @@
 #include <QSizePolicy>
 #include <QTableWidget>
 #include <QTableWidgetItem>
+#include <QTimer>
 #include <QTouchEvent>
 #include <QTransform>
 #include <QVBoxLayout>
@@ -47,6 +48,15 @@ enum Column {
 
 /// How far sideways a swipe has to go before it is a turn rather than a slipped click.
 constexpr int SwipeTurnPixels = 60;
+
+/// How long a press has to stay put before it becomes a grab. Half a second is the gesture everyone
+/// already knows from a tablet, and it is long enough that a swipe -- which moves at once -- can
+/// never be mistaken for it.
+constexpr int HoldDelayMs = 450;
+
+/// How far a press may wander before it is a swipe and not a hold. A few pixels, because a finger
+/// on glass is never perfectly still.
+constexpr int HoldSlopPixels = 8;
 
 /// How much room the page is given inside the canvas.
 constexpr int CanvasMargin = 12;
@@ -496,6 +506,76 @@ void PdfPageCanvas::handleTouch(QTouchEvent *event)
     m_lastDirection = direction;
 }
 
+/**
+ * The reorder's visual: the row being dragged, and the line it would land on.
+ *
+ * A child of the table's viewport, painted over the rows and transparent to the mouse, so it can sit
+ * there without changing what the table does with a click. It is shown only while a drag is in
+ * flight: the highlight says which page is in the hand, and the line across the viewport says where
+ * the page will land. The line is the conventional shape for this, and on a tablet it is the
+ * difference between a drop that is obvious and one that has to be guessed at.
+ */
+class PdfRowDropIndicator : public QWidget
+{
+public:
+    explicit PdfRowDropIndicator(QWidget *parent)
+        : QWidget(parent)
+    {
+        setObjectName(QStringLiteral("pdfio_ops_drop_indicator"));
+        /// The drag's own moves have to reach the viewport, not this.
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        hide();
+    }
+
+    /// \a held is the held row's rectangle and \a lineY the insertion point, both in the viewport's
+    /// own coordinates. A null \a held paints the line alone.
+    void setDrop(const QRect &held, int lineY)
+    {
+        m_held = held;
+        m_line = lineY;
+        update();
+    }
+
+    void clearDrop()
+    {
+        m_held = QRect();
+        m_line = -1;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        Q_UNUSED(event);
+
+        QPainter painter(this);
+        /// A sheet of glass over the rows: it starts transparent, so everything not painted here
+        /// shows the table underneath -- and what is painted is unambiguous.
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.fillRect(rect(), Qt::transparent);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+
+        const QColor accent(0x1e, 0x88, 0xe5);
+        if (m_held.isValid()) {
+            /// The page in the hand: the row stays where it is in the list until the drop, so the
+            /// highlight is what says it is being moved.
+            painter.fillRect(m_held, QColor(accent.red(), accent.green(), accent.blue(), 64));
+            painter.setPen(QPen(accent, 1));
+            painter.drawRect(m_held.adjusted(0, 0, -1, -1));
+        }
+
+        if (m_line >= 0) {
+            painter.setPen(QPen(accent, 3));
+            painter.drawLine(0, m_line, width(), m_line);
+        }
+    }
+
+private:
+    QRect m_held;
+    int m_line = -1;
+};
+
 PdfNotebookOpsDialog::PdfNotebookOpsDialog(const QString &projectDir,
                                            const PdfSessionManifest &manifest, int anchorPage,
                                            QWidget *parent)
@@ -525,8 +605,8 @@ void PdfNotebookOpsDialog::buildUi()
     auto *intro = new QLabel(
         i18n("Notebook \"%1\" has %2 page(s). Change the list here; nothing is written until you "
              "press Apply, and then the whole change is one step you can undo. Drag the page on "
-             "the canvas to turn it by any angle, or swipe a page left or right for a quarter "
-             "turn.",
+             "the canvas to turn it by any angle, swipe a page left or right for a quarter turn, "
+             "or press and hold a page to drag it somewhere else in the list.",
              m_original.displayName(), m_rows.size()),
         this);
     intro->setWordWrap(true);
@@ -546,9 +626,17 @@ void PdfNotebookOpsDialog::buildUi()
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->setMinimumWidth(560);
     connect(m_table, &QTableWidget::itemSelectionChanged, this, [this]() { refreshFooter(); });
-    /// On the viewport rather than on the table: the viewport is the widget the press and the
-    /// release actually arrive at, and it sees them before the view turns them into a selection.
+    /// On the viewport rather than on the table: the viewport is the widget the press, the moves
+    /// and the release actually arrive at, and it sees them before the view turns them into a
+    /// selection.
     m_table->viewport()->installEventFilter(this);
+    /// The hold that turns a press into a grab, and the visual a grab shows. Both belong to the
+    /// viewport the gesture is made on.
+    m_hold = new QTimer(this);
+    m_hold->setSingleShot(true);
+    m_hold->setInterval(HoldDelayMs);
+    connect(m_hold, &QTimer::timeout, this, [this]() { startGrab(); });
+    m_dropIndicator = new PdfRowDropIndicator(m_table->viewport());
     middle->addWidget(m_table, 1);
 
     /// The canvas: the selected page, large, where it can be turned to an angle no button can name.
@@ -755,9 +843,147 @@ void PdfNotebookOpsDialog::moveSelected(int delta)
         return;
     }
 
-    m_rows.swapItemsAt(row, target);
+    /// The same reorder a drop makes: a button and a drag differ only in where the row is put.
+    moveRow(row, target);
+}
+
+void PdfNotebookOpsDialog::moveRow(int from, int to)
+{
+    if (from < 0 || from >= m_rows.size()) {
+        return;
+    }
+    to = qBound(0, to, m_rows.size() - 1);
+    if (to == from) {
+        /// Dropped where it already is: nothing changes, so nothing becomes pending and Apply
+        /// stays exactly where it was.
+        return;
+    }
+
+    /// The row is taken out and put back at \a to, so the rows it passes move up or down by one --
+    /// the usual drag-to-reorder, not a swap of two pages. Nothing is written: this edits the same
+    /// working copy every button edits, and the whole move is one change when Apply runs.
+    const Row moved = m_rows.takeAt(from);
+    m_rows.insert(to, moved);
+
     refresh();
-    m_table->selectRow(target);
+    m_table->selectRow(to);
+}
+
+void PdfNotebookOpsDialog::beginHold()
+{
+    m_holding = false;
+    if (!m_hold || m_swipeRow < 0 || m_swipeRow >= m_rows.size()) {
+        return;
+    }
+    if (m_rows.at(m_swipeRow).removed) {
+        /// A page marked for deletion is on its way out: dragging it would only move something the
+        /// change is about to take away, which is the same reason "Move up"/"Move down" are off for
+        /// it. The press still selects it, so "Keep page" is one click away.
+        return;
+    }
+
+    m_holding = true;
+    m_hold->start(HoldDelayMs);
+}
+
+void PdfNotebookOpsDialog::startGrab()
+{
+    if (!m_holding) {
+        return;
+    }
+    m_holding = false;
+    if (m_swipeRow < 0 || m_swipeRow >= m_rows.size() || m_rows.at(m_swipeRow).removed) {
+        return;
+    }
+
+    m_grabbing = true;
+    m_grabRow = m_swipeRow;
+    m_dropGap = dropGapAt(m_swipeFrom.y());
+    showDropFeedback();
+}
+
+void PdfNotebookOpsDialog::updateGrab(const QPoint &at)
+{
+    m_dropGap = dropGapAt(at.y());
+    showDropFeedback();
+}
+
+void PdfNotebookOpsDialog::finishGrab(bool dropped)
+{
+    const int from = m_grabRow;
+    const int gap = m_dropGap;
+    endGrab();
+
+    /// Released outside the table: the drag is cancelled and the list is left exactly as it was.
+    if (!dropped || from < 0 || gap < 0) {
+        return;
+    }
+
+    /// Taking the row out first shifts everything after it up by one, so a gap below the row means
+    /// the row's own final position is one less than that gap. A gap where the row already is comes
+    /// out as \a from and moveRow() leaves it alone.
+    moveRow(from, gap > from ? gap - 1 : gap);
+}
+
+void PdfNotebookOpsDialog::endGrab()
+{
+    m_grabbing = false;
+    m_grabRow = -1;
+    m_dropGap = -1;
+    if (m_dropIndicator) {
+        m_dropIndicator->clearDrop();
+        m_dropIndicator->hide();
+    }
+}
+
+int PdfNotebookOpsDialog::dropGapAt(int y) const
+{
+    if (!m_table || m_rows.isEmpty()) {
+        return 0;
+    }
+
+    for (int row = 0; row < m_rows.size(); ++row) {
+        const int top = m_table->rowViewportPosition(row);
+        const int height = m_table->rowHeight(row);
+        if (y < top + height) {
+            /// The upper half of a row means "before it" and the lower half "after it", so the
+            /// insertion line is always drawn where the pointer is and the drop is where the line is.
+            return y < top + height / 2 ? row : row + 1;
+        }
+    }
+
+    /// Below the last row is the end of the list.
+    return m_rows.size();
+}
+
+void PdfNotebookOpsDialog::showDropFeedback()
+{
+    if (!m_dropIndicator || !m_table) {
+        return;
+    }
+
+    /// The row in the hand, highlighted. The list's order does not change until the drop, so this is
+    /// what says which page is being moved.
+    QRect held;
+    if (m_grabRow >= 0 && m_grabRow < m_rows.size()) {
+        held = QRect(0, m_table->rowViewportPosition(m_grabRow), m_table->viewport()->width(),
+                     m_table->rowHeight(m_grabRow));
+    }
+
+    /// And the line, at the top of the gap's row -- or along the bottom of the last row when the gap
+    /// is the end of the list.
+    int line = 0;
+    if (m_dropGap >= 0 && m_dropGap < m_rows.size()) {
+        line = m_table->rowViewportPosition(m_dropGap);
+    } else if (!m_rows.isEmpty()) {
+        const int last = m_rows.size() - 1;
+        line = m_table->rowViewportPosition(last) + m_table->rowHeight(last);
+    }
+
+    m_dropIndicator->setGeometry(m_table->viewport()->rect());
+    m_dropIndicator->setDrop(held, line);
+    m_dropIndicator->show();
+    m_dropIndicator->raise();
 }
 
 void PdfNotebookOpsDialog::duplicateSelected()
@@ -968,12 +1194,46 @@ bool PdfNotebookOpsDialog::eventFilter(QObject *watched, QEvent *event)
             if (m_swipeRow >= 0) {
                 m_table->selectRow(m_swipeRow);
             }
+            /// The reorder is armed on the SAME press the swipe is armed on -- one state machine,
+            /// two outcomes. A press that moves more than a few pixels before the hold fires is the
+            /// swipe; a press that stays put long enough becomes a grab.
+            if (static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+                beginHold();
+            }
+        } else if (event->type() == QEvent::MouseMove) {
+            const QPoint at = mousePosition(static_cast<QMouseEvent *>(event));
+            if (m_grabbing) {
+                /// The hold has fired, so the drag owns the gesture: the insertion point follows the
+                /// pointer, and the table must not scroll or select behind it.
+                updateGrab(at);
+                return true;
+            }
+            if (m_holding && (at - m_swipeFrom).manhattanLength() > HoldSlopPixels) {
+                /// Moved before the hold fired: this is a swipe (or a slipped click), not a grab.
+                m_holding = false;
+                if (m_hold) {
+                    m_hold->stop();
+                }
+            }
         } else if (event->type() == QEvent::MouseButtonRelease) {
             const QPoint at = mousePosition(static_cast<QMouseEvent *>(event));
-            const int dx = at.x() - m_swipeFrom.x();
-            const int dy = at.y() - m_swipeFrom.y();
             const int row = m_swipeRow;
             m_swipeRow = -1;
+            m_holding = false;
+            if (m_hold) {
+                m_hold->stop();
+            }
+
+            if (m_grabbing) {
+                /// The drag owns this release too: where it landed is a reorder, and the turn a
+                /// sideways drag would otherwise have meant cannot happen at all. A release outside
+                /// the table cancels instead.
+                finishGrab(m_table->viewport()->rect().contains(at));
+                return true;
+            }
+
+            const int dx = at.x() - m_swipeFrom.x();
+            const int dy = at.y() - m_swipeFrom.y();
 
             /// Sideways and far enough, and not a drag down the list. A swipe to the right turns the
             /// page right, which is the way the paper goes; one swipe is one quarter turn, because a

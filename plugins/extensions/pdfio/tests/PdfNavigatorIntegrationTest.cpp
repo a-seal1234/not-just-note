@@ -105,6 +105,13 @@ private Q_SLOTS:
     void testTheCanvasTurnsTheSelectedPageByAnyAngle();
     /// The REAL rotator at an angle that is not a right angle, which no other test runs.
     void testTheRealRotatorTurnsAPageByAnAngleThatIsNotARightAngle();
+    /// The page list's other gesture: press and hold a row, drag it to another place, drop it. The
+    /// new order is ONE pending edit, and the swipe that shares the same press still turns a page.
+    void testDraggingARowReordersItInOnePendingEdit();
+    /// A page marked for deletion cannot be grabbed: it is on its way out.
+    void testARowMarkedForDeletionCannotBeDragged();
+    /// A drop where the row already is, and a drop outside the table, both leave the list alone.
+    void testADropOnTheSamePositionIsANoOp();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -2295,6 +2302,343 @@ void PdfNavigatorIntegrationTest::testTheRealRotatorTurnsAPageByAnAngleThatIsNot
                             .arg(reopened.height())
                             .arg(expected.width())
                             .arg(expected.height())));
+}
+
+namespace {
+
+/// A press, a move or a release on \a widget at \a at, sent straight to it rather than through the
+/// window system so the position under test is the widget's own.
+void sendMouseAt(QWidget *widget, QEvent::Type type, const QPoint &at, Qt::MouseButton button,
+                 Qt::MouseButtons buttons)
+{
+    QMouseEvent event(type, at, widget->mapToGlobal(at), button, buttons, Qt::NoModifier);
+    QApplication::sendEvent(widget, &event);
+}
+
+/// The middle of page row \a row in the table's viewport.
+QPoint rowPoint(QTableWidget *table, int row)
+{
+    return table->visualRect(table->model()->index(row, 0)).center();
+}
+
+/// The order the change would write, as artifact names: the only thing a reorder is about.
+QStringList pageOrder(const PdfNotebookOps::PageEdits &edits)
+{
+    QStringList order;
+    for (const PdfPageRecord &page : edits.pages) {
+        order << page.kraFile;
+    }
+    return order;
+}
+
+/**
+ * Stops the fixture's dialog watchdog for the length of a test, and puts it back however the test
+ * ends.
+ *
+ * The watchdog dismisses any shown QDialog, which is exactly what the screen under test is -- so
+ * without this the screen is closed a few milliseconds in, and "the drop target is on screen" would
+ * be a statement about a hidden widget. Nothing in these tests can raise the modal dialog the
+ * watchdog exists for, so pausing it here is safe; the destructor starts it again even when a
+ * QVERIFY returns early.
+ */
+struct WatchdogPause {
+    explicit WatchdogPause(QTimer *watchdog)
+        : m_watchdog(watchdog)
+    {
+        m_watchdog->stop();
+    }
+    ~WatchdogPause() { m_watchdog->start(); }
+
+    WatchdogPause(const WatchdogPause &) = delete;
+    WatchdogPause &operator=(const WatchdogPause &) = delete;
+
+    QTimer *m_watchdog;
+};
+
+/// How many pixels of \a image carry any paint. The drop indicator is transparent except for the
+/// held row's highlight and the insertion line, so this is the proof that it draws something.
+int paintedPixels(const QImage &image)
+{
+    int painted = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (image.pixelColor(x, y).alpha() > 0) {
+                ++painted;
+            }
+        }
+    }
+    return painted;
+}
+
+} // namespace
+
+/**
+ * Press and hold a page row, drag it to another place, let go: the list takes the new order as ONE
+ * pending edit -- and the swipe that shares the same press still turns a page when the press moves
+ * at once.
+ *
+ * The buttons move a page one place per click, which is a lot of clicking for "this sheet belongs at
+ * the end", and a tablet has no room for a drag handle. So the gesture is the one everyone already
+ * knows: press, hold, drag, drop. What is asserted is that the drop lands in the pending list
+ * exactly as a button's move does -- one change, one undo, nothing written -- that a quick sideways
+ * drag is still the swipe rather than a reorder, and that once the hold has fired the drag owns the
+ * whole gesture, so a sideways drag reorders and cannot turn the page.
+ */
+void PdfNavigatorIntegrationTest::testDraggingARowReordersItInOnePendingEdit()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("reorder"));
+
+    /// Shown for the whole test, so the watchdog has to be out of the way: see WatchdogPause.
+    WatchdogPause watchdogPaused(m_dialogWatchdog);
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QCOMPARE(manifest.pages.size(), 3);
+
+    QFile manifestBeforeFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestBeforeFile.open(QIODevice::ReadOnly));
+    const QByteArray manifestBefore = manifestBeforeFile.readAll();
+
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY(table);
+    auto *indicator = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_drop_indicator"));
+    QVERIFY2(indicator, "the screen has no drop indicator for the held row and the insertion point");
+    auto *summary = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_summary"));
+    QVERIFY(summary);
+    auto *apply = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_apply"));
+    QVERIFY(apply);
+
+    dialog.show();
+    QTest::qWait(50);
+    QWidget *viewport = table->viewport();
+    QVERIFY2(table->visualRect(table->model()->index(2, 0)).isValid(),
+             "the page list has no laid-out row to drag");
+
+    const auto pressRow = [viewport, table](int row) {
+        sendMouseAt(viewport, QEvent::MouseButtonPress, rowPoint(table, row), Qt::LeftButton,
+                    Qt::LeftButton);
+    };
+    const auto moveTo = [viewport](const QPoint &at) {
+        sendMouseAt(viewport, QEvent::MouseMove, at, Qt::NoButton, Qt::LeftButton);
+    };
+    const auto releaseAt = [viewport](const QPoint &at) {
+        sendMouseAt(viewport, QEvent::MouseButtonRelease, at, Qt::LeftButton, Qt::NoButton);
+    };
+
+    const QStringList before = pageOrder(dialog.edits());
+    QVERIFY2(!indicator->isVisible(), "the drop indicator was on screen before any drag");
+
+    /// Hold the first page and drop it past the last one. The hold has to have fired before the move
+    /// is made, which is what the wait gives it; the indicator must be up by then.
+    pressRow(0);
+    QTest::qWait(600);
+    QVERIFY2(indicator->isVisible(), "the hold fired but the drag shows nothing");
+
+    const QPoint dropAt = rowPoint(table, 2) + QPoint(0, table->rowHeight(2));
+    moveTo(dropAt);
+
+    /// The held page is marked and the insertion line is drawn: a grab and a drop target that cannot
+    /// be missed. The line sits at the bottom of the last row, which is the end of the list.
+    const QImage feedback = indicator->grab().toImage();
+    QVERIFY2(paintedPixels(feedback) > 0, "the drag painted nothing at all");
+    const int heldTop = table->rowViewportPosition(0);
+    QVERIFY2(feedback.pixelColor(feedback.width() - 4, heldTop + 5).alpha() > 0,
+             "the row in the hand is not marked");
+    const int lineAt = table->rowViewportPosition(2) + table->rowHeight(2);
+    QVERIFY2(feedback.pixelColor(4, qBound(0, lineAt, feedback.height() - 1)).alpha() > 0,
+             "the insertion point is not marked");
+
+    releaseAt(dropAt);
+    QVERIFY2(!indicator->isVisible(), "the drop indicator was left on screen after the drop");
+
+    const QStringList after = pageOrder(dialog.edits());
+    QCOMPARE(after.size(), 3);
+    QCOMPARE(after.at(0), before.at(1));
+    QCOMPARE(after.at(1), before.at(2));
+    QCOMPARE(after.at(2), before.at(0));
+    QVERIFY2(apply->isEnabled(), "the reorder is not a pending edit");
+    QVERIFY2(summary->text().contains(QStringLiteral("1 change(s) pending")),
+             qPrintable(summary->text()));
+    QVERIFY2(summary->text().contains(QStringLiteral("order changed")), qPrintable(summary->text()));
+
+    /// A quick sideways drag is still the swipe: the press never stayed put, so nothing was grabbed,
+    /// the page turns, and the order does not move.
+    const QStringList beforeSwipe = pageOrder(dialog.edits());
+    const QPoint swipeFrom = rowPoint(table, 1);
+    pressRow(1);
+    moveTo(swipeFrom + QPoint(90, 0));
+    releaseAt(swipeFrom + QPoint(90, 0));
+    QVERIFY2(!indicator->isVisible(), "a quick drag put the drop indicator up");
+    QCOMPARE(pageOrder(dialog.edits()), beforeSwipe);
+    QCOMPARE(dialog.edits().pages.at(1).extraRotation, 90);
+
+    /// And a long hold followed by a drag that is mostly sideways -- |dx| >= 60 and |dx| > |dy|, so
+    /// the swipe would have taken it -- reorders and turns nothing: once the hold has fired, the drag
+    /// owns the whole gesture.
+    const QStringList beforeHold = pageOrder(dialog.edits());
+    pressRow(0);
+    QTest::qWait(600);
+    QVERIFY2(indicator->isVisible(), "the hold fired but the drag shows nothing");
+    const QPoint sideways = rowPoint(table, 1) + QPoint(120, table->rowHeight(1) / 2 - 2);
+    moveTo(sideways);
+    releaseAt(sideways);
+
+    const QStringList afterHold = pageOrder(dialog.edits());
+    QCOMPARE(afterHold.size(), 3);
+    QCOMPARE(afterHold.at(0), beforeHold.at(1));
+    QCOMPARE(afterHold.at(1), beforeHold.at(0));
+    QCOMPARE(afterHold.at(2), beforeHold.at(2));
+    /// No page was turned by that drag: the one the swipe turned above is still the only one holding
+    /// a turn.
+    int turned = 0;
+    for (const PdfPageRecord &page : dialog.edits().pages) {
+        if (page.extraRotation != 0) {
+            ++turned;
+        }
+    }
+    QCOMPARE(turned, 1);
+
+    /// Nothing was written: the new order is pending, and the notebook on disk is as it was.
+    QFile manifestAfterFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestAfterFile.open(QIODevice::ReadOnly));
+    QCOMPARE(manifestAfterFile.readAll(), manifestBefore);
+}
+
+/**
+ * A page marked for deletion cannot be dragged: it is on its way out.
+ *
+ * The struck-through row is still a row, so a hold on one is easy to allow by accident. Moving it
+ * would move something the change is about to take away -- the same reason "Move up"/"Move down" are
+ * off for it -- so the hold does not fire for it at all, and a drag over it leaves the list alone.
+ * The press still selects it, so "Keep page" stays one click away.
+ */
+void PdfNavigatorIntegrationTest::testARowMarkedForDeletionCannotBeDragged()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("reorder-deleted"));
+
+    /// Shown for the whole test, so the watchdog has to be out of the way: see WatchdogPause.
+    WatchdogPause watchdogPaused(m_dialogWatchdog);
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QCOMPARE(manifest.pages.size(), 3);
+
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY(table);
+    auto *indicator = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_drop_indicator"));
+    QVERIFY2(indicator, "the screen has no drop indicator");
+    auto *summary = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_summary"));
+    QVERIFY(summary);
+
+    dialog.show();
+    QTest::qWait(50);
+    QWidget *viewport = table->viewport();
+    QVERIFY2(table->visualRect(table->model()->index(1, 0)).isValid(),
+             "the page list has no laid-out row to hold");
+
+    /// Mark the middle page for deletion. The list keeps it, struck through, until Apply.
+    table->selectRow(1);
+    dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_delete_page"))->click();
+    QVERIFY2(summary->text().contains(QStringLiteral("1 page deleted")),
+             qPrintable(summary->text()));
+    const QStringList kept = pageOrder(dialog.edits());
+    QCOMPARE(kept.size(), 2);
+
+    /// A press and hold on the struck-through row: it is selected, and nothing is grabbed.
+    sendMouseAt(viewport, QEvent::MouseButtonPress, rowPoint(table, 1), Qt::LeftButton,
+                Qt::LeftButton);
+    QTest::qWait(600);
+    QVERIFY2(!indicator->isVisible(), "a page marked for deletion was grabbed");
+
+    /// Dragging it to the top anyway changes nothing: there is nothing held to drop.
+    const QPoint top = rowPoint(table, 0) - QPoint(0, table->rowHeight(0) / 2);
+    sendMouseAt(viewport, QEvent::MouseMove, top, Qt::NoButton, Qt::LeftButton);
+    sendMouseAt(viewport, QEvent::MouseButtonRelease, top, Qt::LeftButton, Qt::NoButton);
+
+    QVERIFY2(!indicator->isVisible(), "the drag indicator appeared for a page being deleted");
+    QCOMPARE(pageOrder(dialog.edits()), kept);
+    QVERIFY2(!summary->text().contains(QStringLiteral("order changed")),
+             qPrintable(summary->text()));
+    QVERIFY2(summary->text().contains(QStringLiteral("1 page deleted")),
+             qPrintable(summary->text()));
+}
+
+/**
+ * A drop where the row already is, and a drop outside the table, both leave the list alone.
+ *
+ * A hold that never moves is the most likely accident on a touch screen -- a press that lingers
+ * before the page is turned -- and it must not become a "change" that turns Apply on and makes the
+ * notebook reopen for nothing. A release outside the table is the other half: the drag is abandoned,
+ * rather than dropped at whatever row happens to be nearest.
+ */
+void PdfNavigatorIntegrationTest::testADropOnTheSamePositionIsANoOp()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("reorder-noop"));
+
+    /// Shown for the whole test, so the watchdog has to be out of the way: see WatchdogPause.
+    WatchdogPause watchdogPaused(m_dialogWatchdog);
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QCOMPARE(manifest.pages.size(), 3);
+
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY(table);
+    auto *indicator = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_drop_indicator"));
+    QVERIFY2(indicator, "the screen has no drop indicator");
+    auto *summary = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_summary"));
+    QVERIFY(summary);
+    auto *apply = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_apply"));
+    QVERIFY(apply);
+
+    dialog.show();
+    QTest::qWait(50);
+    QWidget *viewport = table->viewport();
+
+    const QStringList before = pageOrder(dialog.edits());
+    QVERIFY2(!apply->isEnabled(), "Apply was on before anything was done");
+
+    /// Hold the middle page and let go without moving it: the gap is the one it already occupies.
+    sendMouseAt(viewport, QEvent::MouseButtonPress, rowPoint(table, 1), Qt::LeftButton,
+                Qt::LeftButton);
+    QTest::qWait(600);
+    QVERIFY2(indicator->isVisible(), "the hold fired but the drag shows nothing");
+    sendMouseAt(viewport, QEvent::MouseButtonRelease, rowPoint(table, 1), Qt::LeftButton,
+                Qt::NoButton);
+
+    QVERIFY2(!indicator->isVisible(), "the drop indicator survived the drop");
+    QCOMPARE(pageOrder(dialog.edits()), before);
+    QVERIFY2(!apply->isEnabled(), "a drop where the row already was became a pending change");
+    QVERIFY2(summary->text().contains(QStringLiteral("No changes")), qPrintable(summary->text()));
+
+    /// Hold the last page, drag it above the list and let go there: that is outside the table, so
+    /// the drag is cancelled and the order is untouched.
+    sendMouseAt(viewport, QEvent::MouseButtonPress, rowPoint(table, 2), Qt::LeftButton,
+                Qt::LeftButton);
+    QTest::qWait(600);
+    QVERIFY2(indicator->isVisible(), "the hold fired but the drag shows nothing");
+    const QPoint outside(rowPoint(table, 2).x(), -20);
+    sendMouseAt(viewport, QEvent::MouseMove, outside, Qt::NoButton, Qt::LeftButton);
+    sendMouseAt(viewport, QEvent::MouseButtonRelease, outside, Qt::LeftButton, Qt::NoButton);
+
+    QVERIFY2(!indicator->isVisible(), "the drop indicator survived a cancelled drag");
+    QCOMPARE(pageOrder(dialog.edits()), before);
+    QVERIFY2(!apply->isEnabled(), "a cancelled drop changed the list");
 }
 
 int main(int argc, char *argv[])

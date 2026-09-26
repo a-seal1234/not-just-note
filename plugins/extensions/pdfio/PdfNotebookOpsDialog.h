@@ -21,10 +21,13 @@ class QEvent;
 class QLabel;
 class QPushButton;
 class QTableWidget;
+class QTimer;
 
 /// The preview pane beside the list: the selected page, large, turned by hand. Defined with its
 /// painting and its gestures in PdfNotebookOpsDialog.cpp.
 class PdfPageCanvas;
+/// The reorder's visual: the row being dragged, highlighted, and the line it would land on.
+class PdfRowDropIndicator;
 
 /**
  * The Notebook ops screen: the notebook's pages as one list, worked on as a whole.
@@ -144,6 +147,28 @@ private:
     void refresh();
     void refreshFooter();
     void moveSelected(int delta);
+    /**
+     * Puts the row at \a from where \a to is now, moving the rows between them rather than swapping
+     * the two: this is the whole of a reorder. "Move up"/"Move down" and a drop both come through
+     * here, so a reorder is one edit of the working copy whichever way it was asked for.
+     */
+    void moveRow(int from, int to);
+    /// Arms the press-and-hold: a press that stays put for the hold's length becomes a grab.
+    void beginHold();
+    /// The hold fired: the pressed row is now held, and the drag owns the gesture until release.
+    void startGrab();
+    /// The pointer moved while a row is held: the insertion point follows it.
+    void updateGrab(const QPoint &at);
+    /// The button came up. \a dropped is false when the pointer was outside the table, which cancels
+    /// the drag and leaves the list alone.
+    void finishGrab(bool dropped);
+    /// Hides the reorder's visual and forgets the drag. Called however a drag ends.
+    void endGrab();
+    /// The gap (0..m_rows.size()) the pointer at \a y would insert into: above a row's middle is
+    /// before it, below it is after it.
+    int dropGapAt(int y) const;
+    /// Draws the held row and the insertion line, and shows them over the table.
+    void showDropFeedback();
     void duplicateSelected();
     void deleteSelected();
     void keepSelected();
@@ -184,13 +209,25 @@ private:
     QStringList m_assets;
 
     /**
-     * The page list's own gesture: a swipe left or right across a row turns that page.
+     * The page list's own gestures, which share one press: a swipe turns a page, a hold reorders it.
      *
-     * The buttons are still the way to do it with a mouse, but a page is turned far more often than
-     * a page is deleted, and on a tablet a button is a small thing to find while a list of pages is
-     * a large thing to swipe. One swipe is one quarter turn: a swipe carries a direction and no
-     * angle, so it cannot mean "37 degrees". The canvas beside the list is where an angle is asked
-     * for.
+     * A swipe left or right across a row turns that page. The buttons are still the way to do it
+     * with a mouse, but a page is turned far more often than a page is deleted, and on a tablet a
+     * button is a small thing to find while a list of pages is a large thing to swipe. One swipe is
+     * one quarter turn: a swipe carries a direction and no angle, so it cannot mean "37 degrees".
+     * The canvas beside the list is where an angle is asked for.
+     *
+     * The same press also arms a reorder, because on a tablet there is no room for a drag handle and
+     * a press-and-hold is the gesture everyone already knows. The two are one state machine and not
+     * two: a press that moves more than a few pixels before the hold fires is the swipe, and a press
+     * that stays put long enough becomes a grab -- from then on the DRAG owns the gesture until the
+     * button comes up, and the turn cannot happen on that release at all.
+     *
+     * What a reorder decides, so that none of it is accidental: a page marked for deletion cannot be
+     * grabbed (it is on its way out, the same reason "Move up"/"Move down" are off for it); the first
+     * and last positions are legal drops; a drop where the row already is changes nothing and leaves
+     * Apply exactly as it was; and a release outside the table cancels the drag rather than dropping
+     * the page on whatever row happens to be nearest.
      */
     bool eventFilter(QObject *watched, QEvent *event) override;
 
@@ -230,6 +267,16 @@ private:
     /// on, not on whatever was selected before it.
     QPoint m_swipeFrom;
     int m_swipeRow = -1;
+    /// The press-and-hold: armed on a press, disarmed the moment the pointer moves, and fired by the
+    /// timer below when the press really stays put.
+    QTimer *m_hold = nullptr;
+    bool m_holding = false;
+    /// A row is held and the drag owns the gesture. Nothing is edited until the button comes up.
+    bool m_grabbing = false;
+    int m_grabRow = -1;
+    /// The gap (0..m_rows.size()) the held row would be inserted into if it were dropped now.
+    int m_dropGap = -1;
+    PdfRowDropIndicator *m_dropIndicator = nullptr;
     QLabel *m_summary = nullptr;
     QLabel *m_hint = nullptr;
     QPushButton *m_apply = nullptr;
