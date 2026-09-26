@@ -1137,6 +1137,11 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         /// Every page's content is on disk -- phase one wrote the whole window before this loop
         /// was allowed to run -- so the wipe below cannot take anything with it. Every content
         /// layer, because every one of them belongs to the page that is arriving.
+        ///
+        /// The cells of the window arriving tile the whole image, so a content layer is wiped over
+        /// every row of it whatever band each slot holds -- there is no old band for a content
+        /// layer to leave behind. The paper layer below is the one that needs one, and for exactly
+        /// that reason: it is wiped band by band, not as one layer.
         for (KisPaintLayer *layer : content) {
             layer->paintDevice()->fill(slots.at(i).cell,
                                        KoColor(Qt::transparent, m_document->image()->colorSpace()));
@@ -1146,7 +1151,28 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         /// this code's to repaint.
         KisPaintLayer *paper = qobject_cast<KisPaintLayer *>(
             const_cast<KisNode *>(m_stripPaper.at(i).data()));
+
+        /// The paper is wiped over the band it owned BEFORE the window moved as well as over the one
+        /// it owns now.
+        ///
+        /// Wiping the new band only is the stale strip the tablet reported -- "part of THAT one is
+        /// intruding into the current one". A paper holds one slot's band, and moving the window
+        /// back to the one holding a freely rotated page pushes every band below it down: the page's
+        /// displayed box is much taller than any other page's, so the cell of every slot after the
+        /// first starts lower than it did in the window that did not hold it. The rows at the top of
+        /// each paper's previous band are then OUTSIDE the band it owns now -- in the cell of the
+        /// slot below, whose paper layer sits underneath -- so they are drawn over the page that is
+        /// supposed to be there. Measured on the reported notebook (18 letter pages with page 1
+        /// turned 221 degrees, a five slot window): 576 rows on every slot but the first.
+        ///
+        /// The old band is read here, before m_stripCells is replaced at the end of the roll.
+        const QRect wasHeld = i < m_stripCells.size() ? m_stripCells.at(i) : QRect();
+        const QRect paperWipe = (wasHeld.isValid() && !wasHeld.isEmpty())
+            ? wasHeld.united(slots.at(i).cell)
+            : slots.at(i).cell;
         if (paper) {
+            paper->paintDevice()->fill(paperWipe,
+                                       KoColor(Qt::transparent, m_document->image()->colorSpace()));
             /// The desk colour for the room around the page, then the page itself.
             paper->paintDevice()->fill(slots.at(i).cell,
                                        KoColor(QColor(96, 96, 96), m_document->image()->colorSpace()));
@@ -1154,12 +1180,21 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
 
         /// Krita is told the slot changed. Writing into a paint device directly does not do that,
         /// and without it the canvas goes on showing what was there before: the window rolled, the
-        /// slots held the right pages, and the screen did not.
+        /// slots held the right pages, and the screen did not. The band cleared above counts as
+        /// changed as much as the one repainted: rows that no longer carry paint have to be redrawn
+        /// too, or the stale ones stay on the canvas exactly as they were in the image.
+        /// The rectangles handed to Krita are in IMAGE coordinates and are clamped to the image:
+        /// slot 0's band starts half a gap above it (cell y is -56) so that the bands meet in the
+        /// middle of the gap, and a dirty rectangle with a negative origin is not something the
+        /// canvas, the thumbnail cache or the Layers docker's node model is entitled to be given.
+        /// The paint-device wipe and the desk fill above are deliberately NOT clamped -- the cell
+        /// has to be covered exactly as it is laid out -- and only the notification is trimmed.
+        const QRect imageRect(0, 0, m_document->image()->width(), m_document->image()->height());
         if (paper) {
-            paper->setDirty(slots.at(i).cell);
+            paper->setDirty(paperWipe.intersected(imageRect));
         }
         for (KisPaintLayer *layer : content) {
-            layer->setDirty(slots.at(i).cell);
+            layer->setDirty(slots.at(i).cell.intersected(imageRect));
         }
 
         if (newPage < 0) {

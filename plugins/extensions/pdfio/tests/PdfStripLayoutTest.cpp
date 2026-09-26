@@ -31,6 +31,7 @@ private Q_SLOTS:
     void testAngledPageFillsItsBoundingBox();
     void testAngledPageDoesNotChangeTheImage();
     void testRightAnglesAreUnchanged();
+    void testAWindowMoveLeavesBandsOutsideTheNewCells();
 
 private:
     /// Three pages: A4, then A5 rotated, then a small square. Mixed on purpose.
@@ -73,6 +74,28 @@ private:
             page.index = i;
             page.sizePt = sizes[i];
             page.extraRotation = turns[i];
+            page.kraFile = QStringLiteral("pages/p%1.kra").arg(i + 1, 4, 10, QLatin1Char('0'));
+            page.thumbFile = QStringLiteral("thumbs/p%1.png").arg(i + 1, 4, 10, QLatin1Char('0'));
+            manifest.pages.append(page);
+        }
+        return manifest;
+    }
+
+    /// A notebook of same-size letter pages, one of them set down at an angle: the user's
+    /// notebook, whose windows are what a move between the page holding the big box and one that
+    /// does not has to survive.
+    static PdfSessionManifest letterBook(int count, int rotatedPage, int degrees)
+    {
+        PdfSessionManifest manifest;
+        manifest.sourceFile = QStringLiteral("fixture.pdf");
+        manifest.sourceSha256 = QByteArrayLiteral("0000");
+        manifest.sourceByteSize = 1;
+
+        for (int i = 0; i < count; ++i) {
+            PdfPageRecord page;
+            page.index = i;
+            page.sizePt = QSizeF(612, 792);
+            page.extraRotation = i == rotatedPage ? degrees : 0;
             page.kraFile = QStringLiteral("pages/p%1.kra").arg(i + 1, 4, 10, QLatin1Char('0'));
             page.thumbFile = QStringLiteral("thumbs/p%1.png").arg(i + 1, 4, 10, QLatin1Char('0'));
             manifest.pages.append(page);
@@ -368,6 +391,58 @@ void PdfStripLayoutTest::testRightAnglesAreUnchanged()
     QCOMPARE(turnedBoxPt(sheet, 180), sheet);
     QCOMPARE(turnedBoxPt(sheet, 90), QSizeF(sheet.height(), sheet.width()));
     QCOMPARE(turnedBoxPt(sheet, 270), QSizeF(sheet.height(), sheet.width()));
+}
+
+/**
+ * The precondition of the stale-strip bug, as geometry: moving the window from the one holding a
+ * freely rotated page to one that does not hold it, and back, leaves the top of every slot's old
+ * band OUTSIDE the band it owns afterwards.
+ *
+ * This is why the roll has to clear the paper over the old band as well as the new one. The image
+ * is the same size in both windows -- that is what lets the roll run at all, and the reason the
+ * layout sizes it from the tallest window of the whole notebook -- so nothing resizes, nothing
+ * refuses, and the bands simply do not line up.
+ */
+void PdfStripLayoutTest::testAWindowMoveLeavesBandsOutsideTheNewCells()
+{
+    const PdfSessionManifest manifest = letterBook(18, 0, 221);
+    const int scope = 5;
+    const PdfStripLayout holding = PdfStripLayout::forWindow(manifest, 0, scope, 200.0);
+    const PdfStripLayout away = PdfStripLayout::forWindow(manifest, 8, scope, 200.0);
+
+    QVERIFY(holding.isValid());
+    QVERIFY(away.isValid());
+
+    /// The two windows are the user's: the first holds the tilted page, the second does not, and
+    /// the two have to be the same image or the move would be refused instead of made.
+    QCOMPARE(holding.slots().at(0).page, 0);
+    QCOMPARE(away.slots().at(0).page, 6);
+    QVERIFY(holding.slots().at(0).rect.height() > away.slots().at(0).rect.height());
+    QCOMPARE(holding.imageSize(), away.imageSize());
+
+    /// And the bands really do not line up: every slot but the first starts lower in the window
+    /// holding the tilted page, so the top of its previous band sticks out above the new one.
+    int shifted = 0;
+    for (int i = 0; i < holding.slots().size(); ++i) {
+        const QRect nowOwned = holding.slots().at(i).cell;
+        const QRect wasHeld = away.slots().at(i).cell;
+        if (nowOwned.top() > wasHeld.top()) {
+            ++shifted;
+            /// The band left behind is a real band, not a rounding: the tilted page is over two
+            /// hundred rows taller than the sheet it replaces.
+            QVERIFY(nowOwned.top() - wasHeld.top() > 100);
+        }
+    }
+    QCOMPARE(shifted, holding.slots().size() - 1);
+
+    /// The cells of the window that IS up still tile the image, which is the other half of the
+    /// story: a content layer is wiped over every one of them, so the whole content layer is
+    /// cleared each roll, and only the paper needs its old band.
+    QVERIFY(holding.slots().first().cell.top() <= 0);
+    for (int i = 1; i < holding.slots().size(); ++i) {
+        QCOMPARE(holding.slots().at(i).cell.top(), holding.slots().at(i - 1).cell.bottom() + 1);
+    }
+    QCOMPARE(holding.slots().last().cell.bottom() + 1, holding.imageSize().height());
 }
 
 QTEST_MAIN(PdfStripLayoutTest)

@@ -112,6 +112,14 @@ private Q_SLOTS:
     void testARowMarkedForDeletionCannotBeDragged();
     /// A drop where the row already is, and a drop outside the table, both leave the list alone.
     void testADropOnTheSamePositionIsANoOp();
+    /// The preview is prepared for the screen rather than for the file: the pixels a card and the
+    /// canvas are drawn from are the size they are drawn at, tagged with the screen's ratio.
+    void testAPreviewIsPreparedForTheScreensDeviceRatio();
+    /// The canvas asks the navigator for a fresh preview rather than stretching a small one.
+    void testTheCanvasAsksTheNavigatorForAFreshPreview();
+    /// A window that holds a freely rotated page and one that does not, rolled between and back:
+    /// the image is the same size by design, and part of the strip that was there used to stay.
+    void testRollingBackToARotatedPageLeavesNoStripBehind();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1788,6 +1796,233 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
 }
 
 /**
+ * Rolling back to the window that holds a freely rotated page leaves nothing of the window left
+ * behind.
+ *
+ * Reported from the tablet: "it is as if the layout does not clear the background completely. It
+ * happens when I scroll the tilted page 1 down, switch to the strip of pages 3-8, then switch back,
+ * and find that part of THAT one is intruding into the current one."
+ *
+ * The image is the same size in both windows by design -- the layout sizes it from the tallest
+ * window of the whole notebook -- so the roll runs and every slot's cell is wiped. What that wipe
+ * did not reach was a PAPER layer's own content from the window before: a paper was wiped only over
+ * the band it owned NOW, and moving back to the window holding the big rotated page pushes every
+ * band below it down. The top of each paper's previous band was then left above its new one -- in
+ * the cell of the slot below, whose paper layer sits underneath -- and drawn over the page that was
+ * supposed to be there.
+ *
+ * The page also carries a second content layer kind, an inserted image, so the test proves the
+ * content layers -- wiped over every slot's cell, and the cells tile the whole image -- really are
+ * cleared, and that what leaked was only the paper.
+ */
+void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehind()
+{
+    /// The user's notebook, built rather than opened from a fixture so the geometry is exactly the
+    /// reported one: eighteen same-size letter pages, page 1 set down at 221 degrees, so its box is
+    /// 2726x2776 px against 1700x2200 for the rest at 200 dpi.
+    /// The project lives under the run's own temporary root, beside every other test's, rather
+    /// than in a directory of its own that dies when this function returns: a project removed while
+    /// the navigator still knows about it is a state no other test leaves behind, and the next
+    /// test's openNotebook() writes the page being replaced before it adopts its own notebook.
+    const QString project = m_dir.filePath(QStringLiteral("stale-strip-project"));
+    const QString source = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(source), qPrintable(source));
+
+    PopplerRenderBackend backend;
+    QString why;
+    PdfSessionManifest manifest = PdfSession::createProject(project, source, backend, &why);
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    /// Every page the same size, and only page 1 turned. The fixture's Letter page is the source of
+    /// all of them, so nothing but the angle can make one window different from another.
+    /// The fixture's own geometry cycle: MANY_GEOMETRY[2] is ((0, 0, 612, 792), 0), a letter
+    /// sheet, so every page below is the same size out of the same source page.
+    const int letterPage = 2;
+    const int pages = 18;
+    manifest.pages.clear();
+    for (int i = 0; i < pages; ++i) {
+        PdfPageRecord page;
+        page.index = letterPage;
+        page.sizePt = QSizeF(612, 792);
+        page.kraFile = PdfSession::pageFileName(i);
+        page.thumbFile = PdfSession::thumbFileName(i);
+        page.extraRotation = i == 0 ? 221 : 0;
+        manifest.pages.append(page);
+    }
+    manifest.refreshNextPageNumber();
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+    QVERIFY2(manifest.writeTo(PdfSession::manifestPath(project), &why), qPrintable(why));
+
+    navigator()->setScope(5);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+    QCOMPARE(navigator()->pageCount(), pages);
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    const PdfSessionManifest opened = navigator()->manifest();
+    QCOMPARE(opened.pages.at(0).extraRotation, 221);
+
+    /// The window holding the tilted page and the one the user switched to. Same image, different
+    /// bands -- that sameness is what lets the roll run at all, and the difference is the trap.
+    const PdfStripLayout holding = PdfStripLayout::forWindow(opened, 0, 5, 200.0);
+    const PdfStripLayout away = PdfStripLayout::forWindow(opened, 8, 5, 200.0);
+    QVERIFY(holding.isValid());
+    QVERIFY(away.isValid());
+    QCOMPARE(holding.imageSize(), away.imageSize());
+    QCOMPARE(holding.slots().at(0).page, 0);
+    QVERIFY2(holding.slots().at(0).rect.height() > away.slots().at(0).rect.height(),
+             "the tilted page is not the tall one, so this test would prove nothing");
+    QVERIFY2(holding.slots().at(1).cell.top() != away.slots().at(1).cell.top(),
+             "the two windows have the same bands, so this test would prove nothing");
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisImageSP strip = document->image();
+    QVERIFY(strip);
+    QCOMPARE(QSize(strip->width(), strip->height()), holding.imageSize());
+    QVERIFY2(strip->width() > qRound(612.0 * 200.0 / 72.0),
+             "the strip was not built wide enough for the turned page's box");
+
+    /// The Ink group, and a second content layer kind inside it: the inserted image the user's own
+    /// page carries. The first roll writes it into the page's artifact; the second has to bring it
+    /// back as its own layer, at its own place, and clear it everywhere else.
+    KisNodeSP inkGroup;
+    for (quint32 i = 0; i < strip->root()->childCount(); ++i) {
+        KisNodeSP child = strip->root()->at(i);
+        if (qobject_cast<KisGroupLayer *>(child.data())) {
+            inkGroup = child;
+            break;
+        }
+    }
+    QVERIFY2(inkGroup, "the strip has no Ink group");
+
+    const QRect picture(40, 60, 48, 48);
+    KisPaintLayerSP inserted = new KisPaintLayer(strip, QStringLiteral("Inserted image"),
+                                                 OPACITY_OPAQUE_U8);
+    inserted->paintDevice()->fill(QRect(QPoint(0, 0), picture.size()),
+                                  KoColor(QColor(255, 0, 0), strip->colorSpace()));
+    inserted->setX(picture.x());
+    inserted->setY(picture.y());
+    QVERIFY2(strip->addNode(inserted, inkGroup), "the picture could not be added to the Ink group");
+
+    document->setModified(true);
+    Q_EMIT strip->sigImageModified();
+
+    /// Away: the window moves off the tilted page, writing every page it held -- the inserted image
+    /// among them.
+    QVERIFY2(navigator()->showPage(8, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 8);
+    QVERIFY2(QFileInfo::exists(artifactFor(0)), "the roll did not write the tilted page");
+
+    /// And back. This second roll is the one the report is about.
+    QVERIFY2(navigator()->showPage(0, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    /// The document is the same one: a roll moves the window, it does not rebuild it. Without this
+    /// the assertions below could be reading a freshly built strip and pass without proving
+    /// anything.
+    QVERIFY(navigator()->currentDocument() == document);
+    /// .data() on both sides: image() hands back a KisImageWSP (weak) and strip is a KisImageSP
+    /// (shared), and there is no single overload for comparing the two. The question is identity --
+    /// the same image, not a rebuilt one -- and the raw pointers ask exactly that.
+    QVERIFY(navigator()->currentDocument()->image().data() == strip.data());
+
+    /// Every paper layer is exactly the band it owns now: the desk colour over the whole cell, the
+    /// page inside it, and nothing anywhere else. A row of the previous window left outside the new
+    /// band is what the user saw as the other strip intruding.
+    ///
+    /// The cell is compared as the layout lays it out, NOT clipped to the image. Slot 0's band
+    /// starts half a gap above the image -- cell y is -56 -- so that the bands meet in the middle of
+    /// the gap, and a paint device keeps those rows even though the image never shows them (the
+    /// reported failure is exactly that: painted 0,-56 2726x2888, which IS slot 0's cell). Clipping
+    /// the expectation would fail on a paper that is painted perfectly. Equality is also the
+    /// strictest form of the check the test exists for: a stale band outside the cell, a band one
+    /// row short, or the wrong slot's paper all fail it.
+    QList<KisPaintLayer *> papers;
+    for (quint32 i = 0; i < strip->root()->childCount(); ++i) {
+        KisNodeSP child = strip->root()->at(i);
+        if (child->name() == QStringLiteral("Desk") || child == inkGroup) {
+            continue;
+        }
+        if (KisPaintLayer *paper = qobject_cast<KisPaintLayer *>(child.data())) {
+            papers.append(paper);
+        }
+    }
+    QCOMPARE(papers.size(), holding.slots().size());
+
+    for (int i = 0; i < papers.size(); ++i) {
+        const QRect ownedNow = holding.slots().at(i).cell;
+        const QRect painted = papers.at(i)->paintDevice()->exactBounds();
+        QVERIFY2(painted == ownedNow,
+                 qPrintable(QStringLiteral("the paper of slot %1 is painted %2,%3 %4x%5, where the "
+                                           "band it owns now is %6,%7 %8x%9")
+                                .arg(i)
+                                .arg(painted.x()).arg(painted.y())
+                                .arg(painted.width()).arg(painted.height())
+                                .arg(ownedNow.x()).arg(ownedNow.y())
+                                .arg(ownedNow.width()).arg(ownedNow.height())));
+    }
+
+    /// And there really is a second content layer kind to clear: the inserted image came back as
+    /// its own layer, in its own place on the tilted page, and nowhere else.
+    KisPaintLayer *insertedBack = nullptr;
+    for (quint32 i = 0; i < inkGroup->childCount(); ++i) {
+        KisPaintLayer *layer = qobject_cast<KisPaintLayer *>(inkGroup->at(i).data());
+        if (layer && layer->name() == QStringLiteral("Inserted image")) {
+            insertedBack = layer;
+            break;
+        }
+    }
+    QVERIFY2(insertedBack, "the inserted image did not come back as a layer of its own");
+
+    const QRect tiltedSlot = holding.slots().at(0).rect;
+    const QRect expectedPicture(tiltedSlot.topLeft() + picture.topLeft(), picture.size());
+    QVERIFY2(insertedBack->paintDevice()->exactBounds() == expectedPicture,
+             qPrintable(QStringLiteral("the inserted image is at %1,%2 %3x%4, not at its own place "
+                                       "%5,%6 %7x%8 in the page's slot")
+                            .arg(insertedBack->paintDevice()->exactBounds().x())
+                            .arg(insertedBack->paintDevice()->exactBounds().y())
+                            .arg(insertedBack->paintDevice()->exactBounds().width())
+                            .arg(insertedBack->paintDevice()->exactBounds().height())
+                            .arg(expectedPicture.x()).arg(expectedPicture.y())
+                            .arg(expectedPicture.width()).arg(expectedPicture.height())));
+
+    const QImage picturePixels =
+        insertedBack->paintDevice()->convertToQImage(0, expectedPicture);
+    QVERIFY(!picturePixels.isNull());
+    const QColor at = picturePixels.pixelColor(QPoint(picture.width() / 2, picture.height() / 2));
+    QVERIFY2(at.red() > 200 && at.green() < 60 && at.blue() < 60,
+             qPrintable(QStringLiteral("the inserted image came back as rgb(%1,%2,%3)")
+                            .arg(at.red()).arg(at.green()).arg(at.blue())));
+
+    /// And the tab is closed the way every test that leaves one open closes it: a view nobody
+    /// closed takes the main window down with it in the teardown. Nothing was drawn that is not on
+    /// disk -- the roll wrote the window -- so closing asks nothing.
+    ///
+    /// Drained on both sides of the close, for longer than the Layers docker's node model
+    /// compresses a dummy change. That model calls m_d->indexConverter without a guard when the
+    /// queue fires (libs/ui/kis_node_model.cpp:440), and setDummiesFacade deletes and nulls that
+    /// converter without stopping the compressor or clearing the queue (:316, :144-152) -- only
+    /// slotBeginRemoveDummy does, and it is marked FIXME (:383). So a node update still in the air
+    /// when the document goes away crashes from whatever nested event loop is running, and
+    /// KisImage::waitForDone() spins one through KisBusyWaitBroker -> KisDelayedSaveDialog. This
+    /// test runs its strokes and rolls in one image and then closes it, which is the most likely
+    /// place for that queue to be non-empty at close; letting it run while the model is still
+    /// attached, and again after the close, is what keeps this test from handing that work to
+    /// whatever runs next. It is not a fix for the Krita defect -- the missing guard is.
+    QApplication::processEvents();
+    QTest::qWait(200);
+    document->setModified(false);
+    navigator()->setScope(1);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
+/**
  * A window move as a whole, as a flow: write every page the window holds, then redraw the whole
  * window from what was written.
  *
@@ -2639,6 +2874,137 @@ void PdfNavigatorIntegrationTest::testADropOnTheSamePositionIsANoOp()
     QVERIFY2(!indicator->isVisible(), "the drop indicator survived a cancelled drag");
     QCOMPARE(pageOrder(dialog.edits()), before);
     QVERIFY2(!apply->isEnabled(), "a cancelled drop changed the list");
+}
+
+/**
+ * A preview is prepared for the screen, not for the file.
+ *
+ * The saved preview of an A4 page is 180x256 pixels; the card it goes into is 46x62 LOGICAL pixels,
+ * which on a 2-2.5x tablet is 115x155 DEVICE pixels, and the canvas wants several times that again.
+ * Handing Qt the file's size for the box and letting the painter stretch it by the screen's ratio is
+ * what the user saw as pixelation. What is asserted here is the arithmetic of the fix at the ratios
+ * a 3K panel really has, and then that the screen's two surfaces use it: the card's pixels are the
+ * card's size at the table's ratio, the pane's pixels are the pane's size at the canvas's ratio, and
+ * for the card the source is at least as big as what is drawn -- which is the crispness claim, and a
+ * size claim.
+ */
+void PdfNavigatorIntegrationTest::testAPreviewIsPreparedForTheScreensDeviceRatio()
+{
+    /// The arithmetic, at the ratios the tablet has. The result is the drawn size in DEVICE pixels,
+    /// tagged with the ratio, never the file's size handed through.
+    QImage sheet(180, 256, QImage::Format_ARGB32_Premultiplied);
+    sheet.fill(Qt::white);
+    const QPixmap file = QPixmap::fromImage(sheet);
+    const QSize logical(46, 62);
+    for (qreal ratio : { 1.0, 2.0, 2.5 }) {
+        const QPixmap prepared = pdfioPreviewForDisplay(file, logical, ratio);
+        QVERIFY2(!prepared.isNull(), "a preview with pixels was prepared as nothing");
+        QCOMPARE(prepared.devicePixelRatio(), ratio);
+        QCOMPARE(prepared.size(),
+                 QSize(qRound(logical.width() * ratio), qRound(logical.height() * ratio)));
+    }
+
+    /// Nothing in, nothing out: no pixels are invented for an empty source or an empty box.
+    QVERIFY(pdfioPreviewForDisplay(QPixmap(), logical, 2.5).isNull());
+    QVERIFY(pdfioPreviewForDisplay(file, QSize(), 2.5).isNull());
+
+    /// And now the screen's own two surfaces, which is where the numbers have to be real. The
+    /// preview on disk is the size a real one is: 180x256 for an A4 page.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("dense-preview"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QVERIFY(!manifest.pages.at(0).thumbFile.isEmpty());
+
+    const QString thumbPath = QDir(project).filePath(manifest.pages.at(0).thumbFile);
+    QVERIFY2(sheet.save(thumbPath), qPrintable(thumbPath));
+
+    WatchdogPause watchdogPaused(m_dialogWatchdog);
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY(table);
+    auto *canvas = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_canvas"));
+    QVERIFY(canvas);
+
+    dialog.show();
+    QTest::qWait(50);
+
+    /// The card: the file is 180x256, the card is the table's icon size, and the pixels prepared for
+    /// it are that box at the table's ratio -- not the file handed through.
+    const PdfNotebookOpsDialog::PreparedPreview card = dialog.cardPreview(0);
+    QVERIFY2(!card.pixmap.isNull(), "the card has no picture");
+    QCOMPARE(card.sourcePixels, QSize(180, 256));
+    QCOMPARE(card.logicalSize, QSize(180, 256).scaled(table->iconSize(), Qt::KeepAspectRatio));
+    QCOMPARE(card.devicePixelRatio, table->devicePixelRatioF());
+    QCOMPARE(card.pixmap.size(), QSize(qRound(card.logicalSize.width() * table->devicePixelRatioF()),
+                                       qRound(card.logicalSize.height() * table->devicePixelRatioF())));
+    QVERIFY2(card.sourcePixels.width() >= card.pixmap.width()
+                 && card.sourcePixels.height() >= card.pixmap.height(),
+             "the card is drawn from fewer pixels than it is drawn at, so it will be stretched");
+
+    /// The canvas: the same rule at the pane's own size. The pane is bigger than the file, which is
+    /// exactly the case the other test covers -- here what matters is that the pixels prepared for
+    /// it are the pane's drawn size, not the file's.
+    canvas->grab();
+    const PdfNotebookOpsDialog::PreparedPreview pane = dialog.canvasPreview();
+    QVERIFY2(!pane.pixmap.isNull(), "the canvas has no picture");
+    QCOMPARE(pane.sourcePixels, QSize(180, 256));
+    QCOMPARE(pane.devicePixelRatio, canvas->devicePixelRatioF());
+    QCOMPARE(pane.pixmap.size(), QSize(qRound(pane.logicalSize.width() * canvas->devicePixelRatioF()),
+                                       qRound(pane.logicalSize.height() * canvas->devicePixelRatioF())));
+    QVERIFY2(pane.logicalSize != pane.sourcePixels,
+             "the canvas handed the file through instead of preparing it for the pane");
+    QVERIFY2(pane.logicalSize.width() > 0 && pane.logicalSize.height() > 0,
+             "the canvas prepared nothing to draw into");
+}
+
+/**
+ * The canvas asks the navigator for a fresh preview instead of stretching a small one.
+ *
+ * The file a page's preview is saved in is small -- 180x256 for A4 -- and a 3K tablet's pane wants
+ * several times those pixels. When the pane is about to draw at a size its row's preview cannot
+ * fill, the page is asked for again rather than the small picture stretched. The ask has to go to
+ * the navigator, and this is that: a notebook the navigator itself has open, its preview deleted, and
+ * the file back on disk because the screen asked for it -- nothing else in this test writes one.
+ */
+void PdfNavigatorIntegrationTest::testTheCanvasAsksTheNavigatorForAFreshPreview()
+{
+    QVERIFY(useNotebook(QStringLiteral("crisp-preview")));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest manifest = navigator()->manifest();
+    QVERIFY2(!manifest.pages.at(0).thumbFile.isEmpty(), "the page records no preview name");
+
+    const QString preview = QDir(project).filePath(manifest.pages.at(0).thumbFile);
+    QFile::remove(preview);
+    QVERIFY2(!QFileInfo::exists(preview), qPrintable(preview));
+
+    WatchdogPause watchdogPaused(m_dialogWatchdog);
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *canvas = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_canvas"));
+    QVERIFY(canvas);
+
+    dialog.show();
+    QTest::qWait(50);
+
+    /// The pane has no preview for the open page, so the screen asks the navigator for one -- and
+    /// the ask is what writes the file, because nothing else in this test does.
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(preview), 10000);
+
+    /// And the fresh pixels reach the canvas rather than staying in the file.
+    canvas->grab();
+    const PdfNotebookOpsDialog::PreparedPreview pane = dialog.canvasPreview();
+    QVERIFY2(!pane.pixmap.isNull(), "the fresh preview never reached the canvas");
+    QVERIFY2(!pane.sourcePixels.isEmpty(), "the canvas is still drawing an empty sheet");
+    QCOMPARE(pane.devicePixelRatio, canvas->devicePixelRatioF());
+
+    /// The pixels the pane took are the pixels the navigator wrote, not something it drew itself.
+    const QImage written(preview);
+    QVERIFY2(!written.isNull(), qPrintable(preview));
+    QCOMPARE(pane.sourcePixels, written.size());
 }
 
 int main(int argc, char *argv[])
