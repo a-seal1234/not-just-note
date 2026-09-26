@@ -292,9 +292,18 @@ qreal fitZoomFor(const QSize &viewport, const QRect &pageRect)
 /// 96 dpi or more -- so this only stops throwing the pixels away at the last step.
 constexpr int ThumbnailPixels = 1152;
 
-/// The coarsest a page is rendered at on its way to a thumbnail. Below this, text stops being
-/// recognisable and the thumbnail stops being useful for choosing a page.
-constexpr qreal ThumbnailRenderDpi = 96;
+/// The coarsest a page is ever rendered at, on its way to a preview or to the strip. Below this,
+/// text stops being recognisable: a page is not worth drawing coarser than this. Shared, so the two
+/// paths that render a page cannot drift into two floors.
+constexpr qreal CoarsestRenderDpi = 96;
+
+/// The dpi a page is rendered at when no page-size bound is set, and the finest any bound can make
+/// it -- the fixed 200 dpi the strip rendered at before the bound existed.
+constexpr qreal DefaultRenderDpi = 200;
+
+/// Where the rendered page-size bound is kept. 0 means no bound, which is what a notebook that has
+/// never been given one gets.
+const char *const MaxPagePixelsKey = "pdfio/maxPagePixels";
 
 /// Whether a roll should behave as if its document went away after the write phase. Set by a test
 /// only; see PdfPageNavigator::setDocumentGoneAfterWritesForTests().
@@ -310,6 +319,12 @@ PdfPageNavigator::PdfPageNavigator()
     : m_saves(SaveLandingTimeoutMs)
     , m_sourceRenderers([]() { return PdfRenderBackend::create(); })
 {
+    /// The rendered page size the user chose, if one ever was. Read before anything can render, so
+    /// the first page of the first notebook this process opens is already at the chosen size -- and
+    /// a fresh install, or a notebook nobody has touched this for, gets 0: the fixed 200 dpi the
+    /// strip has always rendered at.
+    m_maxPagePixels = qMax(0, QSettings().value(QLatin1String(MaxPagePixelsKey), 0).toInt());
+
     /// The window's save is the plugin's own page save: the ink-only document, the crop when the
     /// page lives in a strip, and the asynchronous write saveCurrentPage already owns. Wired once
     /// here rather than at each call site, so no page switch can run without it -- and through
@@ -685,7 +700,7 @@ void PdfPageNavigator::makeOneThumbnail()
     /// rather than lowering it.
     const PdfPageInfo info = m_sourceRenderers.pageInfo(manifest, m_projectDir, index, nullptr);
     const qreal widthPt = qMax(qreal(1), info.sizePt.width());
-    const qreal dpi = qBound(ThumbnailRenderDpi, ThumbnailPixels * 72.0 / widthPt, qreal(200));
+    const qreal dpi = qBound(CoarsestRenderDpi, ThumbnailPixels * 72.0 / widthPt, DefaultRenderDpi);
 
     const QImage page = m_sourceRenderers.renderPage(manifest, m_projectDir, index, dpi, nullptr);
     if (page.isNull()) {
@@ -1161,7 +1176,11 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     /// and a read before it lands shows the page as it was before the ink that is on its way.
     drainWrites(nullptr);
 
-    const PdfStripBuilder::Strip strip = PdfStripBuilder::build(m_manifest, index, m_scope, m_dpi,
+    /// The dpi the page-size bound implies for THIS window, derived once and handed to the builder:
+    /// the layout the strip is built at and the layout a later roll of it builds have to be the same
+    /// resolution, or a roll would render the pages at a scale the layout does not describe.
+    const qreal dpi = renderDpiFor(index);
+    const PdfStripBuilder::Strip strip = PdfStripBuilder::build(m_manifest, index, m_scope, dpi,
                                                                 m_sourceRenderers, m_projectDir, why);
     if (!strip.image) {
         return false;
@@ -1203,7 +1222,10 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     if (centreOn < 0 || centreOn >= m_manifest.pages.size()) {
         centreOn = index;
     }
-    const PdfStripLayout target = PdfStripLayout::forWindow(m_manifest, centreOn, m_scope, m_dpi);
+    /// One derivation for the whole roll: the window it lays out and the pages it renders below are
+    /// the same resolution, so a window cannot be built at one and repainted at another.
+    const qreal dpi = renderDpiFor(centreOn);
+    const PdfStripLayout target = PdfStripLayout::forWindow(m_manifest, centreOn, m_scope, dpi);
     if (!target.isValid()) {
         fail(why, QStringLiteral("the new window has no valid layout"));
         return false;
@@ -1595,7 +1617,7 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
         }
 
         const QImage rendered =
-            m_sourceRenderers.renderPage(m_manifest, m_projectDir, newPage, m_dpi, nullptr);
+            m_sourceRenderers.renderPage(m_manifest, m_projectDir, newPage, dpi, nullptr);
         if (paper && !rendered.isNull()) {
             paper->paintDevice()->convertFromQImage(rendered, nullptr,
                                                     slots.at(i).rect.x(), slots.at(i).rect.y());
@@ -1630,7 +1652,8 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             }
 
             /// The artifact is page-local at whatever resolution it was WRITTEN at, and this
-            /// repaint is at m_dpi -- which the page-resolution setting can have changed since. So
+            /// repaint is at the resolution derived above -- which the page-size bound can have
+            /// changed since the ink was written. So
             /// it is scaled to the page's own rectangle, which is what keeps the ink on the page it
             /// was drawn on. A difference of two pixels or less is pasted as it is: that is the two
             /// roundings of one box disagreeing, and scaling for it would only blur the ink.
@@ -1904,6 +1927,101 @@ void PdfPageNavigator::setScope(int scope)
     m_window.setCapacity(m_scope);
 }
 
+int PdfPageNavigator::maxPagePixels() const
+{
+    return m_maxPagePixels;
+}
+
+qreal PdfPageNavigator::currentRenderDpi() const
+{
+    /// The page that is open is what the window is centred on, which is the same page
+    /// buildForStrip() and rollToPage() derived the resolution from.
+    return renderDpiFor(m_index >= 0 ? m_index : 0);
+}
+
+void PdfPageNavigator::setMaxPagePixels(int pixels)
+{
+    const int bound = qMax(0, pixels);
+
+    /// Written whether or not the value changed: the menu offers choices, and the one that is
+    /// already in force in memory may not be the one on disk when another build wrote the file.
+    QSettings settings;
+    settings.setValue(QLatin1String(MaxPagePixelsKey), bound);
+
+    if (bound == m_maxPagePixels) {
+        return;
+    }
+    m_maxPagePixels = bound;
+
+    say(QStringLiteral("the rendered page size is now %1")
+            .arg(bound > 0 ? QStringLiteral("%1 px on the long side").arg(bound)
+                           : QStringLiteral("unbounded (the fixed 200 dpi)")));
+
+    /// The user chose it, so the screen has to show it, and the roll's resize path is the ONE
+    /// mechanism that can change the resolution of a strip: it writes every page the window holds,
+    /// resizes the document to the window at the new resolution and repaints every slot from its
+    /// artifact. Nothing here is a second way of changing a strip.
+    ///
+    /// A single page (design A) is not a strip: there is no window to resize, and the page takes the
+    /// new bound through buildForSinglePage() the next time it is built.
+    if (!hasNotebook() || m_index < 0 || m_stripPages.isEmpty()) {
+        return;
+    }
+
+    /// The window does not move; only the pixels it is drawn at change, so the reading page is kept
+    /// where it is.
+    QString why;
+    if (!rollToPage(m_index, &why, m_index, true)) {
+        say(QStringLiteral("the page size was saved but the strip was not rebuilt: %1").arg(why));
+    }
+}
+
+qreal PdfPageNavigator::renderDpiFor(int activePage) const
+{
+    if (m_maxPagePixels <= 0) {
+        /// No bound: exactly what this rendered at before the bound existed.
+        return DefaultRenderDpi;
+    }
+
+    const qreal longest = longestSidePtInWindow(activePage);
+    if (longest <= 0.0) {
+        /// The window has no pages to measure: nothing here can be derived from it.
+        return DefaultRenderDpi;
+    }
+
+    /// The target is a MAXIMUM, so there is a ceiling and NO floor: the 96 dpi floor belongs to the
+    /// preview path, where the box is small and a 31 dpi thumbnail is a grey smear, and it is not a
+    /// strip concept. A floor here would make the menu entry a lie -- a 1200 px target and an 1800 px
+    /// one would both come back at 96 dpi, the page bigger than either target, and the setting would
+    /// bound nothing. The longest page in the window decides, and the smaller pages beside it come
+    /// out proportionally smaller.
+    ///
+    /// No lower clamp either: a target small enough to make a page unreadable is the user's choice on
+    /// a menu that names the pixels, and clamping it back up would be the same lie the other way.
+    return qMin(m_maxPagePixels * 72.0 / longest, DefaultRenderDpi);
+}
+
+qreal PdfPageNavigator::longestSidePtInWindow(int activePage) const
+{
+    /// The layout is asked which pages the window holds, rather than that range being worked out a
+    /// second time here: forWindow() already clamps the scope to the notebook and centres the window
+    /// as far as the ends allow, and a second copy of that arithmetic would be a second answer. Any
+    /// positive dpi does for the question; the pixels are not read.
+    const PdfStripLayout window = PdfStripLayout::forWindow(m_manifest, activePage, m_scope, 1.0);
+
+    qreal longest = 0.0;
+    for (const PdfStripLayout::Slot &slot : window.slots()) {
+        if (slot.page < 0 || slot.page >= m_manifest.pages.size()) {
+            continue;
+        }
+        /// displaySizePt(): the page as the window will really hold it, which for a page the
+        /// notebook turned is the rectangle that holds the turned sheet.
+        const QSizeF size = m_manifest.pages.at(slot.page).displaySizePt();
+        longest = qMax(longest, qMax(size.width(), size.height()));
+    }
+    return longest;
+}
+
 bool PdfPageNavigator::showPage(int index, QString *why)
 {
     if (m_inPageTurn) {
@@ -2016,7 +2134,10 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
     /// where, and these lines are what turned "somewhere after the copy" into a stage.
     say(QStringLiteral("rendering page %1").arg(index + 1));
 
-    KisImageSP image = PdfProjectBuilder::buildPageImage(m_manifest.pages.at(index), *backend, 200.0, why);
+    /// The same bound the strip answers to, for the one page this mode opens: one page is a window
+    /// of one, so the derivation is the page's own long side.
+    KisImageSP image =
+        PdfProjectBuilder::buildPageImage(m_manifest.pages.at(index), *backend, renderDpiFor(index), why);
     if (!image) {
         return false;
     }

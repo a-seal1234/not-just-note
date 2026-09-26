@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <unistd.h>
 
+#include <QActionGroup>
 #include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -1800,6 +1801,81 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     updateNotebookOpsActions(ops);
 }
 
+/// The rendered page size: a bound on how big a page may be, which is what the strip's memory is
+/// proportional to.
+///
+/// A submenu of targets rather than a dpi: the number the user reasons about is "how big may a page
+/// be on screen", and the dpi follows from it (target x 72 / the longest page's long side, never
+/// above the 200 dpi the pages were always rendered at). "No limit" is that 200 dpi and it is the
+/// default, so nothing changes for anyone who does not touch this.
+///
+/// The tooltip carries the two things the labels cannot:
+///
+///  - the target is the LONGEST page's long side, not every page's. In a window whose longest page
+///    is a 1672 pt slide, an 1800 px target leaves the A4 page beside it at about 853 px on its
+///    long side instead of 1800 -- and that is the right side to pay on, because capping every page
+///    at its own target would spend MORE memory, not less;
+///  - the source PDF and everything already stored are untouched, but the page the strip renders IS
+///    the page the pen draws on and the artifact is written from those pixels, so this also sets the
+///    resolution of the ink stored from then on, and lowering it is not freely reversible.
+void addPageSizeMenu(QMenu *menu)
+{
+    if (!menu) {
+        return;
+    }
+
+    /// Deduped like the entries around it: registerActions() runs again for a second view and is
+    /// retried while the first screen has no window.
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_page_size_menu"))) {
+        menu->removeAction(previous->menuAction());
+        previous->deleteLater();
+    }
+
+    QMenu *sizes = menu->addMenu(i18n("Rendered page size"));
+    sizes->setObjectName(QStringLiteral("pdfio_page_size_menu"));
+
+    const QString caveat = i18n(
+        "The target is the LONGEST page's long side, not every page's: in a window whose longest "
+        "page is a 1672 pt slide, an 1800 px target leaves the A4 page beside it at about 853 px on "
+        "its long side instead of 1800 -- and that is the right side to pay on, because capping "
+        "every page at its own target would spend more memory, not less.\n\n"
+        "The source PDF and everything already stored are untouched. The page the strip renders is "
+        "the page the pen draws on and the artifact is written from those pixels, so this also sets "
+        "the resolution of the ink stored from now on, and lowering it is not freely reversible.");
+    sizes->setToolTip(caveat);
+
+    auto *group = new QActionGroup(sizes);
+    const auto addTarget = [sizes, group, caveat](const QString &label, int pixels,
+                                                  const QString &name) {
+        QAction *action = sizes->addAction(label);
+        action->setObjectName(name);
+        action->setCheckable(true);
+        action->setToolTip(caveat);
+        action->setData(pixels);
+        group->addAction(action);
+        QObject::connect(action, &QAction::triggered, sizes,
+                         [pixels]() { PdfPageNavigator::instance()->setMaxPagePixels(pixels); });
+        return action;
+    };
+
+    addTarget(i18n("No limit (the 200 dpi it always used)"), 0,
+              QStringLiteral("pdfio_page_size_unlimited"));
+    addTarget(i18n("Up to 1200 px"), 1200, QStringLiteral("pdfio_page_size_1200"));
+    addTarget(i18n("Up to 1800 px"), 1800, QStringLiteral("pdfio_page_size_1800"));
+    addTarget(i18n("Up to 2600 px"), 2600, QStringLiteral("pdfio_page_size_2600"));
+
+    /// Checked from the navigator every time the submenu opens: the mark is the setting, not what
+    /// the menu happened to be built with.
+    const auto markCurrent = [group]() {
+        const int current = PdfPageNavigator::instance()->maxPagePixels();
+        for (QAction *action : group->actions()) {
+            action->setChecked(action->data().toInt() == current);
+        }
+    };
+    QObject::connect(sizes, &QMenu::aboutToShow, sizes, markCurrent);
+    markCurrent();
+}
+
 /// Puts the "Recent notebooks" submenu at the top of \a menu: the entry the user reaches for
 /// first, open document or not. Rebuilt every time it opens, so it is never stale; deduped like the
 /// entries around it.
@@ -2324,6 +2400,9 @@ void PdfIoPlugin::registerActions()
         }
     }
 
+    /// The rendered page size: the one knob the strip's memory answers to, next to the two switches
+    /// above because it is a display setting and not an operation on the notebook.
+    addPageSizeMenu(menu);
 }
 
 void PdfIoPlugin::updateStripAction()
@@ -3010,8 +3089,11 @@ void PdfIoPlugin::runStripProbe()
 
     /// The page's own rectangle inside the strip, worked out the same way the strip was: the mark
     /// goes a hundred pixels in from the page's corner, wherever that corner is.
-    const PdfStripLayout layout =
-        PdfStripLayout::forWindow(navigator->manifest(), first, 3, 200.0);
+    /// The navigator's OWN scope and resolution, not a number of the probe's own: the page-size
+    /// bound can have changed the dpi the strip was built at, and a rectangle worked out at any
+    /// other one is the wrong rectangle.
+    const PdfStripLayout layout = PdfStripLayout::forWindow(
+        navigator->manifest(), first, navigator->scope(), navigator->currentRenderDpi());
     const int slot = layout.slotForPage(first);
     if (!layout.isValid() || slot < 0) {
         say(QStringLiteral("strip: the layout does not hold that page"));

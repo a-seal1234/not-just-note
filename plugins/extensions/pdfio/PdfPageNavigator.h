@@ -149,6 +149,39 @@ public:
     int scope() const;
     void setScope(int scope);
 
+    /**
+     * The largest number of pixels a rendered page's long side may reach, or 0 for no bound.
+     *
+     * The strip is sized to its window, so what a window costs is proportional to how many pixels
+     * its pages are rendered at: this is the knob that bounds that, and it reads as "how big may a
+     * page be on screen" rather than as an abstract dpi. 0 -- the default, and what every notebook
+     * had before this existed -- is the fixed 200 dpi the pages have always been rendered at.
+     *
+     * It is NOT free: the page the strip renders is the page the pen draws on and the artifact is
+     * written from those pixels, so this also sets the resolution of the ink stored from then on.
+     * The source PDF is never touched, and nothing already stored is rewritten.
+     */
+    int maxPagePixels() const;
+
+    /**
+     * The dpi the bound implies for the window that is up: what the strip was built at and is
+     * repainted at.
+     *
+     * Exposed because anything that has to work out where a page sits in the OPEN strip -- the strip
+     * probe's own mark, a test -- has to lay the window out at the resolution the document really
+     * has, and deriving that a second time is how the two come to disagree.
+     */
+    qreal currentRenderDpi() const;
+    /**
+     * Sets the bound and applies it to what is on screen.
+     *
+     * Persisted, so the choice survives a restart, and applied immediately through the roll's own
+     * resize path -- the one mechanism that can change the resolution of a strip -- because the user
+     * changed it and the screen has to show it. A single page has no strip to roll and takes the new
+     * bound the next time it is built.
+     */
+    void setMaxPagePixels(int pixels);
+
 
     /**
      * Makes sure the page has a thumbnail, rendering one at thumbnail resolution when it has none.
@@ -337,6 +370,20 @@ private:
     /// Acts on where the middle of the view has settled.
     void checkScrollFollow();
 
+    /**
+     * The dpi the page-size bound implies for the window around \a activePage.
+     *
+     * One derivation, here: the thumbnail path's own shape -- the target times 72 over the longest
+     * side, never coarser than 96 dpi (below which text stops being recognisable) and never finer
+     * than the 200 dpi the pages were rendered at before the bound existed. With no bound it is
+     * exactly 200, which is what makes the default reproduce today's sizes.
+     */
+    qreal renderDpiFor(int activePage) const;
+
+    /// The longest side, in points, of the longest page the window around \a activePage holds --
+    /// what the bound is divided by.
+    qreal longestSidePtInWindow(int activePage) const;
+
     /// Which slot of the open window the given document point is over, or -1. Window-local: it
     /// reads m_stripCells and nothing about the notebook.
     int windowSlotFor(const QPointF &point) const;
@@ -445,7 +492,11 @@ private:
     /// each side. One page at a time is still reachable from the menu, and the default used to be
     /// that -- a page with no neighbours on screen, which is not what the notebook is for.
     int m_scope = 5;
-    qreal m_dpi = 200.0;
+
+    /// The rendered page-size bound: the largest a page's long side may be, in pixels, or 0 for the
+    /// fixed 200 dpi the pages are rendered at when no bound has been chosen. Read from QSettings in
+    /// the constructor, written by setMaxPagePixels().
+    int m_maxPagePixels = 0;
 
     /**
      * Which pages may stay open, and the rule that keeps closing one from losing ink.
