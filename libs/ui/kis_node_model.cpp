@@ -300,6 +300,14 @@ void KisNodeModel::setDummiesFacade(KisDummiesFacadeBase *dummiesFacade,
         m_d->showRootLayer = false;
     }
 
+    // Everything the old graph queued is dead once it is detached below: updateQueue holds raw
+    // KisNodeDummy pointers, and neither this method nor resetIndexConverter() stopped the
+    // compressor that drains them 100 ms later. The model was seen to take SIGSEGV in
+    // processUpdateQueue() exactly there -- on Android, while a document was being torn down after
+    // a notebook reload -- so the queue is emptied here, where the graph it describes goes away.
+    m_d->updateCompressor.stop();
+    m_d->updateQueue.clear();
+
     if (oldDummiesFacade && m_d->image) {
         m_d->image->disconnect(this);
         oldDummiesFacade->disconnect(this);
@@ -434,6 +442,14 @@ void addChangedIndex(const QModelIndex &idx, QSet<QModelIndex> *indexes)
 
 void KisNodeModel::processUpdateQueue()
 {
+    // Belt and braces for the same hazard: something that emptied or replaced the converter without
+    // clearing the queue would otherwise be dereferenced here. A model with no converter has nothing
+    // to say about a dummy, and the queue is not worth keeping across that state.
+    if (!m_d->indexConverter) {
+        m_d->updateQueue.clear();
+        return;
+    }
+
     QSet<QModelIndex> indexes;
 
     Q_FOREACH (KisNodeDummy *dummy, m_d->updateQueue) {
