@@ -297,13 +297,35 @@ constexpr int ThumbnailPixels = 1152;
 /// paths that render a page cannot drift into two floors.
 constexpr qreal CoarsestRenderDpi = 96;
 
-/// The dpi a page is rendered at when no page-size bound is set, and the finest any bound can make
-/// it -- the fixed 200 dpi the strip rendered at before the bound existed.
+/// The dpi a page is rendered at when no budget is set, and the finest any budget can make it -- the
+/// fixed 200 dpi the strip has always rendered at.
 constexpr qreal DefaultRenderDpi = 200;
 
-/// Where the rendered page-size bound is kept. 0 means no bound, which is what a notebook that has
-/// never been given one gets.
-const char *const MaxPagePixelsKey = "pdfio/maxPagePixels";
+/// Where the rendered window's memory budget is kept, in megabytes. 0 means no budget, which is what
+/// a notebook that has never been given one gets.
+///
+/// The key an earlier build used for its pixel target -- pdfio/maxPagePixels -- is deliberately NOT
+/// read: that target is superseded (it bounded the longest side whatever the page's shape, so the
+/// memory it bought changed with the shape), and a value left in a settings file must not resurrect
+/// the behaviour the user replaced. It is left in the file rather than deleted: nothing writes a key
+/// nobody reads, and a downgrade should find its own setting where it left it.
+const char *const MemoryBudgetMbKey = "pdfio/memoryBudgetMb";
+
+/// How many paint layers \a node and everything under it hold. Each one is a full-size allocation in
+/// the strip image, so this is the layer count a budget is divided by.
+void countPaintLayers(KisNodeSP node, int *count)
+{
+    /// Not const pointers: a const KisNodeSP hands back a const KisNode* through data(), and
+    /// qobject_cast refuses to cast the constness away. The walking pointer is ours and there is
+    /// nothing const about it.
+    for (quint32 i = 0; i < node->childCount(); ++i) {
+        KisNodeSP child = node->at(i);
+        if (qobject_cast<KisPaintLayer *>(child.data())) {
+            ++*count;
+        }
+        countPaintLayers(child, count);
+    }
+}
 
 /// Whether a roll should behave as if its document went away after the write phase. Set by a test
 /// only; see PdfPageNavigator::setDocumentGoneAfterWritesForTests().
@@ -319,11 +341,11 @@ PdfPageNavigator::PdfPageNavigator()
     : m_saves(SaveLandingTimeoutMs)
     , m_sourceRenderers([]() { return PdfRenderBackend::create(); })
 {
-    /// The rendered page size the user chose, if one ever was. Read before anything can render, so
-    /// the first page of the first notebook this process opens is already at the chosen size -- and
-    /// a fresh install, or a notebook nobody has touched this for, gets 0: the fixed 200 dpi the
-    /// strip has always rendered at.
-    m_maxPagePixels = qMax(0, QSettings().value(QLatin1String(MaxPagePixelsKey), 0).toInt());
+    /// The memory budget the user chose, if one ever was. Read before anything can render, so the
+    /// first page of the first notebook this process opens is already inside it -- and a fresh
+    /// install, or a notebook nobody has touched this for, gets 0: the fixed 200 dpi the strip has
+    /// always rendered at, exactly.
+    m_memoryBudgetMb = qMax(0, QSettings().value(QLatin1String(MemoryBudgetMbKey), 0).toInt());
 
     /// The window's save is the plugin's own page save: the ink-only document, the crop when the
     /// page lives in a strip, and the asynchronous write saveCurrentPage already owns. Wired once
@@ -1179,7 +1201,14 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     /// The dpi the page-size bound implies for THIS window, derived once and handed to the builder:
     /// the layout the strip is built at and the layout a later roll of it builds have to be the same
     /// resolution, or a roll would render the pages at a scale the layout does not describe.
-    const qreal dpi = renderDpiFor(index);
+    /// The dpi the budget implies for THIS window, derived once and handed to the builder: the
+    /// layout the strip is built at and the layout a later roll of it builds have to be the same
+    /// resolution, or a roll would render the pages at a scale the layout does not describe. The
+    /// count is the shape this builder is about to make -- one band per slot plus Ink -- because the
+    /// content layers of the pages' artifacts have not been read back yet; a roll then counts the
+    /// layers that really exist.
+    const qreal dpi = dpiForBudget(m_memoryBudgetMb, index, 0);
+    m_renderedDpi = dpi;
     const PdfStripBuilder::Strip strip = PdfStripBuilder::build(m_manifest, index, m_scope, dpi,
                                                                 m_sourceRenderers, m_projectDir, why);
     if (!strip.image) {
@@ -1224,7 +1253,11 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     }
     /// One derivation for the whole roll: the window it lays out and the pages it renders below are
     /// the same resolution, so a window cannot be built at one and repainted at another.
-    const qreal dpi = renderDpiFor(centreOn);
+    /// One derivation for the whole roll, with the layer count the document really has: the window
+    /// it lays out and the pages it renders below are the same resolution, so a window cannot be
+    /// built at one and repainted at another.
+    const qreal dpi = dpiForBudget(m_memoryBudgetMb, centreOn, stripLayerCount());
+    m_renderedDpi = dpi;
     const PdfStripLayout target = PdfStripLayout::forWindow(m_manifest, centreOn, m_scope, dpi);
     if (!target.isValid()) {
         fail(why, QStringLiteral("the new window has no valid layout"));
@@ -1927,35 +1960,50 @@ void PdfPageNavigator::setScope(int scope)
     m_window.setCapacity(m_scope);
 }
 
-int PdfPageNavigator::maxPagePixels() const
+int PdfPageNavigator::memoryBudgetMb() const
 {
-    return m_maxPagePixels;
+    return m_memoryBudgetMb;
 }
 
 qreal PdfPageNavigator::currentRenderDpi() const
 {
-    /// The page that is open is what the window is centred on, which is the same page
-    /// buildForStrip() and rollToPage() derived the resolution from.
-    return renderDpiFor(m_index >= 0 ? m_index : 0);
+    /// What the document that is up was built at, stored when it was built or rolled. The default
+    /// before anything has been built is the reference dpi, which is what an empty navigator means.
+    return m_renderedDpi > 0.0 ? m_renderedDpi : DefaultRenderDpi;
 }
 
-void PdfPageNavigator::setMaxPagePixels(int pixels)
+int PdfPageNavigator::longestPagePixelsForBudget(int megabytes) const
 {
-    const int bound = qMax(0, pixels);
+    const int activePage = m_index >= 0 ? m_index : 0;
+    const qreal longestPt = longestSidePtInWindow(activePage);
+    if (longestPt <= 0.0) {
+        /// No notebook, or a window with no pages: there is no page size to name.
+        return 0;
+    }
+
+    /// The same derivation a roll would use, with the same layer count, without applying anything:
+    /// the number the menu shows beside a budget has to be the number picking it would produce.
+    const qreal dpi = dpiForBudget(megabytes, activePage, stripLayerCount());
+    return qMax(0, qRound(longestPt * dpi / 72.0));
+}
+
+void PdfPageNavigator::setMemoryBudgetMb(int megabytes)
+{
+    const int budget = qMax(0, megabytes);
 
     /// Written whether or not the value changed: the menu offers choices, and the one that is
     /// already in force in memory may not be the one on disk when another build wrote the file.
     QSettings settings;
-    settings.setValue(QLatin1String(MaxPagePixelsKey), bound);
+    settings.setValue(QLatin1String(MemoryBudgetMbKey), budget);
 
-    if (bound == m_maxPagePixels) {
+    if (budget == m_memoryBudgetMb) {
         return;
     }
-    m_maxPagePixels = bound;
+    m_memoryBudgetMb = budget;
 
-    say(QStringLiteral("the rendered page size is now %1")
-            .arg(bound > 0 ? QStringLiteral("%1 px on the long side").arg(bound)
-                           : QStringLiteral("unbounded (the fixed 200 dpi)")));
+    say(QStringLiteral("the rendered window's memory budget is now %1")
+            .arg(budget > 0 ? QStringLiteral("%1 MB").arg(budget)
+                            : QStringLiteral("unlimited (the fixed 200 dpi)")));
 
     /// The user chose it, so the screen has to show it, and the roll's resize path is the ONE
     /// mechanism that can change the resolution of a strip: it writes every page the window holds,
@@ -1963,7 +2011,7 @@ void PdfPageNavigator::setMaxPagePixels(int pixels)
     /// artifact. Nothing here is a second way of changing a strip.
     ///
     /// A single page (design A) is not a strip: there is no window to resize, and the page takes the
-    /// new bound through buildForSinglePage() the next time it is built.
+    /// new budget through buildForSinglePage() the next time it is built.
     if (!hasNotebook() || m_index < 0 || m_stripPages.isEmpty()) {
         return;
     }
@@ -1972,33 +2020,88 @@ void PdfPageNavigator::setMaxPagePixels(int pixels)
     /// where it is.
     QString why;
     if (!rollToPage(m_index, &why, m_index, true)) {
-        say(QStringLiteral("the page size was saved but the strip was not rebuilt: %1").arg(why));
+        say(QStringLiteral("the memory budget was saved but the strip was not rebuilt: %1").arg(why));
     }
 }
 
-qreal PdfPageNavigator::renderDpiFor(int activePage) const
+qreal PdfPageNavigator::dpiForBudget(int megabytes, int activePage, int layers) const
 {
-    if (m_maxPagePixels <= 0) {
-        /// No bound: exactly what this rendered at before the bound existed.
+    if (megabytes <= 0) {
+        /// No budget: exactly what this rendered at before the setting existed, to the dpi.
         return DefaultRenderDpi;
     }
 
-    const qreal longest = longestSidePtInWindow(activePage);
-    if (longest <= 0.0) {
-        /// The window has no pages to measure: nothing here can be derived from it.
+    /// The window at the reference dpi. The layout is where the window's geometry lives -- how many
+    /// pages it holds, how big they are, how much the gaps cost -- so the pixels it needs are read
+    /// off one layout instead of being guessed from page sizes here.
+    const PdfStripLayout reference =
+        PdfStripLayout::forWindow(m_manifest, activePage, m_scope, DefaultRenderDpi);
+    const QSize referenceSize = reference.imageSize();
+    if (referenceSize.isEmpty()) {
+        /// Nothing to lay out: no notebook, or a window with no pages in it.
         return DefaultRenderDpi;
     }
 
-    /// The target is a MAXIMUM, so there is a ceiling and NO floor: the 96 dpi floor belongs to the
-    /// preview path, where the box is small and a 31 dpi thumbnail is a grey smear, and it is not a
-    /// strip concept. A floor here would make the menu entry a lie -- a 1200 px target and an 1800 px
-    /// one would both come back at 96 dpi, the page bigger than either target, and the setting would
-    /// bound nothing. The longest page in the window decides, and the smaller pages beside it come
-    /// out proportionally smaller.
+    /// The layers: the caller's own count when it has one, or the shape the builder is about to
+    /// make -- one band per slot plus the Ink layer. A content layer an artifact carries makes the
+    /// strip one bigger, which the roll that follows counts for real.
+    const int counted = layers > 0 ? layers : qMax(1, reference.slots().size() + 1);
+    const qreal budgetBytes = qreal(megabytes) * 1000.0 * 1000.0;
+    const qreal targetArea = budgetBytes / (4.0 * qreal(counted));
+    const qreal referenceArea = qreal(referenceSize.width()) * qreal(referenceSize.height());
+    if (targetArea <= 0.0 || referenceArea <= 0.0) {
+        return DefaultRenderDpi;
+    }
+
+    if (targetArea >= referenceArea) {
+        /// The budget already pays for the window at the reference resolution: the answer is the
+        /// ceiling, and it is EXACTLY 200 dpi rather than a hair under it, so a budget that costs
+        /// nothing in quality is today's behaviour to the dpi.
+        return DefaultRenderDpi;
+    }
+
+    /// The square root is the estimate: at the reference dpi the window needs referenceArea pixels,
+    /// the budget buys targetArea of them, and a layout's area goes as the square of its dpi.
     ///
-    /// No lower clamp either: a target small enough to make a page unreadable is the user's choice on
-    /// a menu that names the pixels, and clamping it back up would be the same lie the other way.
-    return qMin(m_maxPagePixels * 72.0 / longest, DefaultRenderDpi);
+    /// It is only an estimate, because the gaps between the pages do NOT scale with the dpi: a window
+    /// solved this way spends the whole budget on the pages and then pays for the gaps on top, about
+    /// 3% over for a five page window. So the dpi is then walked down against the layout itself --
+    /// the same forWindow(), no second arithmetic -- until the area it really has fits, which is what
+    /// makes a budget a bound rather than a hope. A few layout passes, not a render.
+    qreal low = 0.0;
+    qreal high = qMin(DefaultRenderDpi * qSqrt(targetArea / referenceArea), DefaultRenderDpi);
+    for (int i = 0; i < 24; ++i) {
+        const qreal middle = (low + high) / 2.0;
+        const QSize probeSize =
+            PdfStripLayout::forWindow(m_manifest, activePage, m_scope, middle).imageSize();
+        const qreal probeArea = qreal(probeSize.width()) * qreal(probeSize.height());
+        if (probeArea > targetArea) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+
+    /// A dpi that lays a page out no pixels wide is not a lower quality, it is a broken layout: the
+    /// geometry refuses at zero and the page would not open at all. One pixel for the longest page is
+    /// the floor that needs, and it is not a quality clamp -- the menu offers nothing near it.
+    const qreal smallest = 72.0 / qMax(qreal(1.0), longestSidePtInWindow(activePage));
+    return qMax(smallest, low);
+}
+
+int PdfPageNavigator::stripLayerCount() const
+{
+    /// What is open, when something is: every paint layer of the document is a full-size allocation,
+    /// so counting them is the real answer -- the per-slot bands, the ink layer the pages are drawn
+    /// on, and any content layer a page's artifact restored.
+    if (!m_document || !m_document->image()) {
+        /// Nothing open: the caller builds from the planned shape instead.
+        return 0;
+    }
+
+    int layers = 0;
+    countPaintLayers(m_document->image()->root(), &layers);
+    return layers;
 }
 
 qreal PdfPageNavigator::longestSidePtInWindow(int activePage) const
@@ -2134,10 +2237,12 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
     /// where, and these lines are what turned "somewhere after the copy" into a stage.
     say(QStringLiteral("rendering page %1").arg(index + 1));
 
-    /// The same bound the strip answers to, for the one page this mode opens: one page is a window
-    /// of one, so the derivation is the page's own long side.
-    KisImageSP image =
-        PdfProjectBuilder::buildPageImage(m_manifest.pages.at(index), *backend, renderDpiFor(index), why);
+    /// The same budget the strip answers to, for the one page this mode opens: a page document is
+    /// its paper and the ink drawn on it, which is the count the planned window (one slot plus Ink)
+    /// gives.
+    const qreal dpi = dpiForBudget(m_memoryBudgetMb, index, 0);
+    m_renderedDpi = dpi;
+    KisImageSP image = PdfProjectBuilder::buildPageImage(m_manifest.pages.at(index), *backend, dpi, why);
     if (!image) {
         return false;
     }

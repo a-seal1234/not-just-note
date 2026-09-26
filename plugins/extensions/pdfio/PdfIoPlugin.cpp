@@ -1801,24 +1801,25 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     updateNotebookOpsActions(ops);
 }
 
-/// The rendered page size: a bound on how big a page may be, which is what the strip's memory is
-/// proportional to.
+/// What the strip's rendered pages may cost, and the resolution that buys.
 ///
-/// A submenu of targets rather than a dpi: the number the user reasons about is "how big may a page
-/// be on screen", and the dpi follows from it (target x 72 / the longest page's long side, never
-/// above the 200 dpi the pages were always rendered at). "No limit" is that 200 dpi and it is the
-/// default, so nothing changes for anyone who does not touch this.
+/// A page can be LANDSCAPE, so a bound on the longest side buys a different amount of memory for
+/// every shape: the same pixel target is 1.8 Mpx on a 16:9 page and 2.5 Mpx on an A4 portrait, and a
+/// window of five slides costs several times a window of five A4 sheets. The knob is therefore the
+/// memory, and the resolution follows from the window that is up (see
+/// PdfPageNavigator::memoryBudgetMb()).
 ///
-/// The tooltip carries the two things the labels cannot:
+/// The labels name the budget AND, when a notebook is open, the page size it produces for the window
+/// that is up: a budget must not hide what it costs in quality. The tooltip carries the two things
+/// neither can:
 ///
-///  - the target is the LONGEST page's long side, not every page's. In a window whose longest page
-///    is a 1672 pt slide, an 1800 px target leaves the A4 page beside it at about 853 px on its
-///    long side instead of 1800 -- and that is the right side to pay on, because capping every page
-///    at its own target would spend MORE memory, not less;
-///  - the source PDF and everything already stored are untouched, but the page the strip renders IS
-///    the page the pen draws on and the artifact is written from those pixels, so this also sets the
-///    resolution of the ink stored from then on, and lowering it is not freely reversible.
-void addPageSizeMenu(QMenu *menu)
+///  - the budget is spent on the WHOLE window that is up -- every page in it plus the gaps, across
+///    every full-size layer the strip has -- so the page size it buys depends on how many pages are
+///    open and how big they are: a window of five slides buys a smaller page than five A4 sheets;
+///  - the budget is the pages' rendered resolution, which is also the resolution the pen's ink is
+///    stored at from then on, and lowering it is not freely reversible. The source PDF and
+///    everything already stored are untouched.
+void addMemoryBudgetMenu(QMenu *menu)
 {
     if (!menu) {
         return;
@@ -1826,54 +1827,69 @@ void addPageSizeMenu(QMenu *menu)
 
     /// Deduped like the entries around it: registerActions() runs again for a second view and is
     /// retried while the first screen has no window.
-    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_page_size_menu"))) {
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_memory_budget_menu"))) {
         menu->removeAction(previous->menuAction());
         previous->deleteLater();
     }
 
-    QMenu *sizes = menu->addMenu(i18n("Rendered page size"));
-    sizes->setObjectName(QStringLiteral("pdfio_page_size_menu"));
+    QMenu *budgets = menu->addMenu(i18n("Rendered page memory"));
+    budgets->setObjectName(QStringLiteral("pdfio_memory_budget_menu"));
 
-    const QString caveat = i18n(
-        "The target is the LONGEST page's long side, not every page's: in a window whose longest "
-        "page is a 1672 pt slide, an 1800 px target leaves the A4 page beside it at about 853 px on "
-        "its long side instead of 1800 -- and that is the right side to pay on, because capping "
-        "every page at its own target would spend more memory, not less.\n\n"
-        "The source PDF and everything already stored are untouched. The page the strip renders is "
-        "the page the pen draws on and the artifact is written from those pixels, so this also sets "
-        "the resolution of the ink stored from now on, and lowering it is not freely reversible.");
-    sizes->setToolTip(caveat);
-
-    auto *group = new QActionGroup(sizes);
-    const auto addTarget = [sizes, group, caveat](const QString &label, int pixels,
-                                                  const QString &name) {
-        QAction *action = sizes->addAction(label);
+    auto *group = new QActionGroup(budgets);
+    const auto addBudget = [budgets, group](int megabytes, const QString &name) {
+        QAction *action = budgets->addAction(QString());
         action->setObjectName(name);
         action->setCheckable(true);
-        action->setToolTip(caveat);
-        action->setData(pixels);
+        action->setData(megabytes);
         group->addAction(action);
-        QObject::connect(action, &QAction::triggered, sizes,
-                         [pixels]() { PdfPageNavigator::instance()->setMaxPagePixels(pixels); });
+        QObject::connect(action, &QAction::triggered, budgets, [megabytes]() {
+            PdfPageNavigator::instance()->setMemoryBudgetMb(megabytes);
+        });
         return action;
     };
 
-    addTarget(i18n("No limit (the 200 dpi it always used)"), 0,
-              QStringLiteral("pdfio_page_size_unlimited"));
-    addTarget(i18n("Up to 1200 px"), 1200, QStringLiteral("pdfio_page_size_1200"));
-    addTarget(i18n("Up to 1800 px"), 1800, QStringLiteral("pdfio_page_size_1800"));
-    addTarget(i18n("Up to 2600 px"), 2600, QStringLiteral("pdfio_page_size_2600"));
+    QAction *unlimited = addBudget(0, QStringLiteral("pdfio_memory_budget_unlimited"));
+    QAction *mb200 = addBudget(200, QStringLiteral("pdfio_memory_budget_200"));
+    QAction *mb400 = addBudget(400, QStringLiteral("pdfio_memory_budget_400"));
+    QAction *mb800 = addBudget(800, QStringLiteral("pdfio_memory_budget_800"));
 
-    /// Checked from the navigator every time the submenu opens: the mark is the setting, not what
-    /// the menu happened to be built with.
-    const auto markCurrent = [group]() {
-        const int current = PdfPageNavigator::instance()->maxPagePixels();
-        for (QAction *action : group->actions()) {
-            action->setChecked(action->data().toInt() == current);
-        }
+    /// Filled every time the submenu opens: the mark is the navigator's own setting, and the page
+    /// size beside each budget is what THAT budget would produce for the notebook that is open now.
+    /// With nothing open there is no page size to name, and the label is the budget alone.
+    const auto refresh = [unlimited, mb200, mb400, mb800]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        const bool open = navigator->hasNotebook();
+
+        const QString caveat = i18n(
+            "This is spent on the whole window that is up -- every page in it plus the gaps, across "
+            "every full-size layer the strip has -- so the page size it buys depends on how many "
+            "pages are open and how big they are: a window of five slides buys a smaller page than "
+            "a window of five A4 sheets.\n\n"
+            "The budget is the pages' rendered resolution, which is also the resolution the pen's "
+            "ink is stored at from then on, and lowering it is not freely reversible. The source "
+            "PDF and everything already stored are untouched.");
+
+        const auto fill = [navigator, open, &caveat](QAction *action) {
+            const int megabytes = action->data().toInt();
+            const QString label = megabytes > 0 ? i18n("Up to %1 MB", megabytes)
+                                                : i18n("No limit (the 200 dpi it always used)");
+
+            const int pixels = open ? navigator->longestPagePixelsForBudget(megabytes) : 0;
+            action->setText(pixels > 0
+                                ? i18n("%1 — about %2 px on the longest side", label, pixels)
+                                : label);
+            action->setToolTip(caveat);
+            action->setChecked(megabytes == navigator->memoryBudgetMb());
+        };
+
+        fill(unlimited);
+        fill(mb200);
+        fill(mb400);
+        fill(mb800);
     };
-    QObject::connect(sizes, &QMenu::aboutToShow, sizes, markCurrent);
-    markCurrent();
+
+    QObject::connect(budgets, &QMenu::aboutToShow, budgets, refresh);
+    refresh();
 }
 
 /// Puts the "Recent notebooks" submenu at the top of \a menu: the entry the user reaches for
@@ -2400,9 +2416,9 @@ void PdfIoPlugin::registerActions()
         }
     }
 
-    /// The rendered page size: the one knob the strip's memory answers to, next to the two switches
-    /// above because it is a display setting and not an operation on the notebook.
-    addPageSizeMenu(menu);
+    /// The rendered page memory: the one knob the strip's memory answers to, next to the two
+    /// switches above because it is a display setting and not an operation on the notebook.
+    addMemoryBudgetMenu(menu);
 }
 
 void PdfIoPlugin::updateStripAction()

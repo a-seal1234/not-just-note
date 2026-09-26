@@ -150,37 +150,53 @@ public:
     void setScope(int scope);
 
     /**
-     * The largest number of pixels a rendered page's long side may reach, or 0 for no bound.
+     * What the rendered page of the strip is allowed to cost, in megabytes, or 0 for no limit.
      *
-     * The strip is sized to its window, so what a window costs is proportional to how many pixels
-     * its pages are rendered at: this is the knob that bounds that, and it reads as "how big may a
-     * page be on screen" rather than as an abstract dpi. 0 -- the default, and what every notebook
-     * had before this existed -- is the fixed 200 dpi the pages have always been rendered at.
+     * A page can be LANDSCAPE, so a bound on the pixels of its longest side buys a different amount
+     * of memory for every shape: the same target is 1.8 Mpx on a 16:9 page and 2.5 Mpx on an A4
+     * portrait, and a window of five slides costs several times a window of five A4 sheets. The knob
+     * is therefore the MEMORY, and the resolution follows from it for the window that is up: lay the
+     * window out at the reference dpi, take the pixels it needs, and solve for the dpi whose image
+     * fits the budget across every full-size layer the strip has.
      *
-     * It is NOT free: the page the strip renders is the page the pen draws on and the artifact is
-     * written from those pixels, so this also sets the resolution of the ink stored from then on.
-     * The source PDF is never touched, and nothing already stored is rewritten.
+     * The megabyte here is 1000000 bytes, so what the window really costs is at or below the number
+     * on the menu. 0 -- the default, and what every notebook had before this existed -- is the fixed
+     * 200 dpi the pages have always been rendered at, exactly.
+     *
+     * It is NOT free: the budget is the pages' rendered resolution, which is also the resolution the
+     * pen's ink is stored at from then on, and lowering it is not freely reversible. The source PDF
+     * and everything already stored are untouched.
      */
-    int maxPagePixels() const;
+    int memoryBudgetMb() const;
 
     /**
-     * The dpi the bound implies for the window that is up: what the strip was built at and is
-     * repainted at.
+     * The dpi the budget implies for the window that is up: what the strip was built at and is
+     * repainted at. Exactly 200 when there is no budget.
      *
      * Exposed because anything that has to work out where a page sits in the OPEN strip -- the strip
      * probe's own mark, a test -- has to lay the window out at the resolution the document really
      * has, and deriving that a second time is how the two come to disagree.
      */
     qreal currentRenderDpi() const;
+
     /**
-     * Sets the bound and applies it to what is on screen.
+     * The longest side, in pixels, the window's longest page comes out at under \a megabytes -- or
+     * at 200 dpi for 0.
      *
-     * Persisted, so the choice survives a restart, and applied immediately through the roll's own
-     * resize path -- the one mechanism that can change the resolution of a strip -- because the user
-     * changed it and the screen has to show it. A single page has no strip to roll and takes the new
-     * bound the next time it is built.
+     * What the menu shows beside each budget, so the memory and what it costs in quality are read
+     * together. Read-only: asking changes nothing.
      */
-    void setMaxPagePixels(int pixels);
+    int longestPagePixelsForBudget(int megabytes) const;
+
+    /**
+     * Sets the budget and applies it to what is on screen.
+     *
+     * Persisted under pdfio/memoryBudgetMb, so the choice survives a restart, and applied
+     * immediately through the roll's own resize path -- the one mechanism that can change the
+     * resolution of a strip -- because the user changed it and the screen has to show it. A single
+     * page has no strip to roll and takes the new budget the next time it is built.
+     */
+    void setMemoryBudgetMb(int megabytes);
 
 
     /**
@@ -371,18 +387,37 @@ private:
     void checkScrollFollow();
 
     /**
-     * The dpi the page-size bound implies for the window around \a activePage.
+     * The dpi \a megabytes buys for the window around \a activePage -- ONE derivation, and the only
+     * place a rendered page's resolution is decided. Exactly 200 with no budget.
      *
-     * One derivation, here: the thumbnail path's own shape -- the target times 72 over the longest
-     * side, never coarser than 96 dpi (below which text stops being recognisable) and never finer
-     * than the 200 dpi the pages were rendered at before the bound existed. With no bound it is
-     * exactly 200, which is what makes the default reproduce today's sizes.
+     * \a layers is how many full-size layers the window will cost: the caller's own count when it has
+     * one (a roll of the strip that is up knows it exactly), or 0 for the shape the builder is about
+     * to make -- one band per slot plus the Ink layer. A content layer an artifact carries is not
+     * known before it has been read back, which is why a build uses the planned count and a roll
+     * uses the real one (see stripLayerCount).
+     *
+     * The arithmetic, and the correction the layout forces on it: the layout scales linearly with the
+     * dpi, so the image's area goes as its square, which gives the dpi from the reference area in one
+     * square root. The gaps between the pages do not scale, though, so that estimate spends the whole
+     * budget on the pages and then pays for the gaps on top. The result is therefore walked down
+     * against the layout itself until the area it really has fits, which is what makes a budget a
+     * bound rather than a hope.
      */
-    qreal renderDpiFor(int activePage) const;
+    qreal dpiForBudget(int megabytes, int activePage, int layers) const;
 
-    /// The longest side, in points, of the longest page the window around \a activePage holds --
-    /// what the bound is divided by.
+    /// The longest side, in points, of the longest page the window around \a activePage holds.
     qreal longestSidePtInWindow(int activePage) const;
+
+    /**
+     * How many full-size layers the document that is open holds: the per-slot bands, the ink layer
+     * the pages are drawn on, and any content layer a page's artifact restored. Each one is a
+     * full-size allocation, so this is the count a budget is divided by.
+     *
+     * 0 when no document is open: a caller that is about to build one then uses the shape the
+     * builder will make instead (one band per slot plus Ink), because a content layer is not known
+     * until an artifact has been read back.
+     */
+    int stripLayerCount() const;
 
     /// Which slot of the open window the given document point is over, or -1. Window-local: it
     /// reads m_stripCells and nothing about the notebook.
@@ -493,10 +528,16 @@ private:
     /// that -- a page with no neighbours on screen, which is not what the notebook is for.
     int m_scope = 5;
 
-    /// The rendered page-size bound: the largest a page's long side may be, in pixels, or 0 for the
-    /// fixed 200 dpi the pages are rendered at when no bound has been chosen. Read from QSettings in
-    /// the constructor, written by setMaxPagePixels().
-    int m_maxPagePixels = 0;
+    /// The memory budget for the rendered window, in megabytes, or 0 for no limit -- the fixed
+    /// 200 dpi the pages are rendered at. Read from QSettings in the constructor, written by
+    /// setMemoryBudgetMb().
+    int m_memoryBudgetMb = 0;
+
+    /// The resolution the document that is up was built at. Stored rather than derived on demand
+    /// because the derivation depends on the layer count of the window being built, and the answer
+    /// has to be the number the document in front of the reader really has. 0 until a window is
+    /// built, which currentRenderDpi() reports as the 200 dpi default.
+    qreal m_renderedDpi = 0.0;
 
     /**
      * Which pages may stay open, and the rule that keeps closing one from losing ink.

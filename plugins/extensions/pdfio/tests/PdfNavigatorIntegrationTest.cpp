@@ -123,9 +123,10 @@ private Q_SLOTS:
     void testDeletingANotebookClosesItAndRemovesItsFolder();
     /// Deleting refuses what is not the store's, and a refusal leaves the open notebook usable.
     void testDeletingRefusesWhatIsNotTheStores();
-    /// The rendered page size: the bound on how big a page may be, what it does to the strip that is
-    /// open, and that "no limit" is exactly the size the strip always had.
-    void testTheRenderedPageSizeBoundsTheStrip();
+    /// The rendered window's memory budget: what the strip may cost, the resolution that buys, and
+    /// that "no limit" is exactly the size and the dpi the strip always had. A mixed-orientation
+    /// notebook, because that is the case a pixel target got wrong.
+    void testTheMemoryBudgetBoundsTheStrip();
     /// The generated preview itself: enough pixels for the screen that draws it, and the page's ink
     /// in it rather than blank paper.
     void testAGeneratedPreviewIsSavedBigEnoughForTheScreen();
@@ -2630,24 +2631,54 @@ struct WatchdogPause {
 };
 
 /**
- * Puts the rendered page size back however a test ends.
+ * Puts the rendered window's memory budget back however a test ends.
  *
- * The bound is PERSISTED: a test that walked away from a target would change what the NEXT RUN of
- * the suite opens a notebook at, and a failure half way through the test would leave it there for
- * good. The destructor runs on every way out, a failed QVERIFY included.
+ * The budget is PERSISTED: a test that walked away from one would change what the NEXT RUN of the
+ * suite opens a notebook at, and a failure half way through the test would leave it there for good.
+ * The destructor runs on every way out, a failed QVERIFY included.
  */
-struct PageSizeRestore {
-    explicit PageSizeRestore(int original)
+struct BudgetRestore {
+    explicit BudgetRestore(int original)
         : m_original(original)
     {
     }
-    ~PageSizeRestore() { PdfPageNavigator::instance()->setMaxPagePixels(m_original); }
+    ~BudgetRestore() { PdfPageNavigator::instance()->setMemoryBudgetMb(m_original); }
 
-    PageSizeRestore(const PageSizeRestore &) = delete;
-    PageSizeRestore &operator=(const PageSizeRestore &) = delete;
+    BudgetRestore(const BudgetRestore &) = delete;
+    BudgetRestore &operator=(const BudgetRestore &) = delete;
 
     int m_original;
 };
+
+/// How many paint layers \a image holds, however they are nested.
+///
+/// Each one is a full-size allocation in the strip -- the per-slot bands, the ink the pages are
+/// drawn on, any content layer an artifact restored -- so this is the count a memory budget is
+/// divided by. Counted here rather than asked of the navigator, so the number the budget was
+/// computed with is checked against the document that was really built.
+int paintLayersOf(const KisImageSP &image)
+{
+    if (!image) {
+        return 0;
+    }
+
+    /// Not const pointers: a const KisNodeSP hands back a const KisNode* through data(), and
+    /// qobject_cast refuses to cast the constness away. The walking pointers are ours.
+    int count = 0;
+    QList<KisNodeSP> pending;
+    pending.append(image->root());
+    while (!pending.isEmpty()) {
+        KisNodeSP node = pending.takeLast();
+        for (quint32 i = 0; i < node->childCount(); ++i) {
+            KisNodeSP child = node->at(i);
+            if (qobject_cast<KisPaintLayer *>(child.data())) {
+                ++count;
+            }
+            pending.append(child);
+        }
+    }
+    return count;
+}
 
 /// How many pixels of \a image carry any paint. The drop indicator is transparent except for the
 /// held row's highlight and the insertion line, so this is the proof that it draws something.
@@ -3516,112 +3547,154 @@ void PdfNavigatorIntegrationTest::testDeletingRefusesWhatIsNotTheStores()
 }
 
 /**
- * The rendered page size: a bound on how big a page may be, applied to the strip that is open, and
- * exactly nothing when it is off.
+ * The rendered window's memory budget: what the strip may cost, and the resolution that buys.
  *
- * The strip is sized to its window, so what it costs is proportional to the pixels its pages are
- * rendered at -- which is why the knob is a maximum dimension and not a dpi. The dpi follows from it
- * (target x 72 / the longest page's long side, no coarser than 96 and no finer than the 200 the
- * pages were always rendered at), and changing it while a notebook is open ends in the document
- * being resized through the roll's own resize path: this test checks the size it lands at, which is
- * what says the navigator derived the same number the layout does.
+ * A page can be LANDSCAPE, which is why the knob is the memory and not a pixel target: a bound on
+ * the longest side buys a different amount of memory for every shape, so the same target is 1.8 Mpx
+ * on a 16:9 page and 2.5 Mpx on an A4 portrait, and a window of five slides costs several times a
+ * window of five A4 sheets. This notebook is deliberately MIXED -- two of its five pages are turned
+ * a right angle, so the window holds landscape pages beside portrait ones -- because that is the case
+ * the pixel target got wrong.
  *
- * "No limit" is the 200 dpi, so a notebook nobody has given a bound still opens at exactly the size
- * it always did.
+ * What is asserted is what the user asked for: the window the strip really built costs no more than
+ * the budget it was given, the budget is spent rather than thrown away when it is small enough to
+ * bind, a budget above what 200 dpi already costs changes nothing, and "no limit" is exactly the dpi
+ * and the image size this notebook has always opened at.
  */
-void PdfNavigatorIntegrationTest::testTheRenderedPageSizeBoundsTheStrip()
+void PdfNavigatorIntegrationTest::testTheMemoryBudgetBoundsTheStrip()
 {
-    /// The strip, not one page: the window is what the bound is measured over.
-    QVERIFY(useNotebook(QStringLiteral("page-size"), 5));
-    const PdfSessionManifest manifest = navigator()->manifest();
-    QVERIFY2(manifest.pages.size() >= 3, "the notebook this test needs has too few pages");
+    /// A mixed-orientation notebook from the real many-page fixture: five Letter pages, the first and
+    /// the third turned a right angle -- landscape beside portrait, from the fixture's own pages and
+    /// through the real renderer, not a doctored sizePt.
+    const QString project = m_dir.filePath(QStringLiteral("memory-budget"));
+    const QString source = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    QVERIFY2(QFileInfo::exists(source), qPrintable(source));
 
-    /// The bound is persisted, so whatever a previous run left behind is put back however this test
-    /// ends -- a failure walks away from the target otherwise.
-    PageSizeRestore restore(PdfPageNavigator::instance()->maxPagePixels());
-
-    const int scope = navigator()->scope();
-    QVERIFY2(scope > 1, "this test is about the strip, which needs a window of more than one page");
-    QVERIFY2(manifest.pages.size() <= scope,
-             "the window has to hold every page for the notebook's longest to be the window's");
-
-    /// The window's longest page, measured the way the derivation measures it. This fixture's three
-    /// pages are three different sizes on purpose -- A4, A5 and a square -- so the longest page is
-    /// not simply the first one.
-    qreal longestPt = 0.0;
-    for (const PdfPageRecord &page : manifest.pages) {
-        const QSizeF visible = page.displaySizePt();
-        longestPt = qMax(longestPt, qMax(visible.width(), visible.height()));
+    PopplerRenderBackend backend;
+    QString why;
+    PdfSessionManifest manifest = PdfSession::createProject(project, source, backend, &why);
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+    QVERIFY2(manifest.pages.size() >= 5, "the fixture this test needs is too short");
+    while (manifest.pages.size() > 5) {
+        manifest.pages.removeLast();
     }
-    QVERIFY2(longestPt > 0.0, "the fixture's pages have no size to derive from");
+    manifest.pages[0].extraRotation = 90;
+    manifest.pages[2].extraRotation = 90;
+    QVERIFY2(manifest.writeTo(PdfSession::manifestPath(project), &why), qPrintable(why));
 
-    /// No bound, explicitly: the fixed 200 dpi, and the document is the layout at 200 dpi and
-    /// nothing else -- the size this notebook has always opened at.
-    PdfPageNavigator::instance()->setMaxPagePixels(0);
-    QCOMPARE(PdfPageNavigator::instance()->maxPagePixels(), 0);
-    /// Exactly 200: the default is the resolution the pages were always rendered at, not something
-    /// near it.
-    QCOMPARE(navigator()->currentRenderDpi(), 200.0);
+    /// The budget that is already saved is put back however this test ends: it is persisted, and a
+    /// failure walking away from one would change what the next RUN of the suite opens at.
+    BudgetRestore restore(PdfPageNavigator::instance()->memoryBudgetMb());
+
+    /// The budget for this window is set BEFORE it is opened: a window of this size at 200 dpi costs
+    /// about 560 MB of layers, and the first build must not allocate that just so the test can shrink
+    /// it afterwards.
+    PdfPageNavigator::instance()->setMemoryBudgetMb(200);
+    PdfPageNavigator::instance()->setScope(5);
+    QVERIFY2(PdfPageNavigator::instance()->openNotebookDir(project, &why), qPrintable(why));
+
+    const PdfSessionManifest opened = navigator()->manifest();
+    QCOMPARE(opened.pages.size(), 5);
+    const int scope = navigator()->scope();
+    QCOMPARE(scope, 5);
+
+    /// The mix really is a mix: a landscape page and a portrait page in the same window.
+    const QSizeF landscape = opened.pages.at(0).displaySizePt();
+    QVERIFY2(landscape.width() > landscape.height(), "page 1 is not the landscape one");
+    const QSizeF portrait = opened.pages.at(1).displaySizePt();
+    QVERIFY2(portrait.height() > portrait.width(), "page 2 is not the portrait one");
+
     KisDocument *document = navigator()->currentDocument();
     QVERIFY(document);
     QVERIFY(document->image());
-    const QSize atDefault = document->image()->size();
-    const PdfStripLayout defaultLayout =
-        PdfStripLayout::forWindow(manifest, navigator()->currentIndex(), scope, 200.0);
-    QVERIFY(defaultLayout.isValid());
-    QCOMPARE(atDefault, defaultLayout.imageSize());
 
-    /// Every finite target is a BOUND, in the document the navigator really built: the longest page
-    /// in the window comes out at or below it. The dpi follows from the longest page with the 200 dpi
-    /// ceiling and no floor -- a target that would make a page unreadable is the user's choice on a
-    /// menu that names the pixels, so a tiny one is a bound as well and is not clamped back up.
-    const QList<int> targets = { 100, 1200, 1800, 2600 };
-    for (int target : targets) {
-        PdfPageNavigator::instance()->setMaxPagePixels(target);
-        QCOMPARE(PdfPageNavigator::instance()->maxPagePixels(), target);
+    /// How many full-size layers the strip really has, counted from the document that was built.
+    const int layers = paintLayersOf(document->image());
+    QVERIFY2(layers >= 2, "the strip has fewer layers than a window with ink on it needs");
 
-        const qreal expectedDpi = qMin(target * 72.0 / longestPt, 200.0);
-        QCOMPARE(navigator()->currentRenderDpi(), expectedDpi);
+    /// The size the window has at the reference dpi, which is the size this notebook has always
+    /// opened at -- read off the layout, so no 200 dpi document has to be allocated to know it.
+    const PdfStripLayout reference =
+        PdfStripLayout::forWindow(opened, navigator()->currentIndex(), scope, 200.0);
+    QVERIFY(reference.isValid());
+    const QSize atDefault = reference.imageSize();
 
-        const PdfStripLayout layout =
-            PdfStripLayout::forWindow(manifest, navigator()->currentIndex(), scope, expectedDpi);
-        QVERIFY(layout.isValid());
-        QCOMPARE(document->image()->size(), layout.imageSize());
+    /// Every finite budget bounds the memory the window really holds: area x layers x 4 bytes, in the
+    /// decimal megabytes the menu names. Small enough to bind and it is spent, not thrown away; above
+    /// what 200 dpi already costs and it changes nothing at all.
+    for (int megabytes : { 200, 400, 800 }) {
+        PdfPageNavigator::instance()->setMemoryBudgetMb(megabytes);
+        QCOMPARE(PdfPageNavigator::instance()->memoryBudgetMb(), megabytes);
 
-        int longestRendered = 0;
-        for (const PdfStripLayout::Slot &slot : layout.slots()) {
-            longestRendered = qMax(longestRendered, qMax(slot.rect.width(), slot.rect.height()));
-        }
-        QVERIFY2(longestRendered <= target + 1,
-                 qPrintable(QStringLiteral("the longest page came out %1 px for a %2 px bound")
-                                .arg(longestRendered)
-                                .arg(target)));
-        /// And unless the ceiling is what it landed on, the bound is met exactly: the number in the
-        /// menu is the number of pixels, which is the whole claim.
-        if (expectedDpi < 200.0) {
-            QVERIFY2(qAbs(longestRendered - target) <= 1,
-                     qPrintable(QStringLiteral("the longest page came out %1 px for a %2 px bound")
-                                    .arg(longestRendered)
-                                    .arg(target)));
+        const QSize size = document->image()->size();
+        const qreal bytes = qreal(size.width()) * qreal(size.height()) * qreal(layers) * 4.0;
+        const qreal budgetBytes = qreal(megabytes) * 1000.0 * 1000.0;
+        QVERIFY2(bytes <= budgetBytes,
+                 qPrintable(QStringLiteral("a %1 MB budget built %2x%3 x %4 layers = %5 MB")
+                                .arg(megabytes)
+                                .arg(size.width())
+                                .arg(size.height())
+                                .arg(layers)
+                                .arg(bytes / 1000000.0, 0, 'f', 1)));
+
+        const qreal dpi = navigator()->currentRenderDpi();
+        const PdfStripLayout landed =
+            PdfStripLayout::forWindow(opened, navigator()->currentIndex(), scope, dpi);
+        QVERIFY(landed.isValid());
+        QCOMPARE(size, landed.imageSize());
+
+        if (dpi < 200.0) {
+            /// It binds, so the window is what the budget buys and not less: a derivation that came
+            /// out half empty would be throwing pixels away for nothing.
+            QVERIFY2(bytes >= budgetBytes * 0.9,
+                     qPrintable(QStringLiteral("a %1 MB budget only spent %2 MB")
+                                    .arg(megabytes)
+                                    .arg(bytes / 1000000.0, 0, 'f', 1)));
+
+            /// And the page size the menu names beside the budget is the longest page in the window
+            /// that budget built, within the layout's own rounding.
+            int longestRendered = 0;
+            for (const PdfStripLayout::Slot &slot : landed.slots()) {
+                longestRendered = qMax(longestRendered, qMax(slot.rect.width(), slot.rect.height()));
+            }
+            const int named = navigator()->longestPagePixelsForBudget(megabytes);
+            QVERIFY2(qAbs(longestRendered - named) <= 1,
+                     qPrintable(QStringLiteral("the menu names %1 px and the window has %2 px")
+                                    .arg(named)
+                                    .arg(longestRendered)));
+        } else {
+            /// The ceiling: a budget above what 200 dpi already costs changes nothing, so the window
+            /// is the size it has always been.
+            QCOMPARE(size, atDefault);
         }
     }
 
-    /// The two targets a 96 dpi floor collapsed into one page -- both came back at 96 dpi, above
-    /// either target, so picking 1200 changed nothing. They must give different documents.
-    PdfPageNavigator::instance()->setMaxPagePixels(1200);
-    const QSize at1200 = document->image()->size();
-    PdfPageNavigator::instance()->setMaxPagePixels(1800);
-    const QSize at1800 = document->image()->size();
-    QVERIFY2(at1200 != at1800, "a 1200 px target and an 1800 px target gave the same document");
-    QVERIFY2(at1800.width() > at1200.width() || at1800.height() > at1200.height(),
-             "the 1800 px target did not make a bigger document than the 1200 px one");
-
-    /// And the ceiling is today's size: a bound above what 200 dpi already gives changes nothing.
-    PdfPageNavigator::instance()->setMaxPagePixels(100000);
+    /// "No limit" is today exactly: 200 dpi, and the window the layout at 200 dpi has.
+    PdfPageNavigator::instance()->setMemoryBudgetMb(0);
+    QCOMPARE(PdfPageNavigator::instance()->memoryBudgetMb(), 0);
+    QCOMPARE(navigator()->currentRenderDpi(), 200.0);
     QCOMPARE(document->image()->size(), atDefault);
+    /// And the page size the menu names for it is the 200 dpi one, from the same derivation.
+    int longestAtDefault = 0;
+    for (const PdfStripLayout::Slot &slot : reference.slots()) {
+        longestAtDefault = qMax(longestAtDefault, qMax(slot.rect.width(), slot.rect.height()));
+    }
+    QVERIFY2(qAbs(navigator()->longestPagePixelsForBudget(0) - longestAtDefault) <= 1,
+             "the page size the menu names for no limit is not the 200 dpi one");
 
     /// The choice is written where a restart reads it.
-    QCOMPARE(QSettings().value(QStringLiteral("pdfio/maxPagePixels")).toInt(), 100000);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/memoryBudgetMb")).toInt(), 0);
+    PdfPageNavigator::instance()->setMemoryBudgetMb(400);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/memoryBudgetMb")).toInt(), 400);
+
+    /// And the key the previous build used for its pixel target is ignored, not read: a settings file
+    /// left behind must not bring the pixel behaviour back.
+    QSettings stale;
+    stale.setValue(QStringLiteral("pdfio/maxPagePixels"), 1200);
+    stale.sync();
+    PdfPageNavigator::instance()->setMemoryBudgetMb(0);
+    QCOMPARE(navigator()->currentRenderDpi(), 200.0);
+    stale.remove(QStringLiteral("pdfio/maxPagePixels"));
 }
 
 int main(int argc, char *argv[])
