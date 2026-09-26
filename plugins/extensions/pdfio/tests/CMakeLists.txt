@@ -232,6 +232,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         "${CMAKE_BINARY_DIR}/krita/krita.qrc"
         ${CMAKE_CURRENT_SOURCE_DIR}/../backend/PdfRenderBackendCreate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../backends/poppler/PopplerRenderBackend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PdfNotebookOpsDialog.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfPageNavigator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfPageStripDecoration.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfInkLoader.cpp

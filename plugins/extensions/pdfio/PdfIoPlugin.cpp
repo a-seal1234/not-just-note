@@ -9,6 +9,7 @@
 #include "PdfIoDocker.h"
 #include "PdfIoPlugin.h"
 #include "PdfIoProbe.h"
+#include "PdfNotebookOpsDialog.h"
 #include "PdfPageNavigator.h"
 #include "PdfRendererSpike.h"
 
@@ -948,6 +949,81 @@ void mergeNotebookFolder()
     mergeNotebookFrom(picked);
 }
 
+/// Opens the Notebook ops screen: the notebook's pages as one list, applied as one change.
+///
+/// The screen reads the list as it is on disk, so the pages that are open are written first -- the
+/// rule every operation follows -- and then it works on a copy. On Apply the engine commits the
+/// whole change once (one journal entry, one manifest write) and the notebook is reloaded once, so
+/// the reader ends up on the page they were on rather than wherever the last edit happened to land.
+void openNotebookOpsScreen(PdfIoPlugin *plugin)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Notebook ops"), i18n("No notebook is open."));
+        return;
+    }
+
+    QString why;
+    if (!navigator->prepareForNotebookChange(&why)) {
+        say(QStringLiteral("the notebook ops screen was not opened: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Notebook ops"),
+                             i18n("The notebook could not be written, so nothing was opened: %1",
+                                  why));
+        return;
+    }
+
+    const PdfSessionManifest manifest = PdfSession::openProject(navigator->projectDir(), &why);
+    if (!manifest.isValid(&why)) {
+        say(QStringLiteral("the notebook ops screen could not read the notebook: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Notebook ops"),
+                             i18n("The notebook could not be read: %1", why));
+        return;
+    }
+
+    PdfNotebookOpsDialog dialog(navigator->projectDir(), manifest, navigator->currentIndex());
+    if (dialog.exec() != QDialog::Accepted) {
+        /// Cancel is the whole promise: nothing was written, so there is nothing to undo.
+        return;
+    }
+
+    /// Insert, extract and merge are entered here and run as the single operations they already
+    /// are: the screen is a door to them, not a second implementation. They are only offered while
+    /// the page list is untouched, so nothing of the user's is lost by running one.
+    switch (dialog.requestedAction()) {
+    case PdfNotebookOpsDialog::InsertPagesAction:
+        if (plugin) {
+            plugin->slotInsertPages();
+        }
+        return;
+    case PdfNotebookOpsDialog::ExtractRangeAction:
+        extractPageRange();
+        return;
+    case PdfNotebookOpsDialog::MergeNotebookAction:
+        mergeNotebookFile();
+        return;
+    case PdfNotebookOpsDialog::NoAction:
+        break;
+    }
+
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(
+        navigator->projectDir(), dialog.edits(), PdfPageRotator::rotateInto);
+    if (!outcome.ok) {
+        say(QStringLiteral("the notebook ops screen was refused: %1").arg(outcome.why));
+        QMessageBox::warning(nullptr, i18n("Notebook ops"), outcome.why);
+        return;
+    }
+
+    say(outcome.summary);
+    if (!navigator->reloadNotebook(dialog.anchorPage(), &why)) {
+        say(QStringLiteral("the page list changed, but the notebook could not be reopened: %1")
+                .arg(why));
+        QMessageBox::warning(nullptr, i18n("Notebook ops"),
+                             i18n("The page list was changed, but the notebook could not be opened "
+                                  "again: %1",
+                                  why));
+    }
+}
+
 /// Runs one notebook-level operation the way its invariants require: write the open pages first,
 /// change the notebook, then reload it and open the page the operation answers with.
 ///
@@ -1022,6 +1098,7 @@ void updateNotebookOpsActions(QMenu *ops)
     /// A notebook keeps at least one page, and the engine refuses to delete the last one.
     set("pdfio_ops_delete", pages > 1);
     set("pdfio_ops_extract_range", pages >= 1);
+    set("pdfio_ops_screen", open);
     set("pdfio_ops_merge", pages >= 1);
     set("pdfio_ops_merge_folder", pages >= 1);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
@@ -1058,6 +1135,15 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
 
     /// Rename first: it is the one notebook-level entry that was already there, and the one the
     /// submenu is a new home for.
+    /// The screen first: one place where the whole page list can be seen and changed in one go, and
+    /// the entries below stay for the one-click cases on the page that is open.
+    QAction *screen = ops->addAction(i18n("Notebook ops..."));
+    screen->setObjectName(QStringLiteral("pdfio_ops_screen"));
+    QObject::connect(screen, &QAction::triggered, ops,
+                     [plugin]() { openNotebookOpsScreen(plugin); });
+
+    ops->addSeparator();
+
     QAction *rename = ops->addAction(i18n("Rename notebook..."));
     rename->setObjectName(QStringLiteral("pdfio_rename_notebook"));
     QObject::connect(rename, &QAction::triggered, ops, []() { renameNotebook(); });

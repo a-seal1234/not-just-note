@@ -2,6 +2,7 @@ set(kritapdfio_SOURCES
     PdfIoDocker.cpp
     PdfIoPlugin.cpp
     PdfIoProbe.cpp
+    PdfNotebookOpsDialog.cpp
     PdfPageNavigator.cpp
     PdfPageStripDecoration.cpp
     PdfRendererSpike.cpp

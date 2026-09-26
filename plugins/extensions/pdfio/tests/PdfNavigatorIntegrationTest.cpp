@@ -4,6 +4,7 @@
  *  SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include "PdfNotebookOpsDialog.h"
 #include "PdfPageNavigator.h"
 
 #include "backends/poppler/PopplerRenderBackend.h"
@@ -32,7 +33,10 @@
 
 #include <QApplication>
 #include <QDialog>
+#include <QLabel>
 #include <QMessageBox>
+#include <QPushButton>
+#include <QTableWidget>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -86,6 +90,7 @@ private Q_SLOTS:
     void testRotatingAPageTurnsTheInkWithThePaper();
     void testAnExtractedRangeOpensAsItsOwnNotebook();
     void testMergingANotebookInAddsItsPagesAndKeepsTheReader();
+    void testTheScreenKeepsItsChangeUntilApply();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1511,6 +1516,135 @@ void PdfNavigatorIntegrationTest::testMergingANotebookInAddsItsPagesAndKeepsTheR
         QApplication::processEvents();
     }
     QTest::qWait(50);
+}
+
+/**
+ * The screen keeps a whole change in memory until Apply, and says why an action is not available.
+ *
+ * The two things the design insists on are assertions here rather than intentions: Apply is off while
+ * nothing has changed (a no-op would still close and reopen the notebook), and a page that cannot be
+ * deleted or moved says so instead of leaving a greyed button mute. Nothing in this test reaches the
+ * disk through the screen: it only ever edits its own copy, which is what makes Cancel free.
+ */
+void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("screen"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QCOMPARE(manifest.pages.size(), 3);
+
+    /// Ink on the first page, so the change has a real file to carry: "the duplicate brings its
+    /// files" is then a statement about bytes rather than about a name.
+    {
+        QFile ink(QDir(project).filePath(manifest.pages.at(0).kraFile));
+        QVERIFY(ink.open(QIODevice::WriteOnly));
+        ink.write("ink of the first page");
+    }
+
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    const auto button = [&dialog](const char *name) {
+        auto *found = dialog.findChild<QPushButton *>(QString::fromLatin1(name));
+        Q_ASSERT(found);
+        return found;
+    };
+    const auto label = [&dialog](const char *name) {
+        auto *found = dialog.findChild<QLabel *>(QString::fromLatin1(name));
+        Q_ASSERT(found);
+        return found->text();
+    };
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY(table);
+
+    /// Nothing has changed: Apply is off and the legend says so, while the whole-notebook entries --
+    /// insert, extract, merge -- are available because the list is untouched.
+    QVERIFY2(!button("pdfio_ops_apply")->isEnabled(),
+             "Apply was offered with nothing changed: that would close and reopen the notebook for "
+             "nothing");
+    QVERIFY2(label("pdfio_ops_summary").contains(QStringLiteral("No changes")),
+             qPrintable(label("pdfio_ops_summary")));
+    QVERIFY(button("pdfio_ops_insert")->isEnabled());
+    QVERIFY(button("pdfio_ops_extract")->isEnabled());
+    QVERIFY(button("pdfio_ops_merge_notebook")->isEnabled());
+
+    /// The first page cannot move up, and the hint says why rather than leaving the button mute.
+    table->selectRow(0);
+    QVERIFY(!button("pdfio_ops_move_up")->isEnabled());
+    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("first page")),
+             qPrintable(label("pdfio_ops_hint")));
+
+    /// Duplicate the first page: one more page, named from the notebook's own allocator, with its
+    /// files brought along -- and still nothing on disk.
+    button("pdfio_ops_duplicate")->click();
+    PdfNotebookOps::PageEdits edits = dialog.edits();
+    QCOMPARE(edits.pages.size(), 4);
+    QCOMPARE(edits.sources.size(), 1);
+    QCOMPARE(edits.pages.at(1).kraFile, PdfSession::pageFileNameForNumber(4));
+    QVERIFY(edits.pages.at(1).kraFile != manifest.pages.at(0).kraFile);
+    QCOMPARE(edits.pages.at(1).index, manifest.pages.at(0).index);
+    /// Every file the copy needs is listed against the name it will have, and every source is a file
+    /// that is really there: the artifact, and the preview when the page has one.
+    bool carriesTheArtifact = false;
+    for (const QPair<QString, QString> &copy : edits.copyExternal) {
+        if (copy.second == edits.pages.at(1).kraFile) {
+            carriesTheArtifact = true;
+            /// The artifact is there because the test made one; a preview is only a name until a save
+            /// has actually drawn one, and the engine carries it when it exists.
+            QVERIFY2(QFileInfo::exists(copy.first), qPrintable(copy.first));
+        }
+    }
+    QVERIFY2(carriesTheArtifact, "the duplicate's artifact is not in the change at all");
+    QVERIFY2(!QFileInfo::exists(QDir(project).filePath(edits.pages.at(1).kraFile)),
+             "the screen wrote a file: it must only edit its own copy");
+    QVERIFY(button("pdfio_ops_apply")->isEnabled());
+
+    /// While a change is pending, the whole-notebook entries wait: a notebook is not two changes at
+    /// once, and the hint says so.
+    QVERIFY(!button("pdfio_ops_insert")->isEnabled());
+    QVERIFY(!button("pdfio_ops_extract")->isEnabled());
+    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("applied or")),
+             qPrintable(label("pdfio_ops_hint")));
+
+    /// Turning the open page: the record carries the turn, the preview goes with the change, and the
+    /// summary names it.
+    table->selectRow(0);
+    button("pdfio_ops_turn_right")->click();
+    edits = dialog.edits();
+    QCOMPARE(edits.pages.at(0).extraRotation, 90);
+    QVERIFY(edits.removeAfter.contains(manifest.pages.at(0).thumbFile));
+    QVERIFY2(label("pdfio_ops_summary").contains(QStringLiteral("turned")),
+             qPrintable(label("pdfio_ops_summary")));
+
+    /// Deleting a page keeps it in the list, struck through, until Apply -- and Keep page brings it
+    /// back, which is what makes a mistake here cost one click rather than a Cancel.
+    table->selectRow(3);
+    button("pdfio_ops_delete_page")->click();
+    /// Still listed -- struck through -- so the mistake is visible and one click from being undone.
+    QCOMPARE(table->rowCount(), 4);
+    QCOMPARE(dialog.edits().pages.size(), 3);
+    QVERIFY(dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile));
+    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("Keep page")),
+             qPrintable(label("pdfio_ops_hint")));
+    button("pdfio_ops_keep_page")->click();
+    QCOMPARE(dialog.edits().pages.size(), 4);
+    QVERIFY(!dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile));
+
+    /// A one-page notebook cannot lose its only page, and says so.
+    PdfSessionManifest single = manifest;
+    single.pages.removeLast();
+    single.pages.removeLast();
+    QCOMPARE(single.pages.size(), 1);
+    PdfNotebookOpsDialog only(project, single, 0);
+    auto *deleteOnly = only.findChild<QPushButton *>(QStringLiteral("pdfio_ops_delete_page"));
+    auto *hintOnly = only.findChild<QLabel *>(QStringLiteral("pdfio_ops_hint"));
+    QVERIFY(deleteOnly && hintOnly);
+    QVERIFY(!deleteOnly->isEnabled());
+    QVERIFY2(hintOnly->text().contains(QStringLiteral("at least one page")),
+             qPrintable(hintOnly->text()));
 }
 
 /**
