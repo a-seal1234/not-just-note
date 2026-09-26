@@ -149,6 +149,7 @@ public:
     int scope() const;
     void setScope(int scope);
 
+
     /**
      * Makes sure the page has a thumbnail, rendering one at thumbnail resolution when it has none.
      *

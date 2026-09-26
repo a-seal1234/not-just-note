@@ -67,6 +67,7 @@ void fail(QString *why, const QString &message)
 /// menus that show the list, because removing a notebook forgets its entry at the same moment, and a
 /// format written down in two places is a format that drifts.
 const char *const RecentNotebooksKey = "pdfio/recentNotebooks";
+
 const QChar RecentNotebookSeparator = QLatin1Char(10);
 const int MaxRecentNotebooks = 10;
 
@@ -828,6 +829,7 @@ QString PdfPageNavigator::projectDir() const
     return m_projectDir;
 }
 
+
 QStringList PdfPageNavigator::recentNotebooks()
 {
     QSettings settings;
@@ -1558,15 +1560,15 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             ? wasHeld.united(slots.at(i).cell)
             : slots.at(i).cell;
         if (paper) {
-            /// Cleared, and deliberately NOT filled with a colour afterwards: the room around the
-            /// page is left transparent and Krita's own canvas background shows through it. The
-            /// fill was what materialised tiles for every side area of every cell -- in a window of
-            /// mixed page sizes, most of the width of a wide page's cell -- and with the Desk layer
-            /// gone there is nothing left that needs the colour. The clearing is still the task-9
-            /// fix: the band the paper owned before the move has to go, or its pixels stay on
-            /// screen.
+            /// Cleared over the band the paper owned BEFORE the window moved -- the task-9 fix, or
+            /// those pixels stay on screen -- and then filled with the desk colour over the cell it
+            /// owns now: the room around the page is the colour the user chose over Krita's
+            /// transparency checkerboard. The layer is still gone; the colour lives in each band.
             paper->paintDevice()->fill(paperWipe,
                                        KoColor(Qt::transparent, m_document->image()->colorSpace()));
+            /// The desk colour for the room around the page, then the page itself.
+            paper->paintDevice()->fill(slots.at(i).cell,
+                                       KoColor(QColor(96, 96, 96), m_document->image()->colorSpace()));
         }
 
         /// Krita is told the slot changed. Writing into a paint device directly does not do that,
@@ -1627,7 +1629,18 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
                 continue;
             }
 
-            target->paintDevice()->convertFromQImage(entry.second, nullptr,
+            /// The artifact is page-local at whatever resolution it was WRITTEN at, and this
+            /// repaint is at m_dpi -- which the page-resolution setting can have changed since. So
+            /// it is scaled to the page's own rectangle, which is what keeps the ink on the page it
+            /// was drawn on. A difference of two pixels or less is pasted as it is: that is the two
+            /// roundings of one box disagreeing, and scaling for it would only blur the ink.
+            const bool sameSize = qAbs(entry.second.width() - slots.at(i).rect.width()) <= 2
+                && qAbs(entry.second.height() - slots.at(i).rect.height()) <= 2;
+            const QImage placed = sameSize
+                ? entry.second
+                : entry.second.scaled(slots.at(i).rect.size(), Qt::IgnoreAspectRatio,
+                                      Qt::SmoothTransformation);
+            target->paintDevice()->convertFromQImage(placed, nullptr,
                                                     slots.at(i).rect.x(), slots.at(i).rect.y());
             target->setDirty(slots.at(i).cell);
         }

@@ -22,6 +22,7 @@ private Q_SLOTS:
     void testWindowIsCentred();
     void testWindowClampsAtTheEnds();
     void testAWindowIsSizedForThePagesInIt();
+    void testTheImageSizeScalesWithTheResolution();
     void testSlotsHoldWholePages();
     void testPageAtDistinguishesGapsFromPages();
     void testEvenScopeIsMadeOdd();
@@ -523,6 +524,49 @@ void PdfStripLayoutTest::testAWindowMoveLeavesBandsOutsideTheNewCells()
         QCOMPARE(holding.slots().at(i).cell.top(), holding.slots().at(i - 1).cell.bottom() + 1);
     }
     QCOMPARE(holding.slots().last().cell.bottom() + 1, holding.imageSize().height());
+}
+
+/**
+ * The image is the window's own geometry at the resolution it is asked for, and memory is that
+ * squared: the page-resolution setting is the lever the user reaches for, so the two have to be in
+ * the ratio of the dpis and nothing in the layout may hold a resolution of its own.
+ */
+void PdfStripLayoutTest::testTheImageSizeScalesWithTheResolution()
+{
+    const PdfSessionManifest manifest = mixedDeckBook();
+    const int scope = 3;
+
+    const PdfStripLayout sharp = PdfStripLayout::forWindow(manifest, 1, scope, 200.0);
+    const PdfStripLayout cheap = PdfStripLayout::forWindow(manifest, 1, scope, 100.0);
+    QVERIFY(sharp.isValid());
+    QVERIFY(cheap.isValid());
+
+    /// The same window, so the same pages: only the resolution differs.
+    QCOMPARE(sharp.slots().size(), cheap.slots().size());
+    for (int i = 0; i < sharp.slots().size(); ++i) {
+        QCOMPARE(sharp.slots().at(i).page, cheap.slots().at(i).page);
+    }
+
+    /// Half the resolution is half the pixels on each side, within the rounding of one pixel. The
+    /// WIDTH is the widest page and nothing else, so it is in the ratio exactly.
+    QVERIFY2(qAbs(sharp.imageSize().width() - 2 * cheap.imageSize().width()) <= 2,
+             qPrintable(QStringLiteral("widths %1 and %2 are not in the ratio of 200 to 100")
+                            .arg(sharp.imageSize().width()).arg(cheap.imageSize().width())));
+
+    /// The height carries the slot gaps as well, and those are a fixed number of PIXELS -- the
+    /// space between two pages on screen, not a length of paper -- so the ratio is taken on the
+    /// pages' own share of it.
+    const int fixedGaps = (scope + 1) * 112;
+    QVERIFY2(qAbs((sharp.imageSize().height() - fixedGaps)
+                  - 2 * (cheap.imageSize().height() - fixedGaps)) <= 2,
+             qPrintable(QStringLiteral("the pages' heights in %1 and %2 are not in the ratio of 200 "
+                                       "to 100")
+                            .arg(sharp.imageSize().height() - fixedGaps)
+                            .arg(cheap.imageSize().height() - fixedGaps)));
+
+    /// And the slot rectangles are the pages at that resolution too, not just the image.
+    QCOMPARE(sharp.slots().at(1).rect.width(), qRound(cheap.slots().at(1).rect.width() * 2.0));
+    QCOMPARE(sharp.slots().at(1).rect.height(), qRound(cheap.slots().at(1).rect.height() * 2.0));
 }
 
 QTEST_MAIN(PdfStripLayoutTest)

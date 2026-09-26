@@ -97,18 +97,17 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
     strip.image->setResolution(dpi, dpi);
     strip.layout = layout;
 
-    /// No desk layer AND no desk paint: the room around the pages -- and the side room a page
-    /// leaves in a cell sized for a wider one -- is left TRANSPARENT, and Krita's canvas background
-    /// shows through it.
+    /// No desk LAYER under the pages -- that was one full-image layer of the same colour -- but the
+    /// colour itself is painted: each slot's band is filled and the page drawn into it, which is
+    /// what the roll does on every window move (PdfPageNavigator::rollToPage fills each paper over
+    /// slot.cell for the same reason). The bands tile the image, so nothing is left uncovered
+    /// without the layer, and a paper layer's own bounds are its cell.
     ///
-    /// The memory is (layers) x (painted area) x 4 bytes, and the colour was what MATERIALISED
-    /// tiles for that room: the desk layer was one full-image layer of it, and the per-cell fill
-    /// under it was the same room again in every paper layer, which for a window of mixed page
-    /// sizes is most of the width of a wide page's cell. The colour existed because a strip without
-    /// it showed Krita's transparency checkerboard around the pages; the device's own captures
-    /// since the desk layer went away show the canvas background there, which is the same grey, so
-    /// the look does not change. If a theme does show its checkerboard through the room, this is
-    /// the change to revisit rather than the one before it.
+    /// The colour is back because the user chose it: the transparency checkerboard showed on the
+    /// tablet when the room was left transparent, and the desk is exactly what exists to prevent
+    /// that. It costs memory -- (layers) x (painted area) x 4 bytes, and in a mixed-size window the
+    /// side room is most of a wide page's cell, about half the paper area -- and the page
+    /// resolution setting is the lever that pays for it back.
 
     const QDir project(projectDir);
     const QList<PdfStripLayout::Slot> slots = layout.slots();
@@ -126,9 +125,10 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
         KisPaintLayerSP background =
             new KisPaintLayer(strip.image, backgroundLayerName(manifest.pages.at(slot.page).index),
                               OPACITY_OPAQUE_U8);
-        /// Nothing under the page and nothing around it: the room stays transparent. A page whose
-        /// render failed is a slot with no pixels at all, which is what the canvas background
-        /// showing through looks like -- and the failure is logged above.
+        /// The desk colour for the room around the page, then the page itself: the band this slot
+        /// owns IS that room. A page whose render failed keeps the colour of its band rather than a
+        /// hole.
+        background->paintDevice()->fill(slot.cell, KoColor(QColor(96, 96, 96), colorSpace));
         if (!rendered.isNull()) {
             /// Said out loud when it happens: the slot was sized from the page's own geometry, and
             /// if the renderer disagrees the page is drawn in the wrong place. Deriving a raster
