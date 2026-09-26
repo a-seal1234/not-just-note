@@ -21,7 +21,10 @@ QSize pageSizeInPixels(const PdfSessionManifest &manifest, const PdfPageRecord &
     Q_UNUSED(manifest);
     /// displaySizePt(), not sizePt: a page the notebook itself has turned occupies its turned
     /// shape on the strip. The two are the same until a rotate is recorded, which is exactly why
-    /// the layout must ask the question that already knows about it.
+    /// the layout must ask the question that already knows about it. A right angle swaps the sides
+    /// exactly; any other angle gives the bigger rectangle the sheet fits in once it is turned, and
+    /// the slot has to be that rectangle rather than sizePt's or the page's own corners fall
+    /// outside the strip image.
     const QSizeF visible = page.displaySizePt();
     if (!visible.isValid()) {
         return QSize();

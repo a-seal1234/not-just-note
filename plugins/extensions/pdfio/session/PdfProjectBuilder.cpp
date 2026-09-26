@@ -172,9 +172,16 @@ KisImageSP PdfProjectBuilder::buildPageImage(const PdfPageRecord &page,
         return KisImageSP();
     }
 
+    /// The box the page occupies once the notebook's own turn is on it, which is what the image
+    /// below will actually measure. A page set down at an angle is BIGGER than its sizePt: charging
+    /// the budget for the unturned rectangle would let an angled page past the cap by the whole
+    /// area the angle adds, and the page the user sees would be the one rendered coarser than the
+    /// device allows.
+    const QSizeF boxPt = page.displaySizePt();
+
     const qint64 maxPixels = maxPagePixels();
     const qreal wantedPixels =
-        (page.sizePt.width() * dpi / 72.0) * (page.sizePt.height() * dpi / 72.0);
+        (boxPt.width() * dpi / 72.0) * (boxPt.height() * dpi / 72.0);
     if (wantedPixels > maxPixels) {
         const qreal requestedDpi = dpi;
         dpi *= std::sqrt(qreal(maxPixels) / wantedPixels);
@@ -193,10 +200,24 @@ KisImageSP PdfProjectBuilder::buildPageImage(const PdfPageRecord &page,
         return KisImageSP();
     }
 
-    /// And turned by the notebook's own quarter turn, if it has one: the renderer hands back the
-    /// source's orientation, and a page the user has turned comes back turned. The ink is turned
-    /// with it -- the artifact was rotated when the page was -- so a stroke stays on its line.
+    /// And turned by the notebook's own turn, if it has one: the renderer hands back the source's
+    /// orientation, and a page the user has turned -- by a right angle or by any other -- comes back
+    /// turned. The ink is turned with it -- the artifact was rotated when the page was -- so a
+    /// stroke stays on its line.
     const QImage oriented = PdfSourceRenderers::turnedForDisplay(rendered, page.extraRotation);
+
+    /// The image the turn produced is the box the budget above was measured on, so the two are
+    /// compared rather than assumed equal. The renderer's own transform rounds its result outwards,
+    /// so a pixel or two more than displaySizePt() is the rounding, not a disagreement; a page that
+    /// came back any further off would mean the turned sheet and the box it is measured against had
+    /// drifted apart, which is worth saying out loud.
+    const QSize boxPixels(qRound(boxPt.width() * dpi / 72.0), qRound(boxPt.height() * dpi / 72.0));
+    if (qAbs(oriented.width() - boxPixels.width()) > 2
+        || qAbs(oriented.height() - boxPixels.height()) > 2) {
+        qWarning() << "[pdfio] page" << (page.index + 1) << "turned by" << page.extraRotation
+                   << "degrees measures" << oriented.size() << "where displaySizePt() puts it at"
+                   << boxPixels;
+    }
 
     const KoColorSpace *colorSpace = KoColorSpaceRegistry::instance()->rgb8();
     if (!colorSpace) {

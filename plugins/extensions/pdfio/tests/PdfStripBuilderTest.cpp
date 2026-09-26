@@ -19,6 +19,57 @@
 #include <kis_paint_device.h>
 #include <kis_paint_layer.h>
 
+namespace {
+
+/**
+ * Collects the warnings emitted while it is alive, so a test can assert that a build stayed quiet.
+ *
+ * It chains to whatever handler was installed before it, so QtTest's own output is not swallowed,
+ * and it restores that handler in its destructor -- which is what a QVERIFY that fails early needs,
+ * since returning from the test function skips any explicit restore.
+ */
+class WarningCapture
+{
+public:
+    WarningCapture()
+    {
+        s_messages.clear();
+        s_previous = qInstallMessageHandler(&WarningCapture::handle);
+    }
+    ~WarningCapture() { qInstallMessageHandler(s_previous); }
+
+    /// The warnings seen since this capture was installed that contain \a needle.
+    QStringList containing(const QString &needle) const
+    {
+        QStringList found;
+        for (const QString &message : s_messages) {
+            if (message.contains(needle)) {
+                found.append(message);
+            }
+        }
+        return found;
+    }
+
+private:
+    static void handle(QtMsgType type, const QMessageLogContext &context, const QString &message)
+    {
+        if (type == QtWarningMsg) {
+            s_messages.append(message);
+        }
+        if (s_previous) {
+            s_previous(type, context, message);
+        }
+    }
+
+    static QStringList s_messages;
+    static QtMessageHandler s_previous;
+};
+
+QStringList WarningCapture::s_messages;
+QtMessageHandler WarningCapture::s_previous = nullptr;
+
+} // namespace
+
 /**
  * The strip, as a layer tree. The assertion that matters is the locking: the promise that the
  * neighbouring pages are shown but not yours to draw on is only true if Krita refuses the stroke,
@@ -37,6 +88,8 @@ private Q_SLOTS:
     void testPaperIsBelowEveryInkGroup();
     void testConsecutiveGapsAreEqual();
     void testASlotIsRenderedFromItsRecordAndNotItsPosition();
+    void testAnAngledPageOccupiesItsBox();
+    void testRightAnglePagesMatchTheRasterExactly();
 
 private:
     QString fixturePath() const
@@ -374,6 +427,120 @@ void PdfStripBuilderTest::testASlotIsRenderedFromItsRecordAndNotItsPosition()
     QCOMPARE(boundsSecond.size(), expectedSecond.size());
     QVERIFY(boundsFirst.size() != positionalFirst.size());
     QVERIFY(boundsSecond.size() != positionalSecond.size());
+}
+
+/**
+ * A page set down at an angle is shown inside the bounding box of its turned sheet, and the strip
+ * makes room for that box rather than for the unturned rectangle -- including the ink, which is
+ * drawn at the slot's own top left.
+ *
+ * The layout and the raster reach that box by different arithmetic and can land a pixel apart, so
+ * the strip builder's size check is a tolerance rather than an equality. The middle page is used
+ * deliberately: a 420x595 sheet at 37 degrees, whose box falls on a fractional pixel for both
+ * roundings, so this case really does exercise the tolerance rather than agreeing by luck.
+ */
+void PdfStripBuilderTest::testAnAngledPageOccupiesItsBox()
+{
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixturePath()));
+
+    const int page = 1;
+    const PdfPageInfo info = backend.pageInfo(page);
+    const QSizeF box = PdfPageRecord::turnedSize(info.sizePt, 37);
+
+    /// The premise first: the box really is bigger than the sheet, or this would pass unturned.
+    QVERIFY(box.width() > info.sizePt.width());
+    QVERIFY(box.height() > info.sizePt.height());
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    manifest.pages[page].extraRotation = 37;
+    QVERIFY(manifest.isValid());
+
+    const QSize boxPixels(qRound(box.width() * 200.0 / 72.0), qRound(box.height() * 200.0 / 72.0));
+
+    WarningCapture warnings;
+    QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
+    const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifest, page, 3, 200.0, renderers,
+                                                               fixtureDir(), &why);
+    QVERIFY2(strip.image, qPrintable(why));
+
+    /// The layout made room for the box, not for the sheet: the unturned rectangle is much shorter.
+    const int slot = strip.layout.slotForPage(page);
+    QVERIFY(slot >= 0);
+    const QRect rect = strip.layout.slots().at(slot).rect;
+    QCOMPARE(rect.size(), boxPixels);
+    QVERIFY(rect.width() > qRound(info.sizePt.width() * 200.0 / 72.0));
+    QVERIFY(rect.height() > qRound(info.sizePt.height() * 200.0 / 72.0));
+
+    /// And the page really landed there, at its box's own size. The two roundings may differ by a
+    /// pixel, never by more; the position is the slot's own corner either way.
+    const QString paperName = PdfStripBuilder::backgroundLayerName(info.index);
+    KisNodeSP paper = childNamed(strip.image, paperName);
+    QVERIFY2(paper, qPrintable(paperName));
+    QVERIFY(paper->userLocked());
+
+    const QRect bounds = paper->paintDevice()->exactBounds();
+    QVERIFY2(qAbs(bounds.width() - rect.width()) <= 2 && qAbs(bounds.height() - rect.height()) <= 2,
+             qPrintable(QStringLiteral("the page is %1x%2 where the layout made room for %3x%4")
+                            .arg(bounds.width()).arg(bounds.height())
+                            .arg(rect.width()).arg(rect.height())));
+    QVERIFY2(qAbs(bounds.left() - rect.left()) <= 2 && qAbs(bounds.top() - rect.top()) <= 2,
+             qPrintable(QStringLiteral("the page is at %1,%2 and its slot starts at %3,%4")
+                            .arg(bounds.left()).arg(bounds.top())
+                            .arg(rect.left()).arg(rect.top())));
+
+    /// And the build stayed quiet: the pixel the two roundings disagree on is not the page being in
+    /// the wrong place, which is what the size comparison in PdfStripBuilder is there to say.
+    const QStringList misplaced = warnings.containing(QStringLiteral("but the layout made room for"));
+    QVERIFY2(misplaced.isEmpty(), qPrintable(misplaced.join(QStringLiteral(" / "))));
+
+    qInfo("page %d turned 37 degrees at 200 dpi: slot %dx%d (unturned %dx%d), raster %dx%d",
+          page + 1, rect.width(), rect.height(),
+          qRound(info.sizePt.width() * 200.0 / 72.0), qRound(info.sizePt.height() * 200.0 / 72.0),
+          bounds.width(), bounds.height());
+}
+
+/**
+ * A right angle is untouched by the free-angle work: the box is the sheet or its exact transpose,
+ * the renderer transposes the raster, and the two agree to the pixel. This is what the tolerance
+ * the angled page needs must not be hiding -- a quarter turn whose size slipped would be a whole
+ * notebook of pages rendered at the wrong scale.
+ *
+ * 90, 180 and 270 in one strip, one per page; extraRotation 0 is asserted exactly by
+ * testPagesAreWhereTheLayoutSays.
+ */
+void PdfStripBuilderTest::testRightAnglePagesMatchTheRasterExactly()
+{
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixturePath()));
+
+    const int turns[] = { 90, 180, 270 };
+    PdfSessionManifest manifest = manifestFor(backend);
+    QCOMPARE(manifest.pages.size(), 3);
+    for (int i = 0; i < manifest.pages.size(); ++i) {
+        manifest.pages[i].extraRotation = turns[i];
+    }
+    QVERIFY(manifest.isValid());
+
+    QString why;
+    PdfSourceRenderers renderers([]() { return new PopplerRenderBackend(); });
+    const PdfStripBuilder::Strip strip = PdfStripBuilder::build(manifest, 1, 3, 200.0, renderers,
+                                                               fixtureDir(), &why);
+    QVERIFY2(strip.image, qPrintable(why));
+
+    for (const PdfStripLayout::Slot &slot : strip.layout.slots()) {
+        QVERIFY(slot.page >= 0);
+
+        const QString name = PdfStripBuilder::backgroundLayerName(manifest.pages.at(slot.page).index);
+        KisNodeSP paper = childNamed(strip.image, name);
+        QVERIFY2(paper, qPrintable(name));
+
+        /// Equality, not a tolerance: for a right angle there is nothing to round differently.
+        const QRect bounds = paper->paintDevice()->exactBounds();
+        QCOMPARE(bounds.size(), slot.rect.size());
+        QCOMPARE(bounds.topLeft(), slot.rect.topLeft());
+    }
 }
 
 QTEST_MAIN(PdfStripBuilderTest)

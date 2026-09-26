@@ -37,7 +37,8 @@ public:
     struct Slot {
         /// The page this slot holds, or -1 when the window runs off either end of the notebook.
         int page = -1;
-        /// Where the page sits in the strip image, in pixels.
+        /// Where the page sits in the strip image, in pixels: the page's displayed box, which for
+        /// a page set down at an angle is the rectangle that holds the turned sheet.
         QRect rect;
 
         /// The whole band this slot owns, page or no page: the page plus half the gap above and

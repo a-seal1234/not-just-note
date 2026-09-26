@@ -61,9 +61,11 @@ void PdfPageStripDecoration::drawDecoration(QPainter &gc,
     /// The open page's own geometry, in the document's pixels. Everything else is derived from it,
     /// because the manifest speaks in points and the canvas in pixels.
     const QRectF pageInDocument(0, 0, image->width(), image->height());
-    const qreal pixelsPerPoint = manifest.pages.at(index).sizePt.width() > 0
-        ? image->width() / manifest.pages.at(index).sizePt.width()
-        : 1.0;
+    /// displaySizePt(), not sizePt: the document holds the page as the reader shows it, and a page
+    /// set down at an angle is its bounding box rather than the source's rectangle. Dividing the
+    /// image by the unturned width would scale every angled page's neighbour up.
+    const QSizeF pageBoxPt = manifest.pages.at(index).displaySizePt();
+    const qreal pixelsPerPoint = pageBoxPt.width() > 0 ? image->width() / pageBoxPt.width() : 1.0;
 
     /// The zoom is read off the page's own on-screen width rather than asked for: the converter
     /// exposes setZoom and clampZoom but no accessor, and the ratio is right here anyway.
@@ -78,7 +80,7 @@ void PdfPageStripDecoration::drawDecoration(QPainter &gc,
             continue;
         }
 
-        const QSizeF neighbourPixels = manifest.pages.at(other).sizePt * pixelsPerPoint;
+        const QSizeF neighbourPixels = manifest.pages.at(other).displaySizePt() * pixelsPerPoint;
         if (neighbourPixels.isEmpty()) {
             continue;
         }

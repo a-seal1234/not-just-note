@@ -126,7 +126,18 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
             /// Said out loud when it happens: the slot was sized from the page's own geometry, and
             /// if the renderer disagrees the page is drawn in the wrong place. Deriving a raster
             /// size instead of asking the renderer is a mistake this project has already made.
-            if (rendered.size() != slot.rect.size()) {
+            ///
+            /// A page set down at an angle is the one case where the two are allowed to differ, and
+            /// by a pixel: the renderer turns the page's own PIXELS and rounds the box out of them
+            /// (PdfSourceRenderers::turnedForDisplay, through PdfPageRecord::turnedSize), while the
+            /// layout turns the page's size in POINTS and only then converts to pixels -- two
+            /// roundings of one box, not two boxes. Measured over the fixture geometries, angles and
+            /// dpis the gap is never more than a pixel, and a right angle is exact. Two is the
+            /// tolerance: wide enough not to cry wolf over half a pixel either way, narrow enough
+            /// that a slot filled with the wrong page -- whose size differs by far more -- still
+            /// speaks up.
+            if (qAbs(rendered.width() - slot.rect.width()) > 2
+                || qAbs(rendered.height() - slot.rect.height()) > 2) {
                 qWarning() << "[pdfio] page" << (slot.page + 1) << "rendered at" << rendered.size()
                            << "but the layout made room for" << slot.rect.size();
             }

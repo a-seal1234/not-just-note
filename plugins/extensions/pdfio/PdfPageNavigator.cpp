@@ -665,8 +665,11 @@ int PdfPageNavigator::pageAtDocumentPoint(const QPointF &point, qreal zoom) cons
         return m_index;
     }
 
-    /// The open page's own scale: the manifest speaks in points and the image in pixels.
-    const qreal pageWidthPt = m_manifest.pages.at(m_index).sizePt.width();
+    /// The open page's own scale: the manifest speaks in points and the image in pixels. The box
+    /// the image measures is displaySizePt() -- the page as the reader shows it, which for a page
+    /// set down at an angle is its bounding box, bigger than the source's sizePt -- or the scale
+    /// would be wrong for exactly the pages this fallback exists for.
+    const qreal pageWidthPt = m_manifest.pages.at(m_index).displaySizePt().width();
     const qreal pixelsPerPoint = pageWidthPt > 0 ? page.width() / pageWidthPt : 1.0;
 
     /// The same arrangement the strip decoration draws: the neighbours directly above and below,
@@ -679,7 +682,7 @@ int PdfPageNavigator::pageAtDocumentPoint(const QPointF &point, qreal zoom) cons
             continue;
         }
 
-        const QSizeF neighbour = m_manifest.pages.at(other).sizePt * pixelsPerPoint;
+        const QSizeF neighbour = m_manifest.pages.at(other).displaySizePt() * pixelsPerPoint;
         const qreal top = direction > 0 ? pageRect.bottom() + gap
                                         : pageRect.top() - gap - neighbour.height();
 
