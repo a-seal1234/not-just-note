@@ -312,6 +312,9 @@ void PdfNotebookOpsDialog::duplicateSelected()
     /// engine copies the list in order, so a chain of duplicates resolves.
     m_copies.append(qMakePair(QDir(source.fromDir).filePath(source.record.kraFile),
                               copy.record.kraFile));
+    m_copies.append(qMakePair(QDir(source.fromDir).filePath(source.record.kraFile
+                                                              + QStringLiteral(".layers.txt")),
+                              copy.record.kraFile + QStringLiteral(".layers.txt")));
     if (!source.record.thumbFile.isEmpty()) {
         m_copies.append(qMakePair(QDir(source.fromDir).filePath(source.record.thumbFile),
                                   copy.record.thumbFile));
@@ -344,6 +347,7 @@ void PdfNotebookOpsDialog::deleteSelected()
                 const QString destination = list->at(i).second;
                 if (destination == dropped.record.kraFile
                     || destination == dropped.record.kraFile + QStringLiteral(".layers")
+                    || destination == dropped.record.kraFile + QStringLiteral(".layers.txt")
                     || (!dropped.record.thumbFile.isEmpty()
                         && destination == dropped.record.thumbFile)) {
                     list->removeAt(i);
@@ -355,7 +359,9 @@ void PdfNotebookOpsDialog::deleteSelected()
     } else {
         Row &gone = m_rows[row];
         gone.removed = true;
-        m_removals << gone.record.kraFile;
+        m_removals << gone.record.kraFile
+                   << gone.record.kraFile + QStringLiteral(".layers")
+                   << gone.record.kraFile + QStringLiteral(".layers.txt");
         if (!gone.record.thumbFile.isEmpty()) {
             m_removals << gone.record.thumbFile;
         }
@@ -375,6 +381,8 @@ void PdfNotebookOpsDialog::keepSelected()
     Row &back = m_rows[row];
     back.removed = false;
     m_removals.removeAll(back.record.kraFile);
+    m_removals.removeAll(back.record.kraFile + QStringLiteral(".layers"));
+    m_removals.removeAll(back.record.kraFile + QStringLiteral(".layers.txt"));
     if (!back.record.thumbFile.isEmpty()) {
         m_removals.removeAll(back.record.thumbFile);
     }
@@ -776,6 +784,8 @@ void PdfNotebookOpsDialog::addNotebook(const NotebookToMerge &notebook)
         row.fromMergedNotebook = true;
 
         m_copies.append(qMakePair(from.filePath(page.kraFile), row.record.kraFile));
+        m_copies.append(qMakePair(from.filePath(page.kraFile + QStringLiteral(".layers.txt")),
+                                  row.record.kraFile + QStringLiteral(".layers.txt")));
         if (!page.thumbFile.isEmpty()) {
             m_copies.append(qMakePair(from.filePath(page.thumbFile), row.record.thumbFile));
         }

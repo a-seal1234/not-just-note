@@ -1545,6 +1545,18 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
         QVERIFY(ink.open(QIODevice::WriteOnly));
         ink.write("ink of the first page");
     }
+    {
+        const QString layerPath = QDir(project).filePath(
+            manifest.pages.at(0).kraFile + QStringLiteral(".layers/Inserted image.png"));
+        QVERIFY(QDir().mkpath(QFileInfo(layerPath).absolutePath()));
+        QFile layer(layerPath);
+        QVERIFY(layer.open(QIODevice::WriteOnly));
+        layer.write("test layer pixels");
+
+        QFile index(QDir(project).filePath(manifest.pages.at(0).kraFile + QStringLiteral(".layers.txt")));
+        QVERIFY(index.open(QIODevice::WriteOnly));
+        index.write("# index\tname\tfile\topacity\tx\ty\n0\tInserted image\tInserted image.png\t255\t0\t0\n");
+    }
 
     PdfNotebookOpsDialog dialog(project, manifest, 0);
     const auto button = [&dialog](const char *name) {
@@ -1589,7 +1601,14 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
     /// Every file the copy needs is listed against the name it will have, and every source is a file
     /// that is really there: the artifact, and the preview when the page has one.
     bool carriesTheArtifact = false;
+    bool carriesTheLayerIndex = false;
     for (const QPair<QString, QString> &copy : edits.copyExternal) {
+        if (copy.second == edits.pages.at(1).kraFile + QStringLiteral(".layers.txt")) {
+            carriesTheLayerIndex = true;
+            QCOMPARE(copy.first, QDir(project).filePath(manifest.pages.at(0).kraFile
+                                                        + QStringLiteral(".layers.txt")));
+            QVERIFY2(QFileInfo::exists(copy.first), qPrintable(copy.first));
+        }
         if (copy.second == edits.pages.at(1).kraFile) {
             carriesTheArtifact = true;
             /// The artifact is there because the test made one; a preview is only a name until a save
@@ -1598,6 +1617,7 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
         }
     }
     QVERIFY2(carriesTheArtifact, "the duplicate's artifact is not in the change at all");
+    QVERIFY2(carriesTheLayerIndex, "the duplicate's sidecar layer index is not in the change");
     QVERIFY2(!QFileInfo::exists(QDir(project).filePath(edits.pages.at(1).kraFile)),
              "the screen wrote a file: it must only edit its own copy");
     QVERIFY(button("pdfio_ops_apply")->isEnabled());
@@ -1630,11 +1650,15 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
     QCOMPARE(table->rowCount(), 4);
     QCOMPARE(dialog.edits().pages.size(), 3);
     QVERIFY(dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile));
+    QVERIFY(dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile + QStringLiteral(".layers")));
+    QVERIFY(dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile + QStringLiteral(".layers.txt")));
     QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("Keep page")),
              qPrintable(label("pdfio_ops_hint")));
     button("pdfio_ops_keep_page")->click();
     QCOMPARE(dialog.edits().pages.size(), 4);
     QVERIFY(!dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile));
+    QVERIFY(!dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile + QStringLiteral(".layers")));
+    QVERIFY(!dialog.edits().removeAfter.contains(manifest.pages.at(2).kraFile + QStringLiteral(".layers.txt")));
 
     /// The insert button is a real edit: given a PDF to add, its pages join THIS list and the PDF is
     /// named in the change, so it commits with everything else rather than as its own operation.
@@ -1700,6 +1724,15 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
         QCOMPARE(withMerge.pages.at(1).index, otherManifest.pages.at(0).index);
         QCOMPARE(withMerge.pages.at(1).sizePt, otherManifest.pages.at(0).sizePt);
         QVERIFY2(!withMerge.copyExternal.isEmpty(), "the incoming page's files are not in the change");
+        bool carriesLayerIndex = false;
+        for (const QPair<QString, QString> &copy : withMerge.copyExternal) {
+            if (copy.second == withMerge.pages.at(1).kraFile + QStringLiteral(".layers.txt")) {
+                carriesLayerIndex = true;
+                QCOMPARE(copy.first, QDir(otherDir).filePath(otherManifest.pages.at(0).kraFile
+                                                              + QStringLiteral(".layers.txt")));
+            }
+        }
+        QVERIFY2(carriesLayerIndex, "the merged page's sidecar layer index is not in the change");
         QVERIFY2(!withMerge.copyExternalDirs.isEmpty(), "the incoming sidecar is not in the change");
     }
 

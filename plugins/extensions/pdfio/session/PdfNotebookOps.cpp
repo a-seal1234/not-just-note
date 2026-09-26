@@ -579,10 +579,13 @@ PdfNotebookOps::Outcome PdfNotebookOps::duplicatePage(const QString &projectDir,
     /// of them would make a later edit of one appear on the other.
     plan.copyDirs.append(qMakePair(sidecarDirOf(original.kraFile), sidecarDirOf(copy.kraFile)));
     plan.copyFiles.append(qMakePair(original.kraFile, copy.kraFile));
+    plan.copyFiles.append(qMakePair(original.kraFile + QStringLiteral(".layers.txt"),
+                                    copy.kraFile + QStringLiteral(".layers.txt")));
     if (!original.thumbFile.isEmpty()) {
         plan.copyFiles.append(qMakePair(original.thumbFile, copy.thumbFile));
     }
-    plan.added << sidecarDirOf(copy.kraFile) << copy.kraFile;
+    plan.added << sidecarDirOf(copy.kraFile) << copy.kraFile
+               << copy.kraFile + QStringLiteral(".layers.txt");
     if (!original.thumbFile.isEmpty()) {
         plan.added << copy.thumbFile;
     }
@@ -841,7 +844,8 @@ PdfNotebookOps::Outcome PdfNotebookOps::extractRange(const QString &projectDir, 
     for (const PdfPageRecord &page : after.pages) {
         /// The sidecar is a directory, so it is copied whole; the artifact and the preview are
         /// files.
-        if (!copyIfThere(page.kraFile) || !copyIfThere(page.thumbFile)) {
+        if (!copyIfThere(page.kraFile) || !copyIfThere(page.kraFile + QStringLiteral(".layers.txt"))
+            || !copyIfThere(page.thumbFile)) {
             return refused(QStringLiteral("cannot copy the files of the page %1").arg(page.kraFile));
         }
         if (!copyDirectory(QDir(projectDir).filePath(sidecarDirOf(page.kraFile)),
@@ -1071,6 +1075,9 @@ PdfNotebookOps::Outcome PdfNotebookOps::mergeNotebook(const QString &projectDir,
 
         plan.copyExternal.append(qMakePair(from.filePath(page.kraFile), copy.kraFile));
         plan.added.append(copy.kraFile);
+        plan.copyExternal.append(qMakePair(from.filePath(page.kraFile + QStringLiteral(".layers.txt")),
+                                            copy.kraFile + QStringLiteral(".layers.txt")));
+        plan.added.append(copy.kraFile + QStringLiteral(".layers.txt"));
         if (!page.thumbFile.isEmpty()) {
             plan.copyExternal.append(qMakePair(from.filePath(page.thumbFile), copy.thumbFile));
             plan.added.append(copy.thumbFile);
@@ -1141,7 +1148,8 @@ PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, i
     plan.after = before;
     for (int i = first; i < first + count; ++i) {
         const PdfPageRecord &page = before.pages.at(i);
-        plan.removeAfter << page.kraFile << sidecarDirOf(page.kraFile);
+        plan.removeAfter << page.kraFile << sidecarDirOf(page.kraFile)
+                         << page.kraFile + QStringLiteral(".layers.txt");
         if (!page.thumbFile.isEmpty()) {
             plan.removeAfter << page.thumbFile;
         }

@@ -727,9 +727,12 @@ void PdfSessionTest::testDeletingAPageJournalsItsFiles()
     const PdfPageRecord second = before.pages.at(1);
     const QByteArray ink = QByteArrayLiteral("ink of page 2");
     const QByteArray sidecar = QByteArrayLiteral("a sidecar layer");
+    const QByteArray sidecarIndex = QByteArrayLiteral(
+        "# index\tname\tfile\topacity\tx\ty\n0\tInserted image\tInserted image.png\t255\t0\t0\n");
     const QByteArray thumb = QByteArrayLiteral("thumb of page 2");
     writeBytes(QDir(project).filePath(second.kraFile), ink);
     writeBytes(QDir(project).filePath(second.kraFile + QStringLiteral(".layers/Inserted image.png")), sidecar);
+    writeBytes(QDir(project).filePath(second.kraFile + QStringLiteral(".layers.txt")), sidecarIndex);
     writeBytes(QDir(project).filePath(second.thumbFile), thumb);
 
     const PdfNotebookOps::Outcome outcome = PdfNotebookOps::deletePages(project, 1, 1, 1);
@@ -745,6 +748,7 @@ void PdfSessionTest::testDeletingAPageJournalsItsFiles()
 
     /// Gone from the notebook...
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(second.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(second.kraFile + QStringLiteral(".layers.txt"))));
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(second.thumbFile)));
 
     /// ...and in the journal.
@@ -752,6 +756,7 @@ void PdfSessionTest::testDeletingAPageJournalsItsFiles()
     const QString removed = QDir(journal).filePath(QStringLiteral("removed"));
     QVERIFY(QFileInfo::exists(QDir(removed).filePath(second.kraFile)));
     QVERIFY(QFileInfo::exists(QDir(removed).filePath(second.thumbFile)));
+    QCOMPARE(readBytes(QDir(removed).filePath(second.kraFile + QStringLiteral(".layers.txt"))), sidecarIndex);
     QVERIFY(QFileInfo::exists(
         QDir(removed).filePath(second.kraFile + QStringLiteral(".layers/Inserted image.png"))));
 
@@ -764,6 +769,7 @@ void PdfSessionTest::testDeletingAPageJournalsItsFiles()
     QCOMPARE(readBytes(QDir(project).filePath(second.thumbFile)), thumb);
     QCOMPARE(readBytes(QDir(project).filePath(second.kraFile + QStringLiteral(".layers/Inserted image.png"))),
              sidecar);
+    QCOMPARE(readBytes(QDir(project).filePath(second.kraFile + QStringLiteral(".layers.txt"))), sidecarIndex);
     QVERIFY(!QFileInfo::exists(journal));
 }
 
@@ -810,6 +816,9 @@ void PdfSessionTest::testDuplicatingAPageCopiesItsArtifacts()
     writeBytes(QDir(project).filePath(original.kraFile), QByteArrayLiteral("ink of page 1"));
     writeBytes(QDir(project).filePath(original.kraFile + QStringLiteral(".layers/Inserted image.png")),
                QByteArrayLiteral("a sidecar layer"));
+    const QByteArray sidecarIndex = QByteArrayLiteral(
+        "# index\tname\tfile\topacity\tx\ty\n0\tInserted image\tInserted image.png\t255\t0\t0\n");
+    writeBytes(QDir(project).filePath(original.kraFile + QStringLiteral(".layers.txt")), sidecarIndex);
     writeBytes(QDir(project).filePath(original.thumbFile), QByteArrayLiteral("thumb of page 1"));
 
     const PdfNotebookOps::Outcome outcome = PdfNotebookOps::duplicatePage(project, 0, 0);
@@ -836,6 +845,7 @@ void PdfSessionTest::testDuplicatingAPageCopiesItsArtifacts()
              readBytes(QDir(project).filePath(original.thumbFile)));
     QCOMPARE(readBytes(QDir(project).filePath(copy.kraFile + QStringLiteral(".layers/Inserted image.png"))),
              QByteArrayLiteral("a sidecar layer"));
+    QCOMPARE(readBytes(QDir(project).filePath(copy.kraFile + QStringLiteral(".layers.txt"))), sidecarIndex);
 
     /// The undo takes the copy away and leaves the original exactly as it was.
     const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
@@ -843,6 +853,7 @@ void PdfSessionTest::testDuplicatingAPageCopiesItsArtifacts()
     QCOMPARE(PdfSession::openProject(project, &why).toJson(), before.toJson());
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile)));
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile + QStringLiteral(".layers"))));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile + QStringLiteral(".layers.txt"))));
     QCOMPARE(readBytes(QDir(project).filePath(original.kraFile)), QByteArrayLiteral("ink of page 1"));
 }
 
@@ -1283,6 +1294,9 @@ void PdfSessionTest::testExtractingARangeMakesANotebook()
     writeBytes(QDir(project).filePath(first.kraFile), QByteArrayLiteral("ink of page 1"));
     writeBytes(QDir(project).filePath(first.kraFile + QStringLiteral(".layers/Inserted image.png")),
                QByteArrayLiteral("a layer"));
+    const QByteArray sidecarIndex = QByteArrayLiteral(
+        "# index\tname\tfile\topacity\tx\ty\n0\tInserted image\tInserted image.png\t255\t0\t0\n");
+    writeBytes(QDir(project).filePath(first.kraFile + QStringLiteral(".layers.txt")), sidecarIndex);
     writeBytes(QDir(project).filePath(first.thumbFile), QByteArrayLiteral("preview of page 1"));
     /// Page 2 is left WITHOUT an artifact on purpose: a page that was never drawn on has none, and
     /// the extracted notebook has to carry that hole rather than invent a file for it.
@@ -1310,6 +1324,7 @@ void PdfSessionTest::testExtractingARangeMakesANotebook()
     QCOMPARE(readBytes(QDir(destination).filePath(first.kraFile
                                                   + QStringLiteral(".layers/Inserted image.png"))),
              QByteArrayLiteral("a layer"));
+    QCOMPARE(readBytes(QDir(destination).filePath(first.kraFile + QStringLiteral(".layers.txt"))), sidecarIndex);
     QVERIFY(QFileInfo::exists(QDir(destination).filePath(extracted.sourceFile)));
     /// And the page that was never drawn on came across as a page with no artifact, not as one
     /// with a file nothing wrote.
@@ -1460,6 +1475,9 @@ void PdfSessionTest::testMergingANotebookIn()
                QByteArrayLiteral("ink of the incoming page"));
     writeBytes(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers/Inserted image.png")),
                QByteArrayLiteral("a layer"));
+    const QByteArray sidecarIndex = QByteArrayLiteral(
+        "# index\tname\tfile\topacity\tx\ty\n0\tInserted image\tInserted image.png\t255\t0\t0\n");
+    writeBytes(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers.txt")), sidecarIndex);
     writeBytes(QDir(other).filePath(incomingFirst.thumbFile), QByteArrayLiteral("a preview"));
     writeBytes(QDir(other).filePath(QStringLiteral("assets/picture.png")), QByteArrayLiteral("an asset"));
     const QByteArray incomingManifestBefore = readBytes(PdfSession::manifestPath(other));
@@ -1496,6 +1514,7 @@ void PdfSessionTest::testMergingANotebookIn()
     QCOMPARE(readBytes(QDir(project).filePath(arrived.kraFile
                                                + QStringLiteral(".layers/Inserted image.png"))),
              QByteArrayLiteral("a layer"));
+    QCOMPARE(readBytes(QDir(project).filePath(arrived.kraFile + QStringLiteral(".layers.txt"))), sidecarIndex);
 
     /// A page of the incoming notebook that was never drawn on arrives without an artifact, and its
     /// asset came across.
@@ -1514,6 +1533,7 @@ void PdfSessionTest::testMergingANotebookIn()
     QVERIFY2(undo.ok, qPrintable(undo.why));
     QCOMPARE(PdfSession::openProject(project, &why).toJson(), target.toJson());
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(arrived.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(arrived.kraFile + QStringLiteral(".layers.txt"))));
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("assets/picture.png"))));
 }
 
@@ -1896,6 +1916,9 @@ void PdfSessionTest::testAWholeChangeThatMergesANotebookInIsOneCommit()
     writeBytes(QDir(other).filePath(incomingFirst.kraFile), QByteArrayLiteral("ink of the other page"));
     writeBytes(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers/Ink.png")),
                QByteArrayLiteral("the other layer"));
+    const QByteArray sidecarIndex = QByteArrayLiteral(
+        "# index\tname\tfile\topacity\tx\ty\n0\tInk\tInk.png\t255\t0\t0\n");
+    writeBytes(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers.txt")), sidecarIndex);
     writeBytes(QDir(other).filePath(incomingFirst.thumbFile), QByteArrayLiteral("the other preview"));
     writeBytes(QDir(other).filePath(QStringLiteral("assets/picture.png")),
                QByteArrayLiteral("an incoming asset"));
@@ -1923,6 +1946,8 @@ void PdfSessionTest::testAWholeChangeThatMergesANotebookInIsOneCommit()
     edits.pages << b << a << firstIn << secondIn;
     edits.copyExternal
         << qMakePair(QDir(other).filePath(incomingFirst.kraFile), firstIn.kraFile)
+        << qMakePair(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers.txt")),
+                     firstIn.kraFile + QStringLiteral(".layers.txt"))
         << qMakePair(QDir(other).filePath(incomingFirst.thumbFile), firstIn.thumbFile);
     edits.copyExternalDirs
         << qMakePair(QDir(other).filePath(incomingFirst.kraFile + QStringLiteral(".layers")),
@@ -1963,6 +1988,7 @@ void PdfSessionTest::testAWholeChangeThatMergesANotebookInIsOneCommit()
     QCOMPARE(readBytes(QDir(project).filePath(firstIn.kraFile
                                               + QStringLiteral(".layers/Ink.png"))),
              QByteArrayLiteral("the other layer"));
+    QCOMPARE(readBytes(QDir(project).filePath(firstIn.kraFile + QStringLiteral(".layers.txt"))), sidecarIndex);
     QCOMPARE(readBytes(QDir(project).filePath(firstIn.thumbFile)),
              QByteArrayLiteral("the other preview"));
     QCOMPARE(readBytes(QDir(project).filePath(QStringLiteral("assets/picture.png"))),
@@ -1975,6 +2001,7 @@ void PdfSessionTest::testAWholeChangeThatMergesANotebookInIsOneCommit()
     QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
     QCOMPARE(readBytes(QDir(project).filePath(c.kraFile)), QByteArrayLiteral("ink of C"));
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(firstIn.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(firstIn.kraFile + QStringLiteral(".layers.txt"))));
     QVERIFY(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("assets/picture.png"))));
     QVERIFY2(!QFileInfo::exists(copiedPdf), "the merged-in notebook's PDF was left behind");
 }
