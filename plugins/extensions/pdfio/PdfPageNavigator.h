@@ -19,6 +19,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 
 #include <QRect>
@@ -177,6 +178,61 @@ public:
     int pageCount() const;
     int currentIndex() const;
     QString projectDir() const;
+
+    /**
+     * Closes the notebook that is open and forgets it.
+     *
+     * prepareForClose() is the gate: every page the open document holds is written first, and a
+     * notebook whose ink cannot be written is left open rather than closed over it. On success the
+     * view and its document go -- the strip's document and its layers are the largest thing the
+     * application holds, so a notebook that is deleted while open must not leave them behind -- and
+     * the window, the strip, the slot bookkeeping, the queued thumbnails, the ink-change watch, the
+     * open renderers, the manifest and the project directory all go with it. \ref pageChanged() then
+     * says there is no notebook, so the menu, the docker and the Start screen stop describing one.
+     *
+     * Ending the notebook in memory is all this does; removing its directory is
+     * \ref removeNotebookStore().
+     */
+    bool closeNotebook(QString *why = nullptr);
+
+    /**
+     * Removes the notebook store at \a projectDir, and forgets it in the recent list with it.
+     *
+     * Refuses, with \a why, a directory that is not inside \ref projectRoot() -- the same rule the
+     * rest of the plugin follows for a path it did not make -- and refuses when the directory cannot
+     * be removed, so the caller can leave the notebook open rather than half-delete it. Nothing is
+     * removed before either check: a caller that is refused has lost nothing.
+     *
+     * A directory that is already gone is not an error: the entry outlived it, and forgetting the
+     * entry is the whole of the work.
+     */
+    static bool removeNotebookStore(const QString &projectDir, QString *why = nullptr);
+
+    /**
+     * Whether \a projectDir is a directory this store may remove: inside \ref projectRoot() and not
+     * the root itself.
+     *
+     * The check removeNotebookStore() makes before it removes anything, exposed separately so a
+     * caller can ask BEFORE it asks the user: a confirmation that then refuses is worse than no
+     * confirmation at all.
+     */
+    static bool isInsideNotebookStore(const QString &projectDir);
+
+    /**
+     * The notebooks this application has opened, most recent first.
+     *
+     * An entry is "<project directory>" + \ref recentNotebookSeparator() + "<the name to show>". The
+     * list is kept with the notebook store rather than with the menus that display it, because
+     * removing a notebook has to forget its entry at the same moment, and one place has to know
+     * where the list lives.
+     */
+    static QStringList recentNotebooks();
+    static void setRecentNotebooks(const QStringList &entries);
+    static QString recentNotebookDir(const QString &entry);
+    static QChar recentNotebookSeparator();
+    /// Drops \a projectDir from the recent list, if it is there. Also drops entries that name no
+    /// directory at all, the way the menus' own pruning does.
+    static void forgetRecentNotebook(const QString &projectDir);
 
     /**
      * Whether a roll should behave as if its document had gone away between its write phase and its

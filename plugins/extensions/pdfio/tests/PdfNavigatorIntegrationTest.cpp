@@ -117,6 +117,11 @@ private Q_SLOTS:
     void testAPreviewIsPreparedForTheScreensDeviceRatio();
     /// The canvas asks the navigator for a fresh preview rather than stretching a small one.
     void testTheCanvasAsksTheNavigatorForAFreshPreview();
+    /// Deleting a notebook: the open one is closed for real, its folder goes, and the recent list
+    /// forgets it. A real fixture notebook, not a hand-made directory.
+    void testDeletingANotebookClosesItAndRemovesItsFolder();
+    /// Deleting refuses what is not the store's, and a refusal leaves the open notebook usable.
+    void testDeletingRefusesWhatIsNotTheStores();
     /// The generated preview itself: enough pixels for the screen that draws it, and the page's ink
     /// in it rather than blank paper.
     void testAGeneratedPreviewIsSavedBigEnoughForTheScreen();
@@ -1931,6 +1936,15 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
                    navigator()->currentDocument()->image()->height()),
              away.imageSize());
 
+    /// And the resize must not leave the strip looking like a document to write. Krita's own
+    /// cropImage()/resizeImage() go through KisProcessingApplicator, which pushes an undo command
+    /// and marks the document modified -- and Krita then autosaves it: on the tablet the tab gained
+    /// an asterisk, the status bar said "Saving Document... 76%", and that save is the prime suspect
+    /// for the memory the user watched climb after every roll. The strip is a view of the notebook,
+    /// and the roll wrote every page it holds, so it is clean.
+    QVERIFY2(!navigator()->currentDocument()->isModified(),
+             "the roll left the strip looking modified, which is what Krita autosaves");
+
     /// And back. This second roll is the one the report is about, and it grows the document again.
     QVERIFY2(navigator()->showPage(0, &why), qPrintable(why));
     QCOMPARE(navigator()->currentIndex(), 0);
@@ -3341,6 +3355,140 @@ void PdfNavigatorIntegrationTest::testARollBetweenSameSizeWindowsDoesNotResize()
     }
     QTest::qWait(200);
     QApplication::processEvents();
+}
+
+/**
+ * Deleting a notebook: the open one is closed for real, its folder goes, and the recent list forgets
+ * it.
+ *
+ * The notebook store only ever grew -- import, open a bundle, extract, merge all make a notebook and
+ * nothing ever removed one -- so the delete is the missing half. Two things have to be true at once:
+ * the folder is gone, and the navigator no longer has the notebook open. The second is the one that
+ * costs something: the strip's document and its layers are the largest thing the application holds,
+ * so a delete that leaves them behind is not a delete, it is a leak. This drives the order the menu
+ * entry uses -- write the open pages, remove the folder, close the notebook -- and then asks the
+ * navigator whether it still knows about any of it.
+ */
+void PdfNavigatorIntegrationTest::testDeletingANotebookClosesItAndRemovesItsFolder()
+{
+    QVERIFY(useNotebook(QStringLiteral("deletable")));
+    const QString project = navigator()->projectDir();
+    QVERIFY2(!project.isEmpty(), "the notebook has no directory to delete");
+    QVERIFY2(PdfPageNavigator::isInsideNotebookStore(project), qPrintable(project));
+    QVERIFY2(QFileInfo::exists(PdfSession::manifestPath(project)), qPrintable(project));
+
+    /// The store's own entry, the way the menus remember one -- the recent list is what the delete
+    /// has to forget along with the folder.
+    const QString entry =
+        project + PdfPageNavigator::recentNotebookSeparator() + QStringLiteral("deletable");
+    QStringList entries = PdfPageNavigator::recentNotebooks();
+    entries.removeAll(entry);
+    entries.prepend(entry);
+    PdfPageNavigator::setRecentNotebooks(entries);
+    QVERIFY2(PdfPageNavigator::recentNotebooks().contains(entry), "the recent entry was not written");
+
+    /// The open notebook has a page document behind it, and ink that is not on disk yet: the close
+    /// has both something to let go of and something to write first.
+    QVERIFY(navigator()->hasNotebook());
+    QVERIFY(navigator()->pageCount() > 0);
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+    QVERIFY(page->isModified());
+
+    /// Exactly what the menu entry does, without the confirmation dialog: the ink is written, the
+    /// folder is removed while the notebook is still open, and then the notebook is closed.
+    QString why;
+    QVERIFY2(navigator()->prepareForClose(), "the open page could not be written before the delete");
+    QVERIFY2(PdfPageNavigator::removeNotebookStore(project, &why), qPrintable(why));
+    QVERIFY2(navigator()->closeNotebook(&why), qPrintable(why));
+
+    QVERIFY2(!QFileInfo::exists(project), qPrintable(project));
+    QVERIFY2(!navigator()->hasNotebook(), "the navigator still reports a notebook after the delete");
+    QVERIFY2(!navigator()->currentDocument(), "the page document outlived the deleted notebook");
+    QVERIFY2(!navigator()->currentView(), "the page view outlived the deleted notebook");
+    QVERIFY(navigator()->projectDir().isEmpty());
+    QVERIFY(navigator()->manifest().pages.isEmpty());
+    QCOMPARE(navigator()->pageCount(), 0);
+    QCOMPARE(navigator()->currentIndex(), -1);
+    QVERIFY2(!PdfPageNavigator::recentNotebooks().contains(entry),
+             "the recent list still names a notebook that is gone");
+}
+
+/**
+ * Deleting refuses what is not the store's, and a refusal leaves the open notebook exactly as it was.
+ *
+ * The refusal has to come before anything is touched: a half-removed notebook is worse than one that
+ * was not removed, and the rule that keeps this from being aimed at the user's own documents is that
+ * only a directory inside the project root is the store's. The last part makes a removal actually
+ * fail -- a directory in the notebook's own tree with the write bit off -- and shows the notebook is
+ * still the one that is open and still works; a run that ignores the permission bits (root in a
+ * container) cannot make that failure and says so rather than pretending.
+ */
+void PdfNavigatorIntegrationTest::testDeletingRefusesWhatIsNotTheStores()
+{
+    /// A directory outside the notebook store: not ours, refused, left alone.
+    QTemporaryDir outside;
+    QVERIFY(outside.isValid());
+    QVERIFY2(!PdfPageNavigator::isInsideNotebookStore(outside.path()),
+             "a directory outside the store was accepted as the store's");
+    QString why;
+    QVERIFY2(!PdfPageNavigator::removeNotebookStore(outside.path(), &why),
+             "a directory outside the store was removed");
+    QVERIFY2(!why.isEmpty(), "the refusal gave no reason");
+    QVERIFY2(QFileInfo::exists(outside.path()), "the refusal removed the directory anyway");
+
+    /// The store's own root is not a notebook either.
+    QVERIFY(!PdfPageNavigator::isInsideNotebookStore(PdfSession::projectRoot()));
+
+    /// And something inside the store that is not a notebook directory: a plain file, which must not
+    /// be removed just because it is in the right place.
+    const QString stray = QDir(PdfSession::projectRoot()).filePath(QStringLiteral("not-a-notebook"));
+    {
+        QFile file(stray);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("not a notebook");
+    }
+    why.clear();
+    QVERIFY2(!PdfPageNavigator::removeNotebookStore(stray, &why),
+             "a file inside the store was accepted as a notebook");
+    QVERIFY2(!why.isEmpty(), "the refusal gave no reason");
+    QVERIFY2(QFileInfo::exists(stray), "the file was removed");
+    QFile::remove(stray);
+
+    /// A real notebook, open, whose tree cannot be emptied: its pages directory is made unwritable.
+    QVERIFY(useNotebook(QStringLiteral("undeletable")));
+    const QString project = navigator()->projectDir();
+    const QString pages = QDir(project).filePath(QStringLiteral("pages"));
+    QVERIFY2(QFileInfo(pages).isDir(), qPrintable(pages));
+
+    const QFile::Permissions original = QFile::permissions(pages);
+    QFile::setPermissions(pages,
+                          QFile::ReadOwner | QFile::ReadUser | QFile::ExeOwner | QFile::ExeUser);
+    const bool unwritable = !QFileInfo(pages).isWritable();
+    if (!unwritable) {
+        QFile::setPermissions(pages, original);
+        QSKIP("this run ignores the permission bits, so a removal cannot be made to fail here");
+    }
+
+    why.clear();
+    const bool refused = !PdfPageNavigator::removeNotebookStore(project, &why);
+    /// Put back first, whatever the rest of the test does: the run's own cleanup removes this tree.
+    QFile::setPermissions(pages, original);
+
+    QVERIFY2(refused, "a notebook whose tree cannot be emptied was removed anyway");
+    QVERIFY2(!why.isEmpty(), "the refusal gave no reason");
+    QVERIFY2(QFileInfo::exists(PdfSession::manifestPath(project)),
+             "the refusal left the notebook half-removed: its manifest is gone");
+
+    /// Still the same open notebook, and still working: the page turn goes through the document and
+    /// the saves the way it always does.
+    QVERIFY(navigator()->hasNotebook());
+    QVERIFY(navigator()->currentDocument());
+    QCOMPARE(navigator()->projectDir(), project);
+    why.clear();
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 1);
 }
 
 int main(int argc, char *argv[])

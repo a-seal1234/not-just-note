@@ -34,8 +34,8 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QScrollBar>
-#include <QSettings>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -117,15 +117,6 @@ qint64 residentKb()
 /// Puts the notebook list on the Start screen; defined with the open helpers far below, and
 /// declared here because the plugin constructor uses it.
 void refreshWelcomePageEntries();
-
-/// One recent notebook is remembered as its project directory, a separator, and the name to show.
-/// A directory cannot contain the separator and the name has it stripped, so the split is never
-/// ambiguous; a name alone would not find the notebook again, and the directory alone would show a
-/// hash-derived folder name.
-const QChar RecentSeparator = QLatin1Char(10);
-
-const int MaxRecentNotebooks = 10;
-const char *const RecentNotebooksKey = "pdfio/recentNotebooks";
 
 /// The notebook's name as it is on disk right now. Read from the manifest rather than from the
 /// navigator: the navigator holds the copy it loaded when the notebook was opened, and a rename is
@@ -212,24 +203,23 @@ void showNotebookPanel()
     }
 }
 
+/// The recent list lives with the notebook store rather than here: removing a notebook has to
+/// forget its entry at the same moment, and one place has to know where the list is kept. What is
+/// here is the policy -- what an entry's name is, which entries are dead, when to refresh the Start
+/// screen -- and the menus around it.
 QStringList recentNotebookEntries()
 {
-    QSettings settings;
-    return settings.value(QLatin1String(RecentNotebooksKey)).toStringList();
+    return PdfPageNavigator::recentNotebooks();
 }
 
 void writeRecentNotebooks(const QStringList &entries)
 {
-    /// Kept as a QStringList and put in through QVariant::fromValue: the Qt5 Android build has no
-    /// QVariant conversion from the QList<QString> mid() hands back, and this code is built there.
-    const QStringList kept = entries.mid(0, MaxRecentNotebooks);
-    QSettings settings;
-    settings.setValue(QLatin1String(RecentNotebooksKey), QVariant::fromValue(kept));
+    PdfPageNavigator::setRecentNotebooks(entries);
 }
 
 QString recentNotebookDir(const QString &entry)
 {
-    return entry.section(RecentSeparator, 0, 0);
+    return PdfPageNavigator::recentNotebookDir(entry);
 }
 
 /// Remembers the open notebook as the most recent one. An older entry for the same project
@@ -255,7 +245,7 @@ void rememberRecentNotebook()
             entries.removeAt(i);
         }
     }
-    entries.prepend(dir + RecentSeparator + name);
+    entries.prepend(dir + PdfPageNavigator::recentNotebookSeparator() + name);
     writeRecentNotebooks(entries);
     refreshWelcomePageEntries();
 }
@@ -602,7 +592,7 @@ void refreshWelcomePageEntries()
         }
 
         KisWelcomePageWidget::ExtraRecentEntry extra;
-        extra.name = entry.section(RecentSeparator, 1);
+        extra.name = entry.section(PdfPageNavigator::recentNotebookSeparator(), 1);
         if (extra.name.isEmpty()) {
             extra.name = manifest.displayName();
         }
@@ -744,7 +734,7 @@ void rebuildRecentNotebooks(QMenu *menu)
 
     for (const QString &entry : alive) {
         const QString dir = recentNotebookDir(entry);
-        const QString name = entry.section(RecentSeparator, 1);
+        const QString name = entry.section(PdfPageNavigator::recentNotebookSeparator(), 1);
         QAction *open = menu->addAction(name.isEmpty() ? dir : name);
         QObject::connect(open, &QAction::triggered, menu, [dir]() { openRecentNotebook(dir); });
     }
@@ -976,7 +966,7 @@ MergeTarget chooseMergeTarget()
     } else {
         for (const QString &entry : alive) {
             const QString dir = recentNotebookDir(entry);
-            const QString name = entry.section(RecentSeparator, 1);
+            const QString name = entry.section(PdfPageNavigator::recentNotebookSeparator(), 1);
             auto *item = new QListWidgetItem(name.isEmpty() ? dir : name, list);
             item->setData(Qt::UserRole, int(MergeTarget::Notebook));
             item->setData(Qt::UserRole + 1, dir);
@@ -1235,6 +1225,95 @@ void mergeNotebookChosen()
         mergeNotebookFolder();
         return;
     }
+}
+
+/// Deletes the notebook that is open: closes it, removes its folder, and forgets it everywhere.
+///
+/// The confirmation is the whole of the safety here, so it says what goes and what does not: the
+/// notebook's own folder -- its pages, the ink drawn on them, their previews, and the copies of every
+/// PDF it was made from or given pages from -- and then the original PDF or notebook file the user
+/// opened, which is their own and is not touched. On Android the notebook opened from a bundle IS
+/// that working copy in the store, which is exactly what deleting it removes; the wording says so by
+/// naming the copies and the untouched original, without a second string for the platform.
+///
+/// The order is deliberate. The folder is checked against the store before the dialog, so a notebook
+/// that is not ours to delete says so instead of asking; the ink is written before anything is
+/// removed, so a removal that fails leaves the notebook complete and usable; the folder is removed
+/// while the notebook is still open, so a refusal can leave it open as it was; and only once the
+/// folder is gone is the notebook closed, so nothing is left describing a folder that does not exist.
+void deleteNotebook()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        QMessageBox::information(nullptr, i18n("Delete notebook"), i18n("No notebook is open."));
+        return;
+    }
+
+    const QString projectDir = navigator->projectDir();
+    const QString folder = QDir::toNativeSeparators(projectDir);
+
+    /// Asked before the dialog, not after: a folder that is not one this store made is not ours to
+    /// remove, and saying that is better than confirming a deletion that cannot happen.
+    if (!PdfPageNavigator::isInsideNotebookStore(projectDir)) {
+        say(QStringLiteral("notebook not deleted: %1 is not inside the notebook store").arg(projectDir));
+        QMessageBox::warning(nullptr, i18n("Delete notebook"),
+                             i18n("%1 is not inside the notebook store, so nothing was deleted.",
+                                  folder));
+        return;
+    }
+
+    QString name = notebookNameFromDisk(projectDir);
+    if (name.isEmpty()) {
+        name = QFileInfo(projectDir).fileName();
+    }
+
+    QMessageBox confirm(QMessageBox::Warning, i18n("Delete notebook"),
+                        i18n("Delete the notebook \"%1\"?", name), QMessageBox::Cancel);
+    confirm.setInformativeText(
+        i18n("This removes %1 and everything in it: the notebook's pages, the ink drawn on them, "
+             "their previews, and the copies of every PDF it was made from or given pages from. "
+             "The original PDF or notebook file you opened is your own file and is not touched.",
+             folder));
+    QPushButton *remove = confirm.addButton(i18n("Delete"), QMessageBox::DestructiveRole);
+    confirm.setDefaultButton(QMessageBox::Cancel);
+    confirm.exec();
+    if (confirm.clickedButton() != remove) {
+        say(QStringLiteral("the notebook was not deleted"));
+        return;
+    }
+
+    /// The ink first: if what follows fails, the notebook is exactly as it was and goes on working.
+    if (!navigator->prepareForClose()) {
+        say(QStringLiteral("the notebook was not deleted: its open pages could not be written"));
+        QMessageBox::warning(nullptr, i18n("Delete notebook"),
+                             i18n("The open pages could not be written, so the notebook was not "
+                                  "deleted and is still open."));
+        return;
+    }
+
+    /// The folder goes while the notebook is still open, so a removal that fails leaves the notebook
+    /// open and usable rather than closed over a folder that is still there.
+    QString why;
+    if (!PdfPageNavigator::removeNotebookStore(projectDir, &why)) {
+        say(QStringLiteral("the notebook was not deleted: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Delete notebook"),
+                             i18n("The notebook was not deleted: %1", why));
+        return;
+    }
+
+    /// And now it is closed: its folder is gone, so nothing may go on describing it. The ink was
+    /// written a moment ago, so this close has nothing of its own to refuse over.
+    QString closeWhy;
+    if (!navigator->closeNotebook(&closeWhy)) {
+        say(QStringLiteral("the notebook folder was removed but the notebook was not closed: %1")
+                .arg(closeWhy));
+    }
+
+    /// The store's entry went with the folder (removeNotebookStore() forgets it); the Start screen
+    /// shows the same list, and the "Recent notebooks" menu rebuilds itself when it opens.
+    refreshWelcomePageEntries();
+
+    say(QStringLiteral("notebook deleted: %1").arg(folder));
 }
 
 /// Picks a PDF for the screen's insert button and reads what the screen needs: the path and every
@@ -1554,6 +1633,8 @@ void updateNotebookOpsActions(QMenu *ops)
     set("pdfio_ops_merge", pages >= 1);
     set("pdfio_ops_merge_folder", pages >= 1);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
+    /// Deleting the notebook is possible exactly when there is one open, which is what a open is.
+    set("pdfio_ops_delete_notebook", true);
 }
 
 /// The "Notebook ops" submenu: everything that changes the notebook itself rather than the page on
@@ -1704,6 +1785,14 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
             return PdfNotebookOps::undoLast(dir);
         });
     });
+
+    /// Last, below the separator, and the only entry here that takes something away for good: the
+    /// notebook and its folder. It is the counterpart of "Import PDF as notebook", which is how one
+    /// arrives -- until this existed the store only ever grew.
+    ops->addSeparator();
+    QAction *removeNotebook = ops->addAction(i18n("Delete notebook..."));
+    removeNotebook->setObjectName(QStringLiteral("pdfio_ops_delete_notebook"));
+    QObject::connect(removeNotebook, &QAction::triggered, ops, []() { deleteNotebook(); });
 
     /// Enabled from the state the notebook is in when the user reaches for the menu, not from the
     /// state it was in when the menu was built.

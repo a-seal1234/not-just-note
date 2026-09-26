@@ -12,7 +12,9 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QEventLoop>
 #include <QFileInfo>
@@ -60,6 +62,13 @@ void fail(QString *why, const QString &message)
         *why = message;
     }
 }
+
+/// Where the recent-notebook list is kept, and how one entry is made. Here rather than only with the
+/// menus that show the list, because removing a notebook forgets its entry at the same moment, and a
+/// format written down in two places is a format that drifts.
+const char *const RecentNotebooksKey = "pdfio/recentNotebooks";
+const QChar RecentNotebookSeparator = QLatin1Char(10);
+const int MaxRecentNotebooks = 10;
 
 /// The view that is actually showing \a document.
 ///
@@ -245,6 +254,29 @@ constexpr int ReloadSettleMs = 700;
 
 /// The gap the strip decoration leaves between pages, in widget pixels.
 constexpr qreal GapWidgetPixels = 16;
+
+/// The zoom that fits \a pageRect into \a viewport, with the active page taking about three fifths
+/// of it, or 0 when there is nothing to fit.
+///
+/// Three fifths rather than all of it, because fitting the page exactly filled the viewport and the
+/// page that comes next was then simply not on screen however the view was centred -- "even at page
+/// three you cannot see four". Two fifths of the height left free puts the top of the next page and
+/// the bottom of the previous one on screen, with the active page between them.
+///
+/// One place, because a window move that RESIZES the document has to fit again: the fit is placed
+/// once per document (see showImage), which was right while a roll could not change the size.
+qreal fitZoomFor(const QSize &viewport, const QRect &pageRect)
+{
+    if (viewport.isEmpty() || pageRect.isEmpty()) {
+        return 0.0;
+    }
+
+    constexpr qreal ActivePageShare = 0.6;
+    return qBound(qreal(0.02),
+                  qMin(qreal(viewport.width()) / pageRect.width(),
+                       (qreal(viewport.height()) * ActivePageShare) / pageRect.height()),
+                  qreal(8.0));
+}
 
 /// The box a saved preview is fitted into, in pixels -- an A4 page comes out 814x1152.
 ///
@@ -796,6 +828,158 @@ QString PdfPageNavigator::projectDir() const
     return m_projectDir;
 }
 
+QStringList PdfPageNavigator::recentNotebooks()
+{
+    QSettings settings;
+    return settings.value(QLatin1String(RecentNotebooksKey)).toStringList();
+}
+
+void PdfPageNavigator::setRecentNotebooks(const QStringList &entries)
+{
+    /// Kept as a QStringList and put in through QVariant::fromValue: the Qt5 Android build has no
+    /// QVariant conversion from the QList<QString> mid() hands back, and this code is built there.
+    const QStringList kept = entries.mid(0, MaxRecentNotebooks);
+    QSettings settings;
+    settings.setValue(QLatin1String(RecentNotebooksKey), QVariant::fromValue(kept));
+}
+
+QString PdfPageNavigator::recentNotebookDir(const QString &entry)
+{
+    return entry.section(RecentNotebookSeparator, 0, 0);
+}
+
+QChar PdfPageNavigator::recentNotebookSeparator()
+{
+    return RecentNotebookSeparator;
+}
+
+void PdfPageNavigator::forgetRecentNotebook(const QString &projectDir)
+{
+    const QString gone = QFileInfo(projectDir).absoluteFilePath();
+
+    QStringList kept;
+    for (const QString &entry : recentNotebooks()) {
+        const QString existing = recentNotebookDir(entry);
+        /// An entry that names no directory is dropped as well: the menus prune those out for the
+        /// same reason -- there is nothing behind them to open.
+        if (existing.isEmpty() || QFileInfo(existing).absoluteFilePath() == gone) {
+            continue;
+        }
+        kept.append(entry);
+    }
+
+    setRecentNotebooks(kept);
+}
+
+bool PdfPageNavigator::isInsideNotebookStore(const QString &projectDir)
+{
+    if (projectDir.isEmpty()) {
+        return false;
+    }
+
+    /// Both sides resolved where they can be, so "…/store/../store/notes", a trailing slash and a
+    /// symbolic link are all judged by where they really point: removeRecursively() would otherwise
+    /// be aimed, through a link inside the store, at anything on the disk.
+    const QFileInfo rootInfo(projectRoot());
+    const QString root = rootInfo.canonicalFilePath().isEmpty() ? rootInfo.absoluteFilePath()
+                                                                : rootInfo.canonicalFilePath();
+    if (root.isEmpty()) {
+        /// No store to be inside of: nothing may be removed.
+        return false;
+    }
+
+    const QFileInfo info(projectDir);
+    QString dir = info.canonicalFilePath();
+    if (dir.isEmpty()) {
+        /// A directory that is already gone has no canonical path; it is judged by where it was
+        /// asked about, which is what forgetting its entry needs.
+        dir = info.absoluteFilePath();
+    }
+
+    const QString prefix = root.endsWith(QLatin1Char('/')) ? root : root + QLatin1Char('/');
+    return dir != root && dir.startsWith(prefix);
+}
+
+namespace {
+
+/// Whether every DIRECTORY in the tree below \a dir can be written to, which is what removing what
+/// is inside it needs.
+///
+/// The point is the promise the caller makes: a removal that cannot be completed must leave the
+/// notebook as it was rather than half-deleted. removeRecursively() keeps going after a failure, so
+/// the tree is checked first and nothing is unlinked when the answer is no. A symbolic link is
+/// skipped -- it is removed as a link, never followed.
+bool treeIsRemovable(const QString &dir)
+{
+    if (!QFileInfo(dir).isWritable()) {
+        return false;
+    }
+
+    QDirIterator it(dir, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        const QFileInfo info = it.fileInfo();
+        if (info.isSymLink()) {
+            continue;
+        }
+        if (!info.isWritable()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool PdfPageNavigator::removeNotebookStore(const QString &projectDir, QString *why)
+{
+    if (projectDir.isEmpty()) {
+        fail(why, QStringLiteral("there is no notebook directory to remove"));
+        return false;
+    }
+
+    /// Only inside the store. Every path the plugin removes is one the store made, and this is the
+    /// rule that keeps a manifest, a picker or a hand-edited setting from aiming this at the user's
+    /// own documents. Checked before anything is touched.
+    if (!isInsideNotebookStore(projectDir)) {
+        fail(why, QStringLiteral("%1 is not inside the notebook store (%2), so it is not ours to "
+                                 "remove")
+                      .arg(QFileInfo(projectDir).absoluteFilePath(),
+                           QFileInfo(projectRoot()).absoluteFilePath()));
+        return false;
+    }
+
+    const QString dir = QFileInfo(projectDir).absoluteFilePath();
+
+    const QFileInfo info(dir);
+    if (!info.exists()) {
+        /// Already gone: the entry outlived the directory, and forgetting the entry is the work.
+        forgetRecentNotebook(dir);
+        return true;
+    }
+    if (!info.isDir() || info.isSymLink()) {
+        fail(why, QStringLiteral("%1 is not a notebook directory").arg(dir));
+        return false;
+    }
+
+    /// Checked before a single thing is unlinked: a tree that cannot be emptied is refused whole, so
+    /// the notebook the caller has open is left exactly as it was.
+    if (!treeIsRemovable(dir)) {
+        fail(why, QStringLiteral("%1 cannot be emptied: a directory in it is not writable, so "
+                                 "nothing was removed")
+                      .arg(dir));
+        return false;
+    }
+
+    if (!QDir(dir).removeRecursively()) {
+        fail(why, QStringLiteral("%1 could not be removed; some of it may already be gone").arg(dir));
+        return false;
+    }
+
+    forgetRecentNotebook(dir);
+    return true;
+}
+
 bool PdfPageNavigator::openNotebook(const QString &pdfPath, QString *why)
 {
     if (!QFileInfo::exists(pdfPath)) {
@@ -1198,6 +1382,40 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             return false;
         }
 
+        /// And the zoom, which the resize has just invalidated.
+        ///
+        /// The fit is placed ONCE per document (showImage), which was right while the image could
+        /// not change size: a turn inside a strip keeps the document, and re-fitting moves the centre
+        /// with the zoom. A resize changes the canvas underneath that zoom, and measured on the
+        /// tablet it left the strip a dot -- 0.3-0.7% in a 773x653 viewport, where fitting the
+        /// active page into a 700x11672 window wants about 5.5%. The centre is deliberately NOT set
+        /// here: the anchor logic below puts the reader back on the page they were reading, and
+        /// preferredCenterFor() converts with whatever zoom is set by then.
+        if (m_view && m_view->canvasBase() && m_view->canvasController()) {
+            QWidget *widget = m_view->canvasBase()->canvasWidget();
+            const QRect pageRect = target.slots().at(target.activeSlot()).rect;
+            const qreal zoom = fitZoomFor(widget ? widget->size() : QSize(), pageRect);
+            if (zoom > 0.0) {
+                say(QStringLiteral("zoom: the window is %1x%2 now, so a %3x%4 page fits at %5")
+                        .arg(targetSize.width()).arg(targetSize.height())
+                        .arg(pageRect.width()).arg(pageRect.height()).arg(zoom));
+                m_view->canvasController()->setZoom(KoZoomMode::ZOOM_CONSTANT, zoom);
+                m_viewSettleUntil = QDateTime::currentMSecsSinceEpoch() + 800;
+            }
+        }
+
+        /// The strip is a VIEW of the notebook, not a document to write.
+        ///
+        /// cropImage()/resizeImage() run through KisProcessingApplicator, which pushes an undo
+        /// command and marks the document modified -- and Krita then autosaves it. On the tablet the
+        /// tab gained an asterisk and the status bar said "Saving Document... 76%", writing a .kra of
+        /// a 400 MB strip nobody asked for, and the save is the prime suspect for the memory the user
+        /// watched climb after every roll. Cleared here, where the resize made the mark, and again at
+        /// the end of the roll. Nothing is lost by clearing it: phase one wrote every page the window
+        /// held before any of this ran, and which pages still carry ink is the page window's own
+        /// dirty set, not this flag.
+        m_document->setModified(false);
+
         /// Nothing else has to be repainted for the new size: there is no desk layer any more
         /// (PdfStripBuilder makes each slot's band carry the colour), and the repaint below fills
         /// every slot's paper over its cell -- and the cells tile the image the window arrives with,
@@ -1398,6 +1616,15 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             paper->setDirty(slots.at(i).cell);
         }
     }
+
+    /// And the strip is not a document to write, said once more after the repaint.
+    ///
+    /// The resize above clears the modified flag where Krita's own resize set it; this clears
+    /// anything the repaint raised. The roll has written every page the window holds and rebuilt
+    /// what is on screen out of those artifacts, so there is nothing here Krita has to save, and a
+    /// strip that says it is modified is a strip Krita autosaves: on the tablet that was a .kra of
+    /// a 400 MB image and the memory the user watched climb after every roll.
+    m_document->setModified(false);
 
     /// And the placement rule the notebook asked for: a content layer that ended up outside the
     /// Ink group -- one the user made, or one restored from an artifact under a name the strip did
@@ -1963,19 +2190,8 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
                 return;
             }
 
-            /// Sized so the active page takes about three fifths of the viewport.
-            ///
-            /// Fitting the page exactly filled the viewport, and then the page that comes next is
-            /// simply not on screen however the view is centred -- "even at page three you cannot
-            /// see four". Leaving two fifths of the height free puts the top of the next page and
-            /// the bottom of the previous one on screen, with the active page between them.
-            constexpr qreal ActivePageShare = 0.6;
-
-            const qreal zoom = qBound(qreal(0.02),
-                                      qMin(qreal(viewport.width()) / pageRect.width(),
-                                           (qreal(viewport.height()) * ActivePageShare)
-                                               / pageRect.height()),
-                                      qreal(8.0));
+            /// Sized so the active page takes about three fifths of the viewport: see fitZoomFor().
+            const qreal zoom = fitZoomFor(viewport, pageRect);
 
             say(QStringLiteral("zoom: fitting a %1x%2 page into a %3x%4 viewport gives %5")
                     .arg(pageRect.width()).arg(pageRect.height())
@@ -2189,6 +2405,76 @@ bool PdfPageNavigator::prepareForClose()
     m_document->setModified(false);
     say(QStringLiteral("closing: page %1 of %2 written through the notebook, nothing for Krita to ask about")
             .arg(m_index + 1).arg(m_manifest.pages.size()));
+    return true;
+}
+
+bool PdfPageNavigator::closeNotebook(QString *why)
+{
+    if (!hasNotebook()) {
+        /// Nothing open: there is nothing to close and nothing to forget.
+        return true;
+    }
+
+    /// The ink first, through the gate that exists for it. A notebook whose pages cannot be written
+    /// is left open -- closing it would drop ink that never reached disk, and Krita's own prompt is
+    /// what should ask about it.
+    if (!prepareForClose()) {
+        fail(why, QStringLiteral("the open pages could not be written, so the notebook was left open"));
+        return false;
+    }
+
+    /// A reload waiting for the event loop would put the notebook straight back; finishReload()
+    /// stands down on this flag.
+    m_reloadPending = false;
+    m_reloadManifest = PdfSessionManifest();
+    m_reloadAnchor = 0;
+
+    /// The view takes the document with it, and the document is the largest thing this class holds:
+    /// the strip's image and every layer of it. This is the point of the whole close.
+    closeCurrentPage();
+
+    /// Everything that describes the notebook goes, in the same shape adoptNotebook() clears it --
+    /// the window, the strip, the slot bookkeeping, the write stamps and the thumbnails queued for
+    /// pages that are no longer there.
+    m_window.clear();
+    m_stripPages.clear();
+    m_stripRects.clear();
+    m_stripCells.clear();
+    m_stripPaper.clear();
+    m_stripActiveSlot = -1;
+    m_windowSlot = -1;
+    m_saveStamps.clear();
+    m_thumbnailQueue.clear();
+    m_zoomPlacedFor = nullptr;
+
+    /// The document is gone, so the image whose ink changes were being watched is gone with it.
+    if (m_inkChangeConnection) {
+        disconnect(m_inkChangeConnection);
+        m_inkChangeConnection = QMetaObject::Connection();
+    }
+
+    /// The renderers hold the notebook's source PDFs open. A store that is about to be removed must
+    /// not be held open by a cache.
+    m_sourceRenderers.clear();
+
+    /// The clocks and the two timers: neither the follow nor the idle write may chase a notebook
+    /// that is gone.
+    m_lastInkChange = 0;
+    m_lastAutoSave = 0;
+    m_lastWriteError.clear();
+    if (m_scrollWatch) {
+        m_scrollWatch->stop();
+    }
+    if (m_autoSaveTimer) {
+        m_autoSaveTimer->stop();
+    }
+
+    m_index = -1;
+    m_projectDir.clear();
+    m_manifest = PdfSessionManifest();
+
+    say(QStringLiteral("the notebook is closed; nothing is open now"));
+    Q_EMIT pageChanged(m_index, pageCount(), QString());
     return true;
 }
 
