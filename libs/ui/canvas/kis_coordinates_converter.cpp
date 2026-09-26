@@ -950,7 +950,12 @@ void KisCoordinatesConverter::recalculateZoomLevelLimits()
     }
 
     m_d->minZoom = qMin(100.0 / minDimension, 0.1);
-    m_d->maxZoom = 90.0;
+    /// 9000% was the ceiling, and it is not enough room for this fork's work: a notebook strip
+    /// renders its pages inside a memory budget, so a page can be a few hundred pixels wide on
+    /// screen and filling the window with it already reads as a few thousand percent -- which left
+    /// almost nothing above it. 64000% is the same order as other pen-first applications and keeps
+    /// the slider usable; nothing below this line depends on the ceiling being small.
+    m_d->maxZoom = 640.0;
     m_d->standardZoomLevels.clear(); // TODO: reset only on real change!
 }
 

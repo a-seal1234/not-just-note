@@ -24,7 +24,9 @@ public:
     KoZoomMode::Mode mode = KoZoomMode::ZOOM_CONSTANT;
     qreal zoom {1.0};
     qreal minZoom {0.1};
-    qreal maxZoom {90.0};
+    // Kept in step with KisCoordinatesConverter's ceiling (64000%): this is the default a state is
+    // built with before a canvas reports its own bounds.
+    qreal maxZoom {640.0};
 
     bool operator==(const KoZoomState &other) const;
 };

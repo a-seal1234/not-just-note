@@ -152,6 +152,19 @@ private Q_SLOTS:
     /// The other half of the resize: a notebook of one page size must never resize anything.
     void testARollBetweenSameSizeWindowsDoesNotResize();
 
+    /// How many pages the strip holds is the user's to choose: the slots that count lays out, the
+    /// default, the persisted count, a count that is not one of the presets, and that turning the
+    /// strip off does not forget it.
+    void testTheStripPageCountChoosesTheWindowSize();
+    /// A count change while a strip is open lands the document at the new size through the ROLL --
+    /// the same document, the same image, the bands re-cut -- rather than a rebuild.
+    void testAStripPageCountChangeResizesTheSameDocument();
+    /// The count is bounded by the notebook rather than by a constant of this build's.
+    void testAStripPageCountIsBoundedByTheNotebook();
+    /// A bigger strip at a fixed budget stays inside it (the pages get coarser); with no limit it
+    /// simply costs more. The figures the report is written from are printed here.
+    void testABiggerStripStaysInsideTheMemoryBudget();
+
 
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
@@ -350,6 +363,20 @@ void PdfNavigatorIntegrationTest::initTestCase()
 
     QVERIFY(m_dir.isValid());
 
+    /// The strip's page count and whether it is on are PERSISTED settings, and the navigator is a
+    /// process-wide singleton constructed the first time anything asks for it. This is the one place
+    /// the DEFAULT can be observed: with both keys absent, the notebook opens at five pages with the
+    /// strip on, exactly as it always did. Cleared before the first ask -- a previous run of the suite
+    /// leaves both behind -- rather than asserted in a test that runs later, by which time the
+    /// singleton has already read them. The count and the on/off state are two keys on purpose; the
+    /// tests below are what proves turning the strip off leaves the count alone.
+    {
+        QSettings settings;
+        settings.remove(QStringLiteral("pdfio/stripPages"));
+        settings.remove(QStringLiteral("pdfio/stripOn"));
+        settings.sync();
+    }
+
     m_fixture = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf");
     QVERIFY2(QFileInfo::exists(m_fixture), qPrintable(m_fixture));
 
@@ -420,6 +447,11 @@ void PdfNavigatorIntegrationTest::initTestCase()
     /// canvas here has no meaningful viewport, and the timer must not turn a page while a
     /// refused save is being handled.
     navigator()->setScrollFollowEnabled(false);
+
+    /// And the default the singleton read, asserted once it exists: five pages, the strip on. The
+    /// keys were removed above, before anything could construct it.
+    QCOMPARE(navigator()->scope(), 5);
+    QCOMPARE(navigator()->stripPageCount(), 5);
 }
 
 void PdfNavigatorIntegrationTest::cleanupTestCase()
@@ -2806,6 +2838,135 @@ bool writeNamedNotebook(const QString &project, const QString &name, QString *wh
     return manifest.writeTo(PdfSession::manifestPath(project), why);
 }
 
+/// How many of the image's root layers are page backgrounds, counted with the saver's own rule.
+///
+/// A band IS a slot in a strip: the builder makes one paper layer per page of the window, and the
+/// roll re-cuts them when the count changes. So this is the number of pages the document really
+/// holds, and PdfPageSaver::isPageBackground() is what decides it -- never a name check written
+/// again here, which is the rule the task asks the count to be made with.
+int bandCountOf(const KisImageSP &image)
+{
+    if (!image) {
+        return 0;
+    }
+
+    int bands = 0;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        if (PdfPageSaver::isPageBackground(image->root()->at(i))) {
+            ++bands;
+        }
+    }
+    return bands;
+}
+
+/// The root index of the Ink group, or -1. Every paper band has to stay BELOW it: a band added above
+/// the ink hides the strokes on the page it covers, which is why the roll's band surgery inserts at
+/// the top of the paper rather than at the top of the root.
+int inkGroupIndex(const KisImageSP &image)
+{
+    if (!image) {
+        return -1;
+    }
+
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        if (image->root()->at(i)->name() == QStringLiteral("Ink")) {
+            return int(i);
+        }
+    }
+    return -1;
+}
+
+/// Writes a notebook of \a pages same-size Letter (612x792 pt) pages out of the fixture's own letter
+/// page: the shape the reported notebook has, and the one the strip-size memory figures are about.
+bool writeLetterNotebook(const QString &project, int pages, QString *why)
+{
+    const QString source = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("ex-manypage-50.pdf");
+    if (!QFileInfo::exists(source)) {
+        if (why) {
+            *why = QStringLiteral("the fixture %1 is missing").arg(source);
+        }
+        return false;
+    }
+    if (pages < 1) {
+        if (why) {
+            *why = QStringLiteral("%1 pages is not a notebook").arg(pages);
+        }
+        return false;
+    }
+
+    PopplerRenderBackend backend;
+    PdfSessionManifest manifest = PdfSession::createProject(project, source, backend, why);
+    if (!manifest.isValid(why)) {
+        return false;
+    }
+
+    /// The fixture's own geometry cycle: MANY_GEOMETRY[2] is a letter sheet, so every page below is
+    /// the same size out of the same source page and the only thing a window can change is how many
+    /// of them it holds.
+    const int letterPage = 2;
+    manifest.pages.clear();
+    for (int i = 0; i < pages; ++i) {
+        PdfPageRecord page;
+        page.index = letterPage;
+        page.sizePt = QSizeF(612, 792);
+        page.kraFile = PdfSession::pageFileName(i);
+        page.thumbFile = PdfSession::thumbFileName(i);
+        manifest.pages.append(page);
+    }
+    manifest.refreshNextPageNumber();
+    if (!manifest.isValid(why)) {
+        return false;
+    }
+    return manifest.writeTo(PdfSession::manifestPath(project), why);
+}
+
+/// Puts the strip's page count, its on/off state AND the scope in force back, however a test ends.
+///
+/// Three things leak, and each needs its own half:
+///
+///  - pdfio/stripPages and pdfio/stripOn are PERSISTED, and a test that walked away from one would
+///    change what the next RUN of the suite opens a notebook at. The destructor writes both back;
+///  - the navigator is a process-wide SINGLETON that has already read those keys, so what the next
+///    test sees is its in-memory scope, not the keys. setScope() is the one door that puts the count,
+///    the on/off state and the window bound back, and it is called here;
+///  - and the destructor runs on EVERY way out -- a failed QVERIFY included -- which is the whole
+///    point of an RAII guard rather than a trailing statement in each test.
+///
+/// The count is restored BEFORE the scope, so a restore to "off" does not leave the test's own count
+/// behind: setScope(count) records it, setScope(1) turns the strip off and keeps it. A test that
+/// fails part way through leaves an open document; the first call then rolls it back to the restored
+/// count, which is one window write against a suite that would otherwise be wrong for every test
+/// after it.
+struct StripRestore {
+    StripRestore()
+        : m_pages(QSettings().value(QStringLiteral("pdfio/stripPages"), 5).toInt())
+        , m_on(QSettings().value(QStringLiteral("pdfio/stripOn"), true).toBool())
+        , m_scope(PdfPageNavigator::instance()->scope())
+        , m_count(PdfPageNavigator::instance()->stripPageCount())
+    {
+    }
+    ~StripRestore()
+    {
+        /// The navigator first -- setScope() writes both keys itself -- and the original keys LAST, so
+        /// what is on disk at the end is exactly what was there at the start.
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        navigator->setScope(m_count);
+        navigator->setScope(m_scope);
+
+        QSettings settings;
+        settings.setValue(QStringLiteral("pdfio/stripPages"), m_pages);
+        settings.setValue(QStringLiteral("pdfio/stripOn"), m_on);
+    }
+
+    StripRestore(const StripRestore &) = delete;
+    StripRestore &operator=(const StripRestore &) = delete;
+
+    int m_pages;
+    bool m_on;
+    int m_scope;
+    int m_count;
+};
+
 } // namespace
 
 /**
@@ -3514,6 +3675,421 @@ void PdfNavigatorIntegrationTest::testARollBetweenSameSizeWindowsDoesNotResize()
     /// drained on both sides of the close.
     navigator()->currentDocument()->setModified(false);
     navigator()->setScope(1);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
+/**
+ * How many pages the strip holds is the user's to choose.
+ *
+ * The window that is up is the unit: the layout's slots are the pages, one paper band per slot, so a
+ * chosen count has to lay out exactly that many. This drives the count through setScope() -- which is
+ * what the menu's presets and its typed dialog call -- and checks the document that results, the two
+ * settings it is persisted in, and that turning the strip off keeps the count rather than forgetting
+ * it. The spinner WIDGET itself is not in this binary: it lives in PdfIoPlugin.cpp, so what is tested
+ * here is the value handling the dialog hands the navigator, not the widget that produces it.
+ */
+void PdfNavigatorIntegrationTest::testTheStripPageCountChoosesTheWindowSize()
+{
+    StripRestore restore;
+    /// A budget, so the ONE thing under test is the count: eleven Letter pages at the reference 200
+    /// dpi would be two gigabytes across their layers, and this test is about slots, not memory. It
+    /// changes no slot count, and the budget is put back however the test ends.
+    BudgetRestore budgetRestore(PdfPageNavigator::instance()->memoryBudgetMb());
+    PdfPageNavigator::instance()->setMemoryBudgetMb(150);
+
+    const QString project = m_dir.filePath(QStringLiteral("strip-pages"));
+    QString why;
+    QVERIFY2(writeLetterNotebook(project, 12, &why), qPrintable(why));
+
+    /// Five, which is what the notebook ships with, asked for before it is opened so the strip is
+    /// built at that count.
+    navigator()->setScope(5);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+    QCOMPARE(navigator()->pageCount(), 12);
+    QCOMPARE(navigator()->scope(), 5);
+    QCOMPARE(navigator()->stripPageCount(), 5);
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document);
+    QVERIFY(document->image());
+    QCOMPARE(bandCountOf(document->image()), 5);
+
+    /// A chosen count lays out that many slots: the bands are the slots, one paper layer per page of
+    /// the window, so counting them with the saver's own rule is counting the window.
+    for (int pages : { 3, 7, 9 }) {
+        navigator()->setScope(pages);
+        QCOMPARE(navigator()->scope(), pages);
+        QCOMPARE(bandCountOf(navigator()->currentDocument()->image()), pages);
+
+        const PdfStripLayout layout = PdfStripLayout::forWindow(navigator()->manifest(),
+                                                                navigator()->currentIndex(), pages,
+                                                                navigator()->currentRenderDpi());
+        QVERIFY(layout.isValid());
+        QCOMPARE(layout.slots().size(), pages);
+    }
+
+    /// A count that is NOT one of the presets works the same way: eleven pages, laid out as eleven,
+    /// and the document really holds eleven bands.
+    navigator()->setScope(11);
+    QCOMPARE(navigator()->scope(), 11);
+    QCOMPARE(navigator()->stripPageCount(), 11);
+    QCOMPARE(bandCountOf(navigator()->currentDocument()->image()), 11);
+
+    /// And it is written where a restart reads it, under the two keys the count and the on/off state
+    /// are kept apart in.
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/stripPages")).toInt(), 11);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/stripOn")).toBool(), true);
+
+    /// Turning the strip off changes only the on/off half: the count is still there, so the switch
+    /// turns it back on at eleven rather than at five. This is the "must not forget the count" rule.
+    navigator()->setScope(1);
+    QCOMPARE(navigator()->scope(), 1);
+    QCOMPARE(navigator()->stripPageCount(), 11);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/stripPages")).toInt(), 11);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/stripOn")).toBool(), false);
+
+    /// And the tab is closed the way the tests that leave one open close it.
+    if (KisDocument *open = navigator()->currentDocument()) {
+        open->setModified(false);
+    }
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
+/**
+ * A count change while a strip is open lands the document at the new size through the ROLL, not a
+ * rebuild.
+ *
+ * A different page count is a different WINDOW -- more slots, each with its own paper band -- and the
+ * roll re-cuts the bands and resizes the document to the window arriving. It used to REFUSE a window
+ * with a different number of slots, which is what handed the change to a full rebuild: a new
+ * document, a new view, and the cost of both. What is asserted here is that identity: the same
+ * KisDocument, the same KisImage, the bands equal to the new layout's slots, every band below the Ink
+ * group, the reading page where it was, and no modified flag left for Krita to autosave.
+ */
+void PdfNavigatorIntegrationTest::testAStripPageCountChangeResizesTheSameDocument()
+{
+    StripRestore restore;
+    /// A budget, and it is not what is under test: it keeps a nine page Letter window from being
+    /// built at the reference 200 dpi, which is 1.4 GB across its layers. The slots, the identity of
+    /// the document and the resize path are all the budget cannot change.
+    BudgetRestore budgetRestore(PdfPageNavigator::instance()->memoryBudgetMb());
+    PdfPageNavigator::instance()->setMemoryBudgetMb(400);
+
+    const QString project = m_dir.filePath(QStringLiteral("strip-pages-resize"));
+    QString why;
+    QVERIFY2(writeLetterNotebook(project, 12, &why), qPrintable(why));
+
+    navigator()->setScope(5);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *const document = navigator()->currentDocument();
+    QVERIFY(document);
+    KisImageSP const strip = document->image();
+    QVERIFY(strip);
+
+    const int indexBefore = navigator()->currentIndex();
+    QCOMPARE(bandCountOf(strip), 5);
+
+    const PdfStripLayout five = PdfStripLayout::forWindow(navigator()->manifest(), indexBefore, 5,
+                                                          navigator()->currentRenderDpi());
+    QVERIFY(five.isValid());
+    QCOMPARE(QSize(strip->width(), strip->height()), five.imageSize());
+
+    /// Five to nine: the window grows at both ends, so four bands have to be added and the document
+    /// grows with them.
+    navigator()->setScope(9);
+
+    /// The SAME document and the SAME image: a count change is a roll of the window, not a rebuild of
+    /// the document. Without this the assertions below could be reading a freshly built strip and pass
+    /// without proving anything.
+    QCOMPARE(navigator()->currentDocument(), document);
+    QVERIFY2(navigator()->currentDocument()->image().data() == strip.data(),
+             "the image was replaced, so the count change rebuilt the document");
+    QCOMPARE(navigator()->currentIndex(), indexBefore);
+
+    const PdfStripLayout nine = PdfStripLayout::forWindow(navigator()->manifest(), indexBefore, 9,
+                                                          navigator()->currentRenderDpi());
+    QVERIFY(nine.isValid());
+    QVERIFY2(nine.imageSize() != five.imageSize(),
+             "the two windows have the same size, so this test says nothing about a resize");
+    QCOMPARE(QSize(navigator()->currentDocument()->image()->width(),
+                   navigator()->currentDocument()->image()->height()),
+             nine.imageSize());
+
+    /// The bands are exactly the slots of the new window, counted with the rule the page saver uses.
+    QCOMPARE(bandCountOf(navigator()->currentDocument()->image()), nine.slots().size());
+    QCOMPARE(bandCountOf(navigator()->currentDocument()->image()), 9);
+
+    /// Every band is BELOW the Ink group. A band inserted above the ink hides the strokes on the page
+    /// it covers, which is the one place the surgery may not put it.
+    const int ink = inkGroupIndex(navigator()->currentDocument()->image());
+    QVERIFY2(ink >= 0, "the strip has no Ink group");
+    for (quint32 i = 0; i < navigator()->currentDocument()->image()->root()->childCount(); ++i) {
+        if (PdfPageSaver::isPageBackground(navigator()->currentDocument()->image()->root()->at(i))) {
+            QVERIFY2(int(i) < ink,
+                     qPrintable(QStringLiteral("a band at root index %1 is above the Ink group at %2")
+                                    .arg(i)
+                                    .arg(ink)));
+        }
+    }
+
+    /// And the surgery left nothing for Krita to autosave: the strip is a view of the notebook, and
+    /// an asterisk on the tab is what makes Krita write the whole strip out.
+    QVERIFY2(!navigator()->currentDocument()->isModified(),
+             "the band surgery left the strip marked modified");
+
+    /// The tab is closed the way the tests that leave one open close it.
+    navigator()->currentDocument()->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
+/**
+ * The page count is bounded by the NOTEBOOK, not by a constant of this build's.
+ *
+ * The user asked to be able to load several tens of pages on a powerful machine, so seven is not a
+ * ceiling. What bounds a WINDOW is the notebook -- it cannot extend past the first and last page --
+ * and the count itself is a setting that is NOT clamped to whichever notebook is open when it is
+ * asked for: it is asked for before the notebook it is meant for as often as after, and a leftover
+ * small notebook rewriting a request for nine into five is exactly the bug the sweep caught. So a
+ * count larger than the open notebook is kept as the setting, and the slots on screen are the
+ * notebook's answer.
+ */
+void PdfNavigatorIntegrationTest::testAStripPageCountIsBoundedByTheNotebook()
+{
+    StripRestore restore;
+    /// A budget for the same reason as its neighbours: five Letter pages at 200 dpi are about
+    /// 476 MB, and this test is about the notebook being the bound rather than a constant.
+    BudgetRestore budgetRestore(PdfPageNavigator::instance()->memoryBudgetMb());
+    PdfPageNavigator::instance()->setMemoryBudgetMb(200);
+
+    const QString project = m_dir.filePath(QStringLiteral("strip-pages-bounded"));
+    QString why;
+    QVERIFY2(writeLetterNotebook(project, 5, &why), qPrintable(why));
+
+    navigator()->setScope(5);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+    QCOMPARE(navigator()->pageCount(), 5);
+
+    /// Nine asked for in a five page notebook: the SETTING is nine, and the WINDOW is the five pages
+    /// the notebook has. Asking for more than the notebook holds changes no pixels, so the five slots
+    /// that are up stay up.
+    navigator()->setScope(9);
+    QCOMPARE(navigator()->stripPageCount(), 9);
+    QCOMPARE(navigator()->scope(), 9);
+    QCOMPARE(bandCountOf(navigator()->currentDocument()->image()), 5);
+    QCOMPARE(QSettings().value(QStringLiteral("pdfio/stripPages")).toInt(), 9);
+
+    /// And the remembered count survives the strip being turned off and on: the switch brings back
+    /// nine, which this notebook again holds five of.
+    navigator()->setScope(1);
+    QCOMPARE(navigator()->scope(), 1);
+    QCOMPARE(navigator()->stripPageCount(), 9);
+
+    navigator()->setScope(navigator()->stripPageCount());
+    QCOMPARE(navigator()->stripPageCount(), 9);
+    QCOMPARE(navigator()->scope(), 9);
+    QCOMPARE(bandCountOf(navigator()->currentDocument()->image()), 5);
+
+    /// The tab is closed the way the tests that leave one open close it.
+    navigator()->currentDocument()->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
+/**
+ * A bigger strip at a fixed budget stays inside it; with no limit it simply costs more.
+ *
+ * This is the half of the strip-size setting the menu label exists for. At a fixed budget the window
+ * keeps its memory and spends it across more pages at a lower resolution each -- the pages get
+ * coarser, the megabytes do not grow. With no limit there is nothing to hold it back and the memory
+ * climbs with the page count, which is the cost the label has to make legible.
+ *
+ * The notebook is the reported one: same-size Letter (612x792 pt) pages. The figures at three, five,
+ * seven and nine pages, with no limit and with 400 MB, are printed here so the device numbers can be
+ * checked against them.
+ */
+void PdfNavigatorIntegrationTest::testABiggerStripStaysInsideTheMemoryBudget()
+{
+    StripRestore stripRestore;
+    BudgetRestore budgetRestore(PdfPageNavigator::instance()->memoryBudgetMb());
+
+    const QString project = m_dir.filePath(QStringLiteral("strip-pages-budget"));
+    QString why;
+    QVERIFY2(writeLetterNotebook(project, 12, &why), qPrintable(why));
+
+    /// 400 MB, set before the notebook is opened so the first build is already inside it.
+    PdfPageNavigator::instance()->setMemoryBudgetMb(400);
+    navigator()->setScope(3);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+
+    struct Figures {
+        QSize size;
+        int layers = 0;
+        qreal bytes = 0.0;
+        qreal dpi = 0.0;
+        int longest = 0;
+    };
+
+    /// What the document really holds at \a pages, read off the document rather than off the
+    /// derivation: the image size and the layer count decide the memory, the dpi the roll landed on
+    /// decides the page size. No QTest macro in here on purpose -- one would return from the lambda,
+    /// not from the test -- the caller asserts on what comes back.
+    const auto measure = [this](int pages) {
+        Figures f;
+        navigator()->setScope(pages);
+
+        KisDocument *document = navigator()->currentDocument();
+        if (!document || !document->image()) {
+            return f;
+        }
+
+        f.size = document->image()->size();
+        f.layers = paintLayersOf(document->image());
+        f.bytes = qreal(f.size.width()) * qreal(f.size.height()) * qreal(f.layers) * 4.0;
+        f.dpi = navigator()->currentRenderDpi();
+
+        const PdfStripLayout layout = PdfStripLayout::forWindow(
+            navigator()->manifest(), navigator()->currentIndex(), pages, f.dpi);
+        for (const PdfStripLayout::Slot &slot : layout.slots()) {
+            f.longest = qMax(f.longest, qMax(slot.rect.width(), slot.rect.height()));
+        }
+
+        /// printf-style on purpose: qWarning() is the printf family and does not take %1.
+        qWarning("[strip-pages] %d pages: %dx%d, %d layer(s), %.1f MB, %.1f dpi, longest %d px",
+                 pages,
+                 f.size.width(),
+                 f.size.height(),
+                 f.layers,
+                 f.bytes / 1000000.0,
+                 f.dpi,
+                 f.longest);
+        return f;
+    };
+
+    /// WITH the budget: every window grown to is inside it, and the pages get smaller as the strip
+    /// grows rather than the window breaking the budget.
+    qreal longestBefore = 0.0;
+    for (int pages : { 3, 5, 7, 9 }) {
+        const Figures f = measure(pages);
+        QCOMPARE(navigator()->scope(), pages);
+        QVERIFY2(f.layers > 0, "the strip has no layers, so the memory figure would be meaningless");
+
+        const qreal budgetBytes = 400.0 * 1000000.0;
+        QVERIFY2(f.bytes <= budgetBytes,
+                 qPrintable(QStringLiteral("a 400 MB budget built %1x%2 x %3 layers = %4 MB")
+                                .arg(f.size.width())
+                                .arg(f.size.height())
+                                .arg(f.layers)
+                                .arg(f.bytes / 1000000.0, 0, 'f', 1)));
+
+        /// The figure the menu names beside the count is the memory the window really costs, to the
+        /// rounding of the megabytes.
+        QVERIFY2(qAbs(navigator()->windowCostMbForScope(pages) - f.bytes / 1000000.0) <= 1.0,
+                 qPrintable(QStringLiteral("the menu names %1 MB where the window costs %2 MB")
+                                .arg(navigator()->windowCostMbForScope(pages))
+                                .arg(f.bytes / 1000000.0, 0, 'f', 1)));
+
+        if (longestBefore > 0.0) {
+            QVERIFY2(f.longest <= longestBefore,
+                     qPrintable(QStringLiteral("%1 pages gives a %2 px longest page where fewer pages "
+                                               "gave %3 px at the same budget")
+                                    .arg(pages)
+                                    .arg(f.longest)
+                                    .arg(longestBefore)));
+        }
+        longestBefore = f.longest;
+
+        QVERIFY2(!navigator()->currentDocument()->isModified(),
+                 "a count change under a budget left the strip marked modified");
+
+        /// The crop a growth-derived resize makes RETAINS the pixels it removed in its undo command
+        /// (a recorded limitation, see rollToPage), and four windows in a row would hold all four.
+        /// Clearing the history frees exactly that; the document's own size and layer count -- what
+        /// the assertions above are about -- are untouched by it.
+        navigator()->currentDocument()->clearUndoHistory();
+    }
+
+    /// And with NO limit the same growth simply costs more: the pages stay at the reference
+    /// resolution and the memory climbs with the page count. This is the half of the label that says
+    /// a big strip is expensive rather than forbidden.
+    ///
+    /// Seven and nine pages are NOT built here. At 200 dpi a nine page Letter window is about 1.4 GB
+    /// across its layers, which is exactly the cost the menu label exists to make legible -- and not
+    /// something this harness should allocate to prove a number. The figures are read off the same
+    /// layout the build would use, and the three page case is built so the two can be seen to agree.
+    /// The roll's own budget would be set on the current, nine page window, so the scope comes down
+    /// first: at 400 MB and then at no limit, three pages is 200 dpi either way.
+    navigator()->setScope(3);
+    PdfPageNavigator::instance()->setMemoryBudgetMb(0);
+    QCOMPARE(navigator()->currentRenderDpi(), 200.0);
+
+    const auto derivedBytesAtNoLimit = [this](int pages) {
+        const PdfStripLayout layout = PdfStripLayout::forWindow(
+            navigator()->manifest(), navigator()->currentIndex(), pages, 200.0);
+        const int layers = qMax(1, layout.slots().size() + 1);
+        const QSize size = layout.imageSize();
+        return qreal(size.width()) * qreal(size.height()) * qreal(layers) * 4.0;
+    };
+
+    /// The built document at three pages IS the derivation's number, to the byte: that is what says
+    /// the reported figures are the document's own size rather than an estimate of it.
+    {
+        const Figures f = measure(3);
+        QCOMPARE(navigator()->currentRenderDpi(), 200.0);
+        const qreal derived = derivedBytesAtNoLimit(3);
+        QVERIFY2(qAbs(f.bytes - derived) < 1.0,
+                 qPrintable(QStringLiteral("the built three page window is %1 MB where the layout says "
+                                           "%2 MB")
+                                .arg(f.bytes / 1000000.0, 0, 'f', 1)
+                                .arg(derived / 1000000.0, 0, 'f', 1)));
+    }
+
+    qreal previous = derivedBytesAtNoLimit(3);
+    for (int pages : { 5, 7, 9 }) {
+        const qreal bytes = derivedBytesAtNoLimit(pages);
+        qWarning("[strip-pages] %d pages: no limit, %.1f MB derived at 200 dpi, about %d px longest",
+                 pages, bytes / 1000000.0, navigator()->longestPagePixelsForScope(pages));
+        QVERIFY2(bytes > previous,
+                 qPrintable(QStringLiteral("%1 pages costs %2 MB, no more than the %3 MB fewer pages "
+                                           "cost with no limit")
+                                .arg(pages)
+                                .arg(bytes / 1000000.0, 0, 'f', 1)
+                                .arg(previous / 1000000.0, 0, 'f', 1)));
+        /// Which is the point of the warning label: with no limit the fourth step is already past
+        /// what the 400 MB budget held it to.
+        QVERIFY2(bytes > 400.0 * 1000000.0,
+                 "a bigger strip with no limit did not cost more than the 400 MB budget held it to");
+        previous = bytes;
+    }
+
+    /// The tab is closed the way the tests that leave one open close it.
+    if (KisDocument *document = navigator()->currentDocument()) {
+        document->setModified(false);
+    }
     if (KisView *view = navigator()->currentView()) {
         view->closeView();
         QApplication::sendPostedEvents();

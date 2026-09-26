@@ -1604,8 +1604,8 @@ void KisCoordinatesConverterTest::testZoomLimits_data()
             {{100,100}, {100,100}},
            }
         << 0.1
-        << 90.0
-        << QVector<qreal>{0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64}
+        << 640.0
+        << QVector<qreal>{0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512}
 
         << QSize(2000, 2000)
         << QPointF(100, 100)
@@ -1615,8 +1615,8 @@ void KisCoordinatesConverterTest::testZoomLimits_data()
             {{100,100}, {100,100}},
            }
         << 0.05
-        << 90.0
-        << QVector<qreal>{0.0625, 0.0833333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64};
+        << 640.0
+        << QVector<qreal>{0.0625, 0.083333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512};
 
     QTest::newRow("image-resolution-change")
         << QSize(1000, 1000)
@@ -1627,8 +1627,8 @@ void KisCoordinatesConverterTest::testZoomLimits_data()
             {{100,100}, {100,100}},
            }
         << 0.1
-        << 90.0
-        << QVector<qreal>{0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64}
+        << 640.0
+        << QVector<qreal>{0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512}
 
         << QSize(1000, 1000)
         << QPointF(50, 50) // lower image DPI to increase physical screen size
@@ -1638,8 +1638,8 @@ void KisCoordinatesConverterTest::testZoomLimits_data()
             {{100,100}, {200,200}},
            }
         << 0.05
-        << 90.0
-        << QVector<qreal>{0.0625, 0.0833333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64};
+        << 640.0
+        << QVector<qreal>{0.0625, 0.083333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512};
 
         QTest::newRow("screen-resolution-change")
         << QSize(1000, 1000)
@@ -1650,8 +1650,8 @@ void KisCoordinatesConverterTest::testZoomLimits_data()
             {{100,100}, {100,100}},
            }
         << 0.1
-        << 90.0
-        << QVector<qreal>{0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64}
+        << 640.0
+        << QVector<qreal>{0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512}
 
         << QSize(1000, 1000)
         << QPointF(100, 100)
@@ -1661,8 +1661,8 @@ void KisCoordinatesConverterTest::testZoomLimits_data()
             {{100,100}, {200,200}},
            }
         << 0.05
-        << 90.0
-        << QVector<qreal>{0.0625, 0.0833333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64};
+        << 640.0
+        << QVector<qreal>{0.0625, 0.083333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512};
 
 }
 
@@ -1805,7 +1805,7 @@ void KisCoordinatesConverterTest::testZoomLimitsEnforcement_data()
         << QSize(1000, 1000)
         << QSize(700, 500)
         << 0.1
-        << 90.0
+        << 640.0
         << KoZoomMode::ZOOM_CONSTANT
         << 0.0001
         << KoZoomMode::ZOOM_CONSTANT
@@ -1815,17 +1815,17 @@ void KisCoordinatesConverterTest::testZoomLimitsEnforcement_data()
         << QSize(1000, 1000)
         << QSize(700, 500)
         << 0.1
-        << 90.0
+        << 640.0
         << KoZoomMode::ZOOM_CONSTANT
-        << 190.0
+        << 1900.0
         << KoZoomMode::ZOOM_CONSTANT
-        << 90.0;
+        << 640.0;
 
     QTest::newRow("page-below-min")
         << QSize(1000, 1000)
         << QSize(50, 50)
         << 0.1
-        << 90.0
+        << 640.0
         << KoZoomMode::ZOOM_PAGE
         << 777.0
         << KoZoomMode::ZOOM_PAGE
@@ -1883,7 +1883,7 @@ void KisCoordinatesConverterTest::testFindNextZoom_data()
     QTest::newRow("next-middle")
         << true
         << 0.07
-        << 0.0833333;
+        << 0.083333;
 
     QTest::newRow("next-collision")
         << true
@@ -1892,8 +1892,8 @@ void KisCoordinatesConverterTest::testFindNextZoom_data()
 
     QTest::newRow("next-above-maximum")
         << true
-        << 65.0
-        << 65.0; // keep the current level
+        << 600.0
+        << 600.0; // keep the current level: 600% is above the top standard level (512%), ceiling 64000%
 
     QTest::newRow("prev-below-minimum")
         << false
@@ -1924,7 +1924,7 @@ void KisCoordinatesConverterTest::testFindNextZoom()
     QFETCH(qreal, startZoom);
     QFETCH(qreal, expectedZoom);
 
-    const QVector<qreal> levels{0.0625, 0.0833333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.33333, 2, 2.66667, 4, 5.33333, 8, 10.6667, 16, 21.3333, 32, 42.6667, 64};
+    const QVector<qreal> levels{0.0625, 0.083333, 0.125, 0.166667, 0.25, 0.333333, 0.5, 0.666667, 1, 1.333333, 2, 2.666667, 4, 5.333333, 8, 10.666667, 16, 21.333333, 32, 42.666667, 64, 85.333333, 128, 170.666667, 256, 341.333333, 512};
 
     const qreal resultZoom =
         findNext ?

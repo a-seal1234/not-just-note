@@ -157,8 +157,35 @@ public:
      * had -- and applied to what is on screen through the roll's own resize path. A different page
      * count is a different WINDOW, not a different notebook: the per-slot bands are re-cut inside the
      * roll and the document is resized to the new window, rather than the document being rebuilt.
+     *
+     * The count is a SETTING, and it is deliberately not clamped to whichever notebook happens to be
+     * open when it is set: it is set before the notebook it is meant for as often as after. The
+     * WINDOW is what the notebook bounds -- PdfStripLayout::forWindow cannot extend past the first
+     * and last page -- so a count larger than the open notebook is kept as the setting and the slots
+     * on screen are the notebook's answer.
+     *
+     * An OFF (1) changes the setting and leaves the document alone, because one page at a time is a
+     * different document rather than a different window, and the switch that asks for it is the one
+     * that rebuilds. The strip is symmetric, so an even count is laid out as the next odd one.
      */
     void setScope(int scope);
+
+    /**
+     * How many pages the strip holds when it is on: the switch's "how many" half, kept apart from
+     * whether it is on.
+     *
+     * Persisted under pdfio/stripPages and never rewritten by turning the strip off, so the count is
+     * still there when it is turned back on. Five on a settings file that has never been touched --
+     * the count the notebook has always opened at.
+     */
+    int stripPageCount() const;
+
+    /// Whether what is OPEN is a strip rather than one page. Both halves are needed: the document has
+    /// to be there, and its slot bookkeeping has to hold a window -- m_stripPages is empty for design
+    /// A and holds one entry per slot for design B. Read by the menu so a count change that is
+    /// already on screen is not rebuilt a second time, and a slot list that outlived its view is not
+    /// mistaken for one.
+    bool stripIsOpen() const;
 
     /// The device's physical memory in megabytes, as Krita itself reports it (0 when it cannot say).
     static int deviceRamMb();
@@ -215,10 +242,17 @@ public:
     /**
      * The same two figures for a window of \a scope pages, which is what the strip-size menu shows
      * beside each choice: what that many pages would cost at the budget in force, and how big the
-     * longest page in it would be. The layer count is the shape the builder would make for that
-     * window -- one band per slot plus Ink -- because the bands of a window that does not exist yet
-     * cannot be counted.
+     * longest page in it would be.
+     *
+     * The window is the one the layout would make -- centred on the active page and bounded by the
+     * notebook -- and the layer count is the shape the builder would make for it, one band per slot
+     * plus Ink, because the bands of a window that does not exist yet cannot be counted. A \a scope
+     * larger than the notebook holds is therefore answered for the window the notebook can really
+     * show, so the figure beside an entry is the figure picking it would produce. 0 when there is no
+     * notebook, or no page size to name.
      */
+    int windowCostMbForScope(int scope) const;
+    int longestPagePixelsForScope(int scope) const;
 
     /**
      * The floor and the ceiling a typed budget is held between, so a dialog and the setter cannot
@@ -489,8 +523,16 @@ private:
      */
     qreal dpiForBudget(int megabytes, int activePage, int layers) const;
 
-    /// The longest side, in points, of the longest page the window around \a activePage holds.
-    qreal longestSidePtInWindow(int activePage) const;
+    /**
+     * The same derivation for a window of \a scope pages rather than for the one that is up: what the
+     * strip-size menu needs, because the window it names does not exist yet. \a layers as in
+     * dpiForBudget().
+     */
+    qreal dpiForBudgetInScope(int megabytes, int activePage, int scope, int layers) const;
+
+    /// The longest side, in points, of the longest page the window of \a scope pages around
+    /// \a activePage holds.
+    qreal longestSidePtInWindow(int activePage, int scope) const;
 
     /**
      * Clears the open document's modified flag: a strip is a view of the notebook, not a document to
@@ -633,6 +675,12 @@ private:
     /// each side. One page at a time is still reachable from the menu, and the default used to be
     /// that -- a page with no neighbours on screen, which is not what the notebook is for.
     int m_scope = 5;
+
+    /// How many pages the strip holds when it is ON: the switch's "how many" half, kept apart from
+    /// whether it is on. Read from pdfio/stripPages in the constructor, written by setScope(), and
+    /// never rewritten by turning the strip off -- so the switch turns it back on at the count it
+    /// had. Five, the count the notebook has always shipped with.
+    int m_stripPageCount = 5;
 
     /// The memory budget for the rendered window, in megabytes, or 0 for no limit -- the fixed
     /// 200 dpi the pages are rendered at. Read from QSettings in the constructor, written by

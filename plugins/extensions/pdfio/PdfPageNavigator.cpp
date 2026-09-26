@@ -314,6 +314,14 @@ constexpr qreal DefaultRenderDpi = 200;
 /// nobody reads, and a downgrade should find its own setting where it left it.
 const char *const MemoryBudgetMbKey = "pdfio/memoryBudgetMb";
 
+/// Where the strip's page count, and whether the strip is on, are kept.
+///
+/// TWO settings rather than one, and that is the whole point: turning the strip off with the menu's
+/// switch must not forget how many pages it had. An "off" therefore writes only StripOnKey and
+/// leaves StripPagesKey exactly where it was, and turning the strip back on reads it again.
+const char *const StripPagesKey = "pdfio/stripPages";
+const char *const StripOnKey = "pdfio/stripOn";
+
 /// What a TYPED budget is held between.
 ///
 /// The floor is a quality choice, not a crash guard: 20 MB is about where the longest page of the
@@ -371,6 +379,23 @@ PdfPageNavigator::PdfPageNavigator()
     /// install, or a notebook nobody has touched this for, gets 0: the fixed 200 dpi the strip has
     /// always rendered at, exactly.
     m_memoryBudgetMb = qMax(0, QSettings().value(QLatin1String(MemoryBudgetMbKey), 0).toInt());
+
+    /// The strip's page count and whether it is on, read BEFORE the window's bound is set: a strip
+    /// that was turned off opens as one page at a time with its count remembered, and the switch
+    /// turns it back on at that count.
+    ///
+    /// Five and on is the notebook's own default, so a settings file that has never been touched
+    /// opens exactly as it always did. A stored count below the smallest real strip -- three, because
+    /// the active page has one either side of it -- is read as the default rather than as a window
+    /// this build cannot lay out, and an even one is rounded up because the strip is symmetric.
+    {
+        const int stored = QSettings().value(QLatin1String(StripPagesKey), 5).toInt();
+        m_stripPageCount = stored >= 3 ? stored : 5;
+        if (m_stripPageCount % 2 == 0) {
+            ++m_stripPageCount;
+        }
+        m_scope = QSettings().value(QLatin1String(StripOnKey), true).toBool() ? m_stripPageCount : 1;
+    }
 
     /// The window's save is the plugin's own page save: the ink-only document, the crop when the
     /// page lives in a strip, and the asynchronous write saveCurrentPage already owns. Wired once
@@ -1382,10 +1407,18 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     }
     /// One derivation for the whole roll: the window it lays out and the pages it renders below are
     /// the same resolution, so a window cannot be built at one and repainted at another.
-    /// One derivation for the whole roll, with the layer count the document really has: the window
-    /// it lays out and the pages it renders below are the same resolution, so a window cannot be
-    /// built at one and repainted at another.
-    const qreal dpi = dpiForBudget(m_memoryBudgetMb, centreOn, stripLayerCount());
+    ///
+    /// The layer count is the window ARRIVING's, which is not always the one leaving's: a scope change
+    /// makes the new window more pages (or fewer), and a budget divided across the OLD count would
+    /// let a bigger window cost more than the budget while making a smaller one needlessly coarse.
+    /// The content layers the strip already carries are the part that does not scale with the slot
+    /// count, and the bands the arriving window needs is the shape the layout is about to make. With
+    /// the scope unchanged this is exactly stripLayerCount(), which is what the roll used before.
+    const int contentLayers = qMax(0, int(stripLayerCount() - m_stripPaper.size()));
+    const int plannedSlots =
+        int(PdfStripLayout::forWindow(m_manifest, centreOn, m_scope, DefaultRenderDpi).slots().size());
+    const qreal dpi =
+        dpiForBudget(m_memoryBudgetMb, centreOn, qMax(1, plannedSlots + contentLayers));
     m_renderedDpi = dpi;
     const PdfStripLayout target = PdfStripLayout::forWindow(m_manifest, centreOn, m_scope, dpi);
     if (!target.isValid()) {
@@ -1405,10 +1438,12 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     /// that must stay exactly as fast as it is: nothing below runs for it.
     const QSize targetSize = target.imageSize();
     const QSize sizeNow(m_document->image()->width(), m_document->image()->height());
-    if (m_stripPaper.size() != target.slots().size()) {
-        fail(why, QStringLiteral("the strip does not have the slots it should"));
-        return false;
-    }
+
+    /// A window with a different number of slots -- a scope change -- is deliberately NOT refused
+    /// here any more. The bands are re-cut inside this roll, after the writes and before the resize:
+    /// see the band surgery below. It used to refuse, and the caller then built the whole document
+    /// and view again, which is not what a different page count should cost.
+
 
     /// Every source the new window draws from, opened before anything is done: a roll that cannot
     /// render its pages has to refuse before it writes and wipes the strip, not after.
@@ -1532,6 +1567,83 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
                                  "the strip is unchanged"));
         say(QStringLiteral("strip: roll refused: the document is not the one this roll started for"));
         return false;
+    }
+
+    /// The band surgery: the window's own shape, cut to the slots this roll is laying out.
+    ///
+    /// A different page count is a different WINDOW, not a different notebook, so the paper layers
+    /// are re-cut here rather than the document being rebuilt. The surplus bands go, and the missing
+    /// ones are inserted directly ABOVE the topmost paper band -- which is where the Ink group
+    /// begins. A band above the ink hides every stroke on the page it covers, which is why the
+    /// insertion point is the one place it can be.
+    ///
+    /// AFTER the write phase and BEFORE the resize and the repaint, in that order and for two
+    /// reasons: a roll that has to refuse -- because a page could not be written, or the document
+    /// went away -- must leave the strip exactly as it was, and the writes are the only thing here
+    /// that can refuse; and the new bands are allocated at the size the document still has, then
+    /// grown or cropped by the resize below along with every other layer, so they arrive at the
+    /// size the repaint works in.
+    ///
+    /// The repaint below gives each band its page and its name, so an inserted band is a page
+    /// background from the moment it exists: named like the other bands, so a slot the repaint
+    /// finds no page for is still recognized as a background rather than as content.
+    const int arrivingSlots = slots.size();
+    if (m_stripPaper.size() != arrivingSlots) {
+        KisImageSP image = m_document->image();
+
+        int removed = 0;
+        int added = 0;
+        if (m_stripPaper.size() > arrivingSlots) {
+            /// The bands that go are the topmost ones. Which band holds which slot does not matter
+            /// -- every band is wiped and repainted from its slot's artifact below -- but taking
+            /// them off the top keeps the list and the stack in the same order.
+            while (m_stripPaper.size() > arrivingSlots) {
+                KisNodeSP surplus = m_stripPaper.takeLast();
+                if (surplus && image->removeNode(surplus)) {
+                    ++removed;
+                }
+            }
+        } else {
+            QList<KisNodeSP> inserted;
+            while (m_stripPaper.size() < arrivingSlots) {
+                const int slot = int(m_stripPaper.size());
+                const int page = slot < slots.size() ? slots.at(slot).page : -1;
+                KisPaintLayerSP band = new KisPaintLayer(image,
+                                                         PdfStripBuilder::backgroundLayerName(page),
+                                                         OPACITY_OPAQUE_U8);
+                band->setUserLocked(true);
+                /// Directly above the topmost band that is already there: the Ink group is above
+                /// every one of them, so the new band lands below it.
+                const KisNodeSP above = m_stripPaper.isEmpty() ? KisNodeSP() : m_stripPaper.last();
+                if (!image->addNode(band, image->root(), above)) {
+                    /// Nothing is left half re-cut: the bands this loop did insert go again, and
+                    /// the roll refuses with the window it started with.
+                    for (const KisNodeSP &rollback : inserted) {
+                        image->removeNode(rollback);
+                    }
+                    m_savingPages = wasSaving;
+                    fail(why, QStringLiteral("the strip could not take the band for slot %1")
+                                  .arg(slot + 1));
+                    say(QStringLiteral("strip: roll refused: a band could not be added to the strip"));
+                    return false;
+                }
+                inserted.append(band);
+                m_stripPaper.append(band);
+                ++added;
+            }
+        }
+
+        say(QStringLiteral("strip: the window was re-cut to %1 slot(s): %2 band(s) removed, %3 added")
+                .arg(arrivingSlots)
+                .arg(removed)
+                .arg(added));
+
+        /// Adding or removing a node marks the image changed, and the strip is a view of the
+        /// notebook rather than a document to write. The resize below clears the mark again where
+        /// Krita's own operation makes it, and the end of the roll clears whatever the repaint and
+        /// the layer adoption leave behind -- this one is here so the surgery on its own can never
+        /// be what leaves the tab saying the strip is modified.
+        clearModifiedFlag();
     }
 
     /// The document is made the size of the window that is arriving, when it is not already.
@@ -2080,12 +2192,106 @@ int PdfPageNavigator::scope() const
     return m_scope;
 }
 
+int PdfPageNavigator::stripPageCount() const
+{
+    return m_stripPageCount;
+}
+
+bool PdfPageNavigator::stripIsOpen() const
+{
+    /// A document AND a window of slots. The slot list alone is not enough: it outlives the view
+    /// that was showing it (a tab closed by hand, or a rebuild between its two halves), and a stale
+    /// list read as "a strip is open" is how a count change would decide nothing needed rebuilding.
+    return m_document && !m_stripPages.isEmpty();
+}
+
 void PdfPageNavigator::setScope(int scope)
 {
-    m_scope = qMax(1, scope);
-    /// The window bound follows the scope: design A is one page, design B would be three. Pages
-    /// already open are not thrown out here; the extra slots are given back on the next page turn.
+    /// The count and the on/off state are TWO settings, and this is where they are kept apart:
+    /// turning the strip off (1) writes only the on/off key, so the count is still there when the
+    /// switch turns it back on. See StripPagesKey / StripOnKey.
+    const bool on = scope > 1;
+    QSettings settings;
+    settings.setValue(QLatin1String(StripOnKey), on);
+
+    int pages = qMax(1, scope);
+    if (on) {
+        /// The strip is symmetric -- a page above and a page below the active one -- so an even
+        /// count is laid out as the next odd one, and what is stored is what the layout really
+        /// makes rather than a number nothing would ever show.
+        if (pages % 2 == 0) {
+            ++pages;
+        }
+        m_stripPageCount = pages;
+        settings.setValue(QLatin1String(StripPagesKey), pages);
+    }
+
+    /// The count is a SETTING, not a property of whichever notebook happens to be open when it is
+    /// asked for.
+    ///
+    /// It is asked for BEFORE the notebook it is meant for as often as after -- the plugin and the
+    /// tests both set the scope and then open a notebook -- and clamping it here to the notebook that
+    /// happens to be open at that moment is how a leftover three page notebook rewrote a request for
+    /// five into three (the sweep's two failures: a five page window built three pages tall). What
+    /// bounds a count is the notebook the WINDOW is built in, and PdfStripLayout::forWindow clamps it
+    /// there, every time, so the number the user chose survives and the slots on screen are the
+    /// notebook's answer.
+    const bool changed = (on ? pages : 1) != m_scope;
+    m_scope = on ? pages : 1;
+
+    /// The window bound follows the scope: design A is one page, design B is a strip of that many.
+    /// Pages already open are not thrown out here; the extra slots are given back on the next page
+    /// turn, and a smaller window is nobody's problem.
     m_window.setCapacity(m_scope);
+
+    /// Nothing to apply and nothing to say when the window that is up is already that one: a
+    /// switch turned on where the strip already was is not a window move.
+    if (!changed) {
+        return;
+    }
+
+    say(QStringLiteral("the strip's page count is now %1 (the strip is %2)")
+            .arg(on ? QString::number(m_scope) : QString::number(m_stripPageCount))
+            .arg(on ? QStringLiteral("on") : QStringLiteral("off")));
+
+    /// OFF: one page at a time is a different DOCUMENT rather than a different window -- no bands,
+    /// no slots -- so it is not this setter's to apply. The switch that asked for it rebuilds, and
+    /// nothing here may take a strip down on its own.
+    if (!on) {
+        return;
+    }
+    if (!m_document || !hasNotebook() || m_index < 0 || m_stripPages.isEmpty()) {
+        /// A single page has no window to re-cut, no document has nothing to re-cut, and no
+        /// notebook has nothing to apply it to: the next build takes the count (the plugin's own
+        /// scope path).
+        return;
+    }
+
+    /// A count the notebook has no room for lays out the window that is already up. The setting
+    /// changes and the screen does not: without this, picking a number larger than the notebook from
+    /// the menu would still cost a whole window write, a render and a repaint to arrive at the same
+    /// pixels. The layout is asked at the resolution the strip is already at, which is the one the
+    /// roll would derive again from the same slot count.
+    const PdfStripLayout arriving =
+        PdfStripLayout::forWindow(m_manifest, m_index, m_scope, currentRenderDpi());
+    const QSize sizeNow(m_document->image()->width(), m_document->image()->height());
+    if (arriving.isValid() && arriving.slots().size() == m_stripPaper.size()
+        && arriving.imageSize() == sizeNow) {
+        return;
+    }
+
+    /// The count changed while a strip is up, so it is applied through the roll's own resize path:
+    /// the bands are re-cut and the document resized, rather than the document and view rebuilt.
+    QString why;
+    if (!rollToPage(m_index, &why, m_index, true)) {
+        say(QStringLiteral("the strip's page count was saved but the strip was not re-cut: %1")
+                .arg(why));
+    } else {
+        /// The roll clears the mark where Krita's resize made it and at its own end; this clears
+        /// anything raised after it returned, through the same helper, so this path cannot drift
+        /// from the roll's own.
+        clearModifiedFlag();
+    }
 }
 
 int PdfPageNavigator::memoryBudgetMb() const
@@ -2103,7 +2309,7 @@ qreal PdfPageNavigator::currentRenderDpi() const
 int PdfPageNavigator::longestPagePixelsForBudget(int megabytes) const
 {
     const int activePage = m_index >= 0 ? m_index : 0;
-    const qreal longestPt = longestSidePtInWindow(activePage);
+    const qreal longestPt = longestSidePtInWindow(activePage, m_scope);
     if (longestPt <= 0.0) {
         /// No notebook, or a window with no pages: there is no page size to name.
         return 0;
@@ -2160,6 +2366,50 @@ int PdfPageNavigator::windowCostMbForBudget(int megabytes) const
     /// Rounded UP: a figure that says "about 200 MB" must never be under the number the user typed
     /// for the case where the budget binds.
     return int(qCeil(bytes / 1000000.0));
+}
+
+int PdfPageNavigator::longestPagePixelsForScope(int scope) const
+{
+    const int activePage = m_index >= 0 ? m_index : 0;
+    const qreal longestPt = longestSidePtInWindow(activePage, scope);
+    if (longestPt <= 0.0) {
+        /// No notebook, or a scope the notebook has no room for: there is no page size to name.
+        return 0;
+    }
+
+    /// The same derivation a build of that window would use, without applying anything: the number
+    /// the menu shows beside a choice has to be the number picking it would produce. The layer count
+    /// is the shape the builder would make -- one band per slot plus Ink -- because the bands of a
+    /// window that does not exist yet cannot be counted.
+    const int slots = PdfStripLayout::forWindow(m_manifest, activePage, scope, 1.0).slots().size();
+    if (slots <= 0) {
+        return 0;
+    }
+    const qreal dpi = dpiForBudgetInScope(m_memoryBudgetMb, activePage, scope, qMax(1, slots + 1));
+    return qMax(0, qRound(longestPt * dpi / 72.0));
+}
+
+int PdfPageNavigator::windowCostMbForScope(int scope) const
+{
+    const int activePage = m_index >= 0 ? m_index : 0;
+    const PdfStripLayout reference = PdfStripLayout::forWindow(m_manifest, activePage, scope, 1.0);
+    if (!reference.isValid()) {
+        return 0;
+    }
+
+    /// The shape the builder would make for that window: one band per slot plus Ink. The bands of a
+    /// window that does not exist yet cannot be counted, and a content layer an artifact would
+    /// restore is not known either.
+    const int layers = qMax(1, reference.slots().size() + 1);
+    const qreal dpi = dpiForBudgetInScope(m_memoryBudgetMb, activePage, scope, layers);
+    const QSize size = PdfStripLayout::forWindow(m_manifest, activePage, scope, dpi).imageSize();
+    if (size.isEmpty()) {
+        return 0;
+    }
+
+    /// Rounded UP: a figure that says "about 300 MB" must never be under the number the window would
+    /// really hold.
+    return int(qCeil(qreal(size.width()) * qreal(size.height()) * qreal(layers) * 4.0 / 1000000.0));
 }
 
 int PdfPageNavigator::layersForBudget(const PdfStripLayout &window) const
@@ -2234,6 +2484,15 @@ void PdfPageNavigator::setMemoryBudgetMb(int megabytes)
 
 qreal PdfPageNavigator::dpiForBudget(int megabytes, int activePage, int layers) const
 {
+    /// The window that is up, or the one a roll is about to lay out (m_scope is set before the roll
+    /// runs). The menu's own "what would N pages cost" goes through dpiForBudgetInScope() directly,
+    /// because that window is not the one in force.
+    return dpiForBudgetInScope(megabytes, activePage, m_scope, layers);
+}
+
+qreal PdfPageNavigator::dpiForBudgetInScope(int megabytes, int activePage, int scope,
+                                            int layers) const
+{
     if (megabytes <= 0) {
         /// No budget: exactly what this rendered at before the setting existed, to the dpi.
         return DefaultRenderDpi;
@@ -2243,7 +2502,7 @@ qreal PdfPageNavigator::dpiForBudget(int megabytes, int activePage, int layers) 
     /// pages it holds, how big they are, how much the gaps cost -- so the pixels it needs are read
     /// off one layout instead of being guessed from page sizes here.
     const PdfStripLayout reference =
-        PdfStripLayout::forWindow(m_manifest, activePage, m_scope, DefaultRenderDpi);
+        PdfStripLayout::forWindow(m_manifest, activePage, scope, DefaultRenderDpi);
     const QSize referenceSize = reference.imageSize();
     if (referenceSize.isEmpty()) {
         /// Nothing to lay out: no notebook, or a window with no pages in it.
@@ -2288,7 +2547,7 @@ qreal PdfPageNavigator::dpiForBudget(int megabytes, int activePage, int layers) 
     for (int i = 0; i < 24; ++i) {
         const qreal middle = (low + high) / 2.0;
         const QSize probeSize =
-            PdfStripLayout::forWindow(m_manifest, activePage, m_scope, middle).imageSize();
+            PdfStripLayout::forWindow(m_manifest, activePage, scope, middle).imageSize();
         const qreal probeArea = qreal(probeSize.width()) * qreal(probeSize.height());
         if (probeArea > targetArea) {
             high = middle;
@@ -2300,7 +2559,7 @@ qreal PdfPageNavigator::dpiForBudget(int megabytes, int activePage, int layers) 
     /// A dpi that lays a page out no pixels wide is not a lower quality, it is a broken layout: the
     /// geometry refuses at zero and the page would not open at all. One pixel for the longest page is
     /// the floor that needs, and it is not a quality clamp -- the menu offers nothing near it.
-    const qreal smallest = 72.0 / qMax(qreal(1.0), longestSidePtInWindow(activePage));
+    const qreal smallest = 72.0 / qMax(qreal(1.0), longestSidePtInWindow(activePage, scope));
     return qMax(smallest, low);
 }
 
@@ -2319,13 +2578,13 @@ int PdfPageNavigator::stripLayerCount() const
     return layers;
 }
 
-qreal PdfPageNavigator::longestSidePtInWindow(int activePage) const
+qreal PdfPageNavigator::longestSidePtInWindow(int activePage, int scope) const
 {
     /// The layout is asked which pages the window holds, rather than that range being worked out a
     /// second time here: forWindow() already clamps the scope to the notebook and centres the window
     /// as far as the ends allow, and a second copy of that arithmetic would be a second answer. Any
     /// positive dpi does for the question; the pixels are not read.
-    const PdfStripLayout window = PdfStripLayout::forWindow(m_manifest, activePage, m_scope, 1.0);
+    const PdfStripLayout window = PdfStripLayout::forWindow(m_manifest, activePage, scope, 1.0);
 
     qreal longest = 0.0;
     for (const PdfStripLayout::Slot &slot : window.slots()) {

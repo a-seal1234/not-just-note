@@ -15,6 +15,7 @@
 #include "PdfRendererSpike.h"
 
 #include <cstdio>
+#include <functional>
 #include <unistd.h>
 
 #include <QActionGroup>
@@ -1843,6 +1844,12 @@ public:
         /// raised as well as lowered -- the knob the user wants is finer than three presets and goes
         /// in both directions. 50 MB is a visible step at this scale: ten taps cover 200 to 700 MB.
         m_value->setSingleStep(50);
+        /// The platform draws the step buttons a few pixels wide, which a finger cannot hit: measured
+        /// on the tablet at about 6x11 logical pixels. The +/- stepping is the whole reason this is a
+        /// spin box rather than a line edit, so the buttons are given the room of a touch target.
+        const int stepWidth = qMax(32, m_value->fontMetrics().height() * 2);
+        m_value->setStyleSheet(QStringLiteral("QSpinBox::up-button, QSpinBox::down-button { width: %1px; }")
+                                   .arg(stepWidth));
         m_value->setValue(qBound(PdfPageNavigator::minMemoryBudgetMb(), current,
                                  PdfPageNavigator::maxMemoryBudgetMb()));
         m_value->setToolTip(memoryBudgetCaveat());
@@ -2014,6 +2021,267 @@ void addMemoryBudgetMenu(QMenu *menu)
     };
 
     QObject::connect(budgets, &QMenu::aboutToShow, budgets, refresh);
+    refresh();
+}
+
+
+/// The two sentences the "Strip pages" submenu and its typed dialog carry: what more pages cost, and
+/// why the count is bounded by the notebook rather than by a constant of this build's.
+QString stripPagesCaveat()
+{
+    return i18n(
+        "The strip is the active page with the same number of pages either side of it, all in one "
+        "document. More pages at a fixed memory budget spend the same memory at a lower resolution "
+        "each; with no limit they simply cost more.\n\n"
+        "The window cannot extend past the first and last page, so a notebook with fewer pages holds "
+        "what it has. This is the strip's \"how many\" half: whether it is on at all is the switch "
+        "beside it, which keeps this count when it is turned off.");
+}
+
+/// The typed strip page count: a number of pages, and under it, live, what that number costs for the
+/// notebook that is open.
+///
+/// The live line is the whole reason a typed count is worth having. The presets name round numbers
+/// and the menu names what each of them buys; a dialog that only took a number would ask the user to
+/// guess what it costs and show them afterwards. So every change asks the navigator the same question
+/// the menu label asks -- longestPagePixelsForScope() and windowCostMbForScope() -- through the same
+/// derivation the build would use.
+///
+/// No Q_OBJECT: it has no signals or slots of its own, so it needs no moc.
+class PdfStripPagesDialog : public QDialog
+{
+public:
+    PdfStripPagesDialog(int current, int maximum, QWidget *parent)
+        : QDialog(parent)
+    {
+        setWindowTitle(i18n("Strip pages"));
+
+        auto *intro = new QLabel(i18n("How many pages the strip holds, the active page included. The "
+                                      "strip is symmetric, so an even count is laid out as the next "
+                                      "odd one:"), this);
+        intro->setWordWrap(true);
+
+        m_value = new QSpinBox(this);
+        m_value->setObjectName(QStringLiteral("pdfio_strip_pages_value"));
+        /// Bounded by the notebook, asked of it rather than written down here: a window cannot extend
+        /// past the first and last page. With nothing open there is nothing to bound it by, so the
+        /// range is wide enough for the "several tens of pages" a powerful machine was asked for, and
+        /// the notebook clamps it when one is open.
+        const int bound = qMax(3, maximum);
+        m_value->setRange(3, bound);
+        m_value->setSuffix(i18n(" pages"));
+        /// A spin box on purpose: it is tapped on a tablet, and +/- is how the value is raised as
+        /// well as lowered. One step is one page, so the step a press makes stays visible however
+        /// large the count is.
+        m_value->setSingleStep(1);
+        m_value->setValue(qBound(3, current, bound));
+        m_value->setToolTip(stripPagesCaveat());
+
+        m_preview = new QLabel(this);
+        m_preview->setObjectName(QStringLiteral("pdfio_strip_pages_preview"));
+        m_preview->setWordWrap(true);
+
+        auto *sentences = new QLabel(stripPagesCaveat(), this);
+        sentences->setWordWrap(true);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+        auto *layout = new QVBoxLayout(this);
+        layout->addWidget(intro);
+        layout->addWidget(m_value);
+        layout->addWidget(m_preview);
+        layout->addWidget(sentences);
+        layout->addWidget(buttons);
+
+        const auto update = [this]() {
+            PdfPageNavigator *navigator = PdfPageNavigator::instance();
+            const int chosen = m_value->value();
+            /// The strip is symmetric, so an even value is laid out as the next odd one: the number
+            /// shown is the number that will really be on screen rather than the one typed.
+            const int laidOut = chosen + (chosen % 2);
+            const int pages =
+                navigator->hasNotebook() ? qMin(laidOut, navigator->pageCount()) : laidOut;
+
+            if (!navigator->hasNotebook()) {
+                m_preview->setText(i18n("%1 pages (active ±%2). No notebook is open: the page size and "
+                                        "the memory a count costs depend on the notebook's own pages.",
+                                        pages, (pages - 1) / 2));
+                return;
+            }
+
+            m_preview->setText(i18n("%1 pages (active ±%2) — about %3 px on the longest page, about "
+                                    "%4 MB.",
+                                    pages,
+                                    (pages - 1) / 2,
+                                    navigator->longestPagePixelsForScope(chosen),
+                                    navigator->windowCostMbForScope(chosen)));
+        };
+        QObject::connect(m_value, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                         [update](int) { update(); });
+        update();
+    }
+
+    int pages() const { return m_value->value(); }
+
+private:
+    QSpinBox *m_value = nullptr;
+    QLabel *m_preview = nullptr;
+};
+
+/// Applies the strip's page count to the navigator AND to the screen.
+///
+/// The navigator owns the setting: setScope() persists the count and the on/off state apart, applies
+/// a new count to a strip that is already up through the roll's own resize path, and leaves a
+/// single-page document alone. What it cannot do is the part that needs a DOCUMENT rather than a
+/// window -- going to one page at a time is design A, a different document, and bringing a strip up
+/// where a single page was is design B's build. Those two are what \a rebuildPage is for, and the
+/// switch's own label is what \a refreshSwitch is for.
+///
+/// \a pages of 1 is OFF, the switch's own state, and anything above it is a count; the navigator
+/// reads the same two settings either way.
+void applyStripPages(int pages, const std::function<void()> &refreshSwitch,
+                     const std::function<void(int)> &rebuildPage)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    const bool turningOff = pages <= 1;
+    const bool stripWasOpen = navigator->stripIsOpen();
+
+    navigator->setScope(pages);
+    refreshSwitch();
+
+    if (!navigator->hasNotebook()) {
+        say(QStringLiteral("strip: %1 set; it applies when a notebook is opened")
+                .arg(turningOff ? QStringLiteral("one page at a time")
+                                : QStringLiteral("%1 pages").arg(navigator->scope())));
+        return;
+    }
+
+    /// Rebuilt only where the change is a different DOCUMENT: taking a strip down to one page, or
+    /// bringing one up where a single page was. A count change WITHIN a strip is neither, and the
+    /// navigator's setScope has already re-cut the bands and resized the document through the roll
+    /// -- rebuilding then would throw away exactly the path this control exists to use.
+    const bool needsBuild = turningOff ? stripWasOpen : !stripWasOpen;
+    if (!needsBuild) {
+        say(QStringLiteral("strip: the window is now %1 page(s), re-cut in place")
+                .arg(navigator->scope()));
+        return;
+    }
+
+    /// The pages the document still holds are written before it is taken down, exactly as the
+    /// switch's own path writes them, and the rebuild happens on the event loop because Krita's close
+    /// of the old document is deferred.
+    navigator->saveStripPages();
+    rebuildPage(navigator->currentIndex());
+}
+
+/// The strip's page count: the switch's "how many" half, as a submenu of presets and a typed value.
+///
+/// The count is bounded by the NOTEBOOK rather than by a constant of this build's -- the user asked
+/// to be able to load several tens of pages on a powerful machine, so seven is not a ceiling. Every
+/// entry names what that count costs for the notebook that is open, the longest page's pixels and the
+/// window's megabytes, which is the discouragement a large value needs: at a fixed budget more pages
+/// spend the same memory coarser, and with no limit they cost more.
+///
+/// \a applyPages is the navigator-and-screen path, provided by the caller because the two things a
+/// count change can need beyond the navigator -- relabelling the switch and rebuilding the document
+/// where its shape changes -- are the plugin's own private members.
+void addStripPagesMenu(QMenu *menu, const std::function<void(int)> &applyPages)
+{
+    if (!menu) {
+        return;
+    }
+
+    /// Deduped like the entries around it: registerActions() runs again for a second view and is
+    /// retried while the first screen has no window.
+    if (QMenu *previous = menu->findChild<QMenu *>(QStringLiteral("pdfio_strip_pages_menu"))) {
+        menu->removeAction(previous->menuAction());
+        previous->deleteLater();
+    }
+
+    QMenu *pages = menu->addMenu(i18n("Strip pages"));
+    pages->setObjectName(QStringLiteral("pdfio_strip_pages_menu"));
+
+    auto *group = new QActionGroup(pages);
+    const auto addPages = [pages, group, applyPages](int count, const QString &name) {
+        QAction *action = pages->addAction(QString());
+        action->setObjectName(name);
+        action->setCheckable(true);
+        action->setData(count);
+        group->addAction(action);
+        QObject::connect(action, &QAction::triggered, pages,
+                         [applyPages, count]() { applyPages(count); });
+        return action;
+    };
+
+    QAction *three = addPages(3, QStringLiteral("pdfio_strip_pages_3"));
+    QAction *five = addPages(5, QStringLiteral("pdfio_strip_pages_5"));
+    QAction *seven = addPages(7, QStringLiteral("pdfio_strip_pages_7"));
+    QAction *nine = addPages(9, QStringLiteral("pdfio_strip_pages_9"));
+
+    /// The typed value. Its own action rather than a preset with a sentinel: it is not a count that
+    /// can be applied, it is a dialog.
+    QAction *custom = pages->addAction(QString());
+    custom->setObjectName(QStringLiteral("pdfio_strip_pages_custom"));
+    custom->setCheckable(true);
+    custom->setData(-1);
+    group->addAction(custom);
+    QObject::connect(custom, &QAction::triggered, pages, [pages, applyPages]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        /// The bound is the notebook's own page count; with nothing open the dialog offers the wide
+        /// range and the notebook clamps it when one is.
+        const int maximum = navigator->hasNotebook() ? navigator->pageCount() : 99;
+        PdfStripPagesDialog dialog(navigator->stripPageCount(), maximum, pages->parentWidget());
+        if (dialog.exec() == QDialog::Accepted) {
+            applyPages(dialog.pages());
+        }
+    });
+
+    /// Filled every time the submenu opens: the mark is the navigator's own count, and the pixels and
+    /// megabytes beside each count are what THAT count would produce for the notebook that is open
+    /// now. With nothing open there is no size or cost to name, and the label is the count alone.
+    const auto refresh = [three, five, seven, nine, custom]() {
+        PdfPageNavigator *navigator = PdfPageNavigator::instance();
+        const bool open = navigator->hasNotebook();
+        const int current = navigator->stripPageCount();
+        const QString caveat = stripPagesCaveat();
+
+        const auto fill = [navigator, open, current, &caveat](QAction *action) {
+            const int count = action->data().toInt();
+
+            if (count < 0) {
+                /// The typed entry names the count in force when it is not one of the presets, so a
+                /// count the user typed is visible on the menu and is the one that gets the mark.
+                const bool typed = current != 3 && current != 5 && current != 7 && current != 9;
+                action->setText(typed ? i18n("Custom... (%1 pages)", current) : i18n("Custom..."));
+                action->setToolTip(caveat);
+                action->setChecked(typed);
+                return;
+            }
+
+            /// What the notebook can really show: the window cannot extend past the first and last
+            /// page, so a choice larger than the notebook is labelled with the pages it will hold.
+            const int held = open ? qMin(count, navigator->pageCount()) : count;
+            const QString label = i18n("%1 pages (active ±%2)", held, (held - 1) / 2);
+            const int pixels = open ? navigator->longestPagePixelsForScope(count) : 0;
+            const int megabytes = open ? navigator->windowCostMbForScope(count) : 0;
+            action->setText(open
+                                ? i18n("%1 — about %2 px on the longest page, about %3 MB",
+                                       label, pixels, megabytes)
+                                : label);
+            action->setToolTip(caveat);
+            action->setChecked(count == current);
+        };
+
+        fill(three);
+        fill(five);
+        fill(seven);
+        fill(nine);
+        fill(custom);
+    };
+
+    QObject::connect(pages, &QMenu::aboutToShow, pages, refresh);
     refresh();
 }
 
@@ -2525,6 +2793,17 @@ void PdfIoPlugin::registerActions()
     }
     updateStripAction();
 
+    /// The strip's "how many" half, immediately under the switch that is its on/off half. The switch
+    /// keeps its own way out -- unchecking it is one page at a time -- and does not forget the count:
+    /// that is the navigator's pdfio/stripPages, which this control owns.
+    addStripPagesMenu(menu, [this](int pages) {
+        applyStripPages(pages,
+                        [this]() { updateStripAction(); },
+                        [this](int page) {
+                            QTimer::singleShot(0, this, [this, page]() { rebuildForScope(page, 6); });
+                        });
+    });
+
     /// A switch rather than a plain action: turning pages by panning is the same gesture as
     /// looking at the bottom of a page, and whoever reads that way will want it off.
     KisAction *followAction =
@@ -2555,10 +2834,24 @@ void PdfIoPlugin::updateStripAction()
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
     const bool strip = navigator->scope() > 1;
 
+    /// The count the strip is SET TO, rather than the five this used to be hard-coded at: the label
+    /// says how many pages the switch is on at, and "Strip pages" is where that number comes from.
+    /// The count is remembered while the strip is off, so the label still names it.
+    ///
+    /// What it NAMES for an open notebook is what that notebook can show: the count is not clamped
+    /// when it is set (it is set before the notebook it is meant for as often as after), and a
+    /// "nine page" label on a five page notebook would promise pages that are not there. With nothing
+    /// open there is nothing to bound it, and the setting itself is named.
+    const int asked = navigator->stripPageCount();
+    const int pages = navigator->hasNotebook()
+        ? qMin(asked, qMax(1, navigator->pageCount()))
+        : asked;
+    const int side = (pages - 1) / 2;
+    const QString label = i18n("%1-page strip (active ±%2)", pages, side);
+
     /// The check mark is the mode indicator, and the text says what is on without a menu open.
     m_stripAction->setChecked(strip);
-    m_stripAction->setText(strip ? i18n("Five-page strip (active ±2) is on")
-                                 : i18n("Five-page strip (active ±2)"));
+    m_stripAction->setText(strip ? i18n("%1 is on", label) : label);
     m_stripAction->setToolTip(strip
         ? i18n("The page above and the page below are shown in the same document. "
                "Choose again to go back to one page at a time.")
@@ -2603,28 +2896,19 @@ void PdfIoPlugin::rebuildForScope(int pageIndex, int attemptsLeft)
 void PdfIoPlugin::slotToggleStripMode()
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();
-    /// Five, so the active page has two pages on each side of it. The window rolls -- repainting
-    /// only the slots that leave -- when the active page reaches that edge.
-    const int wanted = (m_stripAction && m_stripAction->isChecked()) ? 5 : 1;
 
-    navigator->setScope(wanted);
-    updateStripAction();
+    /// The switch is the ON/OFF half: on restores the count the strip last had -- five unless the
+    /// "Strip pages" menu changed it -- and off is one page at a time. Which count that is belongs to
+    /// the navigator, so turning the strip off cannot forget it, and the same apply path the submenu
+    /// uses is what puts the change on screen.
+    const bool on = m_stripAction && m_stripAction->isChecked();
+    const int pages = on ? navigator->stripPageCount() : 1;
 
-    if (!navigator->hasNotebook()) {
-        say(QStringLiteral("strip: mode set to %1 page(s); it applies when a notebook is opened")
-                .arg(wanted));
-        return;
-    }
-
-    /// What is on screen is written before the document that holds it is torn down.
-    navigator->saveStripPages();
-
-    const int page = navigator->currentIndex();
-    say(QStringLiteral("strip: switching to %1, keeping page %2 open")
-            .arg(wanted > 1 ? QStringLiteral("a five-page strip") : QStringLiteral("one page"))
-            .arg(page + 1));
-
-    QTimer::singleShot(0, this, [this, page]() { rebuildForScope(page, 6); });
+    applyStripPages(pages,
+                    [this]() { updateStripAction(); },
+                    [this](int page) {
+                        QTimer::singleShot(0, this, [this, page]() { rebuildForScope(page, 6); });
+                    });
 }
 
 void PdfIoPlugin::slotOpenNotebook()
