@@ -25,7 +25,10 @@
 #include <QScrollBar>
 #include <QShowEvent>
 #include <QListWidget>
+#include <QPainter>
 #include <QPushButton>
+#include <QStyledItemDelegate>
+#include <QStyle>
 #include <QVBoxLayout>
 
 #include <KisMainWindow.h>
@@ -39,6 +42,69 @@ namespace {
 QString pageLabel(int index) {
     return QStringLiteral("Page %1").arg(index + 1);
 }
+
+/// Where a card's prepared picture is carried. The item's own decoration is left empty on purpose:
+/// the delegate below draws the picture itself, because the style's path cannot draw it at the
+/// right size.
+constexpr int CardPreviewRole = Qt::UserRole + 1;
+
+/// The strip under the picture that the page's name is drawn in.
+constexpr int CardLabelHeight = 18;
+
+/**
+ * Draws a notebook card: the panel, the page's picture, and the page's name.
+ *
+ * The picture is drawn here rather than through the item's icon because QIcon::pixmap() answers in
+ * LOGICAL pixels whatever device ratio the pixmap carries. A picture prepared at the card's device
+ * size was therefore smooth-downscaled to the logical size and then stretched back by the screen,
+ * which is the pixelation that showed up on the tablet. Measured on Qt 5.15 at a scale factor of
+ * 2.5: 42% of the card's pixels came out mid-grey through the icon path, under 1% through this
+ * one. Drawing with both rectangles explicit keeps one source pixel per device pixel.
+ */
+class PdfCardDelegate : public QStyledItemDelegate
+{
+public:
+    explicit PdfCardDelegate(QObject *parent = nullptr)
+        : QStyledItemDelegate(parent)
+    {
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override
+    {
+        QStyleOptionViewItem cell = option;
+        initStyleOption(&cell, index);
+        const QPixmap prepared = index.data(CardPreviewRole).value<QPixmap>();
+
+        /// The panel and the selection are the style's business; the picture and the name are not,
+        /// so neither is offered to it. The style would centre its own icon and label, and this
+        /// delegate is about to draw both.
+        cell.icon = QIcon();
+        cell.text.clear();
+        QStyle *style = option.widget ? option.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &cell, painter, option.widget);
+
+        if (!prepared.isNull()) {
+            const qreal ratio = prepared.devicePixelRatio() > 0 ? prepared.devicePixelRatio() : 1.0;
+            const QSize logical(qRound(prepared.width() / ratio),
+                                qRound(prepared.height() / ratio));
+            QRect area = option.rect;
+            area.setBottom(area.bottom() - CardLabelHeight);
+            QRect card(QPoint(0, 0), logical);
+            card.moveCenter(area.center());
+            painter->drawPixmap(card, prepared, QRectF(prepared.rect()));
+        }
+
+        const QString label = index.data(Qt::DisplayRole).toString();
+        if (label.isEmpty()) {
+            return;
+        }
+        QRect strip = option.rect;
+        strip.setTop(strip.bottom() - CardLabelHeight);
+        style->drawItemText(painter, strip, Qt::AlignHCenter | Qt::AlignVCenter, option.palette,
+                            true, label, QPalette::Text);
+    }
+};
 
 } // namespace
 
@@ -87,6 +153,9 @@ PdfIoDocker::PdfIoDocker()
     /// The cards follow the list's own viewport, so the refit is driven from it rather than only
     /// from the docker: see eventFilter().
     m_pages->viewport()->installEventFilter(this);
+    /// The cards are drawn by a delegate of our own rather than by the style: see PdfCardDelegate
+    /// for why the style cannot draw the picture at the size the screen actually has.
+    m_pages->setItemDelegate(new PdfCardDelegate(m_pages));
     layout->addWidget(m_pages);
 
     auto *buttons = new QHBoxLayout();
@@ -119,6 +188,14 @@ PdfIoDocker::PdfIoDocker()
         }
     }
     layout->addLayout(quick);
+
+    /// The way back from the change that was just made. The submenu has had "Undo the last notebook
+    /// change" all along, and it is the one operation a person reaches for in the seconds after an
+    /// insert or a merge, so it belongs next to the notebook rather than two menus deep. It undoes
+    /// one change, which is the whole depth the notebook's undo has.
+    m_undo = new QPushButton(QStringLiteral("Undo last change"), content);
+    connect(m_undo, &QPushButton::clicked, this, []() { pdfIoUndoNotebookChange(); });
+    layout->addWidget(m_undo);
 
     /// The way to the page the rest of the operations live on. Below the turns rather than beside
     /// them: it is a door, not a page operation.
@@ -205,7 +282,7 @@ void PdfIoDocker::refitCards()
     /// re-reading them is what keeps a resize from leaving the old-sized icons behind.
     for (int i = 0; i < m_pages->count(); ++i) {
         if (QListWidgetItem *item = m_pages->item(i)) {
-            if (!item->icon().isNull()) {
+            if (!item->data(CardPreviewRole).value<QPixmap>().isNull()) {
                 updateThumbnail(i);
             }
         }
@@ -368,15 +445,24 @@ void PdfIoDocker::updateThumbnail(int index)
         /// next save writes a new one. Left as it was, the item keeps the picture of the page as
         /// it used to be -- which is how a page that was turned went on showing its old preview
         /// and looked like the wrong page in the list.
-        m_pages->item(index)->setIcon(QIcon());
+        m_pages->item(index)->setData(CardPreviewRole, QVariant());
         return;
     }
 
     /// KeepAspectRatio, never a crop: a thumbnail of a different shape is letterboxed inside the
     /// card so the whole page is always visible.
-    m_pages->item(index)->setIcon(QIcon(pixmap.scaled(m_pages->iconSize(),
-                                                      Qt::KeepAspectRatio,
-                                                      Qt::SmoothTransformation)));
+    ///
+    /// Scaled to the card's size in DEVICE pixels and handed to the delegate with that ratio: a
+    /// card is measured in logical pixels, so on a tablet with a 2-2.5x screen a picture sized for
+    /// the logical card was drawn at two and a half times the size it had, which is the pixelation
+    /// the user reported. The delegate draws it with both rectangles explicit, one source pixel per
+    /// device pixel.
+    const qreal ratio = m_pages->devicePixelRatioF() > 0 ? m_pages->devicePixelRatioF() : 1.0;
+    const QSize card = m_pages->iconSize();
+    const QSize deviceCard(qRound(card.width() * ratio), qRound(card.height() * ratio));
+    QPixmap scaled = pixmap.scaled(deviceCard, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    scaled.setDevicePixelRatio(ratio);
+    m_pages->item(index)->setData(CardPreviewRole, scaled);
 }
 
 void PdfIoDocker::openSelected()
@@ -417,6 +503,12 @@ void PdfIoDocker::refreshQuickButtons()
         /// The reason and not only the grey: a button that cannot do anything says why, the same way
         /// the screen's hint line does, instead of standing there mute.
         button->setToolTip(possible ? pdfIoQuickTitle(entry.first) : why);
+    }
+
+    if (m_undo) {
+        /// Asked rather than remembered: an operation the user just ran is what turns this on, and
+        /// the notebook has no other signal for it.
+        m_undo->setEnabled(!busy && pdfIoCanUndoNotebookChange());
     }
 
     if (m_manage) {

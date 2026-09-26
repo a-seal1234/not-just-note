@@ -3,11 +3,13 @@
  */
 #include "PdfNotebookOpsDialog.h"
 
+#include "PdfPageNavigator.h"
 #include "session/PdfSession.h"
 
 #include <KLocalizedString>
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QEvent>
@@ -22,6 +24,8 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QSizePolicy>
+#include <QStyle>
+#include <QStyledItemDelegate>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTimer>
@@ -48,6 +52,10 @@ enum Column {
 
 /// How far sideways a swipe has to go before it is a turn rather than a slipped click.
 constexpr int SwipeTurnPixels = 60;
+
+/// Where a card's prepared pixmap is kept on its table item, so the delegate that draws it needs
+/// nothing from the dialog.
+constexpr int CardPixmapRole = Qt::UserRole + 1;
 
 /// How long a press has to stay put before it becomes a grab. Half a second is the gesture everyone
 /// already knows from a tablet, and it is long enough that a swipe -- which moves at once -- can
@@ -171,6 +179,25 @@ QList<QPointF> liveTouchPositions(const QTouchEvent *event)
 
 } // namespace
 
+QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, qreal devicePixelRatio)
+{
+    if (source.isNull() || logicalSize.isEmpty()) {
+        return QPixmap();
+    }
+
+    const qreal ratio = devicePixelRatio > 0 ? devicePixelRatio : 1.0;
+    const QSize deviceSize(qMax(1, qRound(logicalSize.width() * ratio)),
+                           qMax(1, qRound(logicalSize.height() * ratio)));
+
+    /// IgnoreAspectRatio because the caller passes the box it is about to draw into, already fitted
+    /// to the sheet's own shape -- the canvas works it out from the turned page's bounding box, the
+    /// card from the icon size. Smooth because this is a picture of text, and a nearest-neighbour
+    /// scale of one is a page of broken letters.
+    QPixmap prepared = source.scaled(deviceSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    prepared.setDevicePixelRatio(ratio);
+    return prepared;
+}
+
 /**
  * The preview pane: the selected page, large, and turned by hand.
  *
@@ -192,6 +219,12 @@ QList<QPointF> liveTouchPositions(const QTouchEvent *event)
  * What is drawn is the preview the dialog read, turned by the difference between the turn it was
  * drawn at and the turn the screen is holding. A page with no preview stands in as an empty sheet of
  * its own proportions, so a page can still be turned before it has ever been saved.
+ *
+ * The picture is prepared for the pane at the screen's own device pixel ratio, so the pane is drawn
+ * from the pixels it will put on the glass rather than from a small file stretched by the painter.
+ * When that still asks for more pixels than the row's preview holds -- a saved preview is 180x256
+ * for an A4 page, and a 3K tablet's pane is several times that -- the widget says so through \c
+ * needsPreview rather than stretching: the dialog asks the navigator for a fresh one.
  */
 class PdfPageCanvas : public QWidget
 {
@@ -212,6 +245,18 @@ public:
     /// The whole-degree angle the gesture ended on. This is ONE pending edit, exactly as a button's
     /// turn is, so one drag from 0 to 37 degrees is one change when Apply runs.
     std::function<void(int)> turned;
+
+    /// The DEVICE pixels the pane has just prepared its picture for, reported while painting. The
+    /// dialog compares them with what the row's preview holds and asks the navigator for a fresh one
+    /// when the picture would otherwise be stretched.
+    std::function<void(const QSize &)> needsPreview;
+
+    /// Whether a turn is in flight. The dialog leaves the canvas alone meanwhile: a preview that
+    /// arrived mid-gesture would move the page under the hand.
+    bool isTurning() const { return m_gesture; }
+    /// The pixels prepared for the last paint (device pixels), and what the row's preview held.
+    QPixmap preparedPreview() const { return m_prepared; }
+    QSize sourcePixels() const { return m_sourcePixels; }
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -240,6 +285,11 @@ private:
     int m_previewRotation = 0;
     int m_rotation = 0;
     QSizeF m_pageSizePt;
+
+    /// What the last paint prepared and drew, kept so the dialog can be told what was drawn: the
+    /// pixels in DEVICE units, and the pixels the row's own preview had to make them from.
+    QPixmap m_prepared;
+    QSize m_sourcePixels;
 
     /// A turn in progress, either a drag or a two-finger twist. While it is set, m_rotation is a
     /// preview and no record has been touched.
@@ -287,6 +337,8 @@ void PdfPageCanvas::clearPage()
     m_previewRotation = 0;
     m_rotation = 0;
     m_pageSizePt = QSizeF();
+    m_prepared = QPixmap();
+    m_sourcePixels = QSize();
     m_gesture = false;
     m_twisting = false;
     update();
@@ -371,6 +423,24 @@ void PdfPageCanvas::paintEvent(QPaintEvent *event)
     const QSizeF drawn(sheet.width() * scale, sheet.height() * scale);
     const QRectF target(-drawn.width() / 2, -drawn.height() / 2, drawn.width(), drawn.height());
 
+    /// Prepared at the size the pane is about to paint it at, in DEVICE pixels, and tagged with the
+    /// ratio: Qt then puts those pixels on the glass one for one instead of stretching a small
+    /// picture by the screen's ratio inside the painter.
+    const qreal ratio = devicePixelRatioF() > 0 ? devicePixelRatioF() : 1.0;
+    const QSize logical(qMax(1, qRound(drawn.width())), qMax(1, qRound(drawn.height())));
+    const QSize deviceNeed(qMax(1, qRound(logical.width() * ratio)),
+                           qMax(1, qRound(logical.height() * ratio)));
+
+    m_sourcePixels = m_preview.size();
+    m_prepared = pdfioPreviewForDisplay(m_preview, logical, ratio);
+
+    /// The pane has just worked out how many device pixels it is about to draw. The dialog hears
+    /// that and asks the navigator for a fresh preview when the row's own cannot fill it; a pane
+    /// that asked again on every repaint would hammer the navigator, so it only ever asks.
+    if (needsPreview) {
+        needsPreview(deviceNeed);
+    }
+
     painter.translate(QRectF(rect()).center());
     painter.rotate(turn);
 
@@ -383,10 +453,12 @@ void PdfPageCanvas::paintEvent(QPaintEvent *event)
         return;
     }
 
-    const QPixmap fitted = m_preview.scaled(QSize(qMax(1, qRound(drawn.width())),
-                                                 qMax(1, qRound(drawn.height()))),
-                                           Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-    painter.drawPixmap(target.topLeft(), fitted);
+    /// The whole source onto the whole target, explicitly: the target is in logical coordinates
+    /// and the pixmap holds target * ratio device pixels, so the painter's own device transform is
+    /// what maps one to the other -- one source pixel per device pixel, and no second scaling by
+    /// the pixmap's ratio tag. The three-argument form because QPainter has no (QRectF, QPixmap)
+    /// overload, and toRect() would throw the pane's fractional position away.
+    painter.drawPixmap(target, m_prepared, QRectF(m_prepared.rect()));
 }
 
 void PdfPageCanvas::mousePressEvent(QMouseEvent *event)
@@ -576,6 +648,60 @@ private:
     int m_line = -1;
 };
 
+/**
+ * Draws a page card from the pixels this screen prepared for it.
+ *
+ * The style's own icon drawing cannot be used for this, and that is measured rather than assumed
+ * (Qt 5.15, an offscreen table at a 2.5 device ratio, the same one-pixel pattern in two cards):
+ *
+ *  - a card prepared at 115x155 DEVICE pixels and tagged 2.5 -- logical 46x62, exactly what the box
+ *    is drawn at -- came out through the style as 42% mid-grey pixels: the delegate asks QIcon for
+ *    the icon at the LOGICAL size, QIcon answers in logical pixels, and the ratio tag is lost on the
+ *    way, so the picture was smoothed down to 46x62 and stretched again by the screen;
+ *  - the same pixels drawn here came out with under 1% mid-grey: the whole source rect onto the
+ *    logical card rect, with the painter already carrying the screen's ratio, maps one device pixel
+ *    to one device pixel.
+ *
+ * The row itself -- background, selection, the struck-through words of a page marked for deletion --
+ * is still the style's; only the picture is drawn here.
+ */
+class PdfPreviewDelegate : public QStyledItemDelegate
+{
+public:
+    explicit PdfPreviewDelegate(QObject *parent = nullptr)
+        : QStyledItemDelegate(parent)
+    {
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override
+    {
+        if (index.column() != ThumbnailColumn) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
+        }
+
+        QStyleOptionViewItem cell = option;
+        initStyleOption(&cell, index);
+        const QPixmap prepared = index.data(CardPixmapRole).value<QPixmap>();
+
+        /// The picture is this delegate's business, not the style's.
+        cell.icon = QIcon();
+        QStyle *style = option.widget ? option.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &cell, painter, option.widget);
+
+        if (prepared.isNull()) {
+            return;
+        }
+
+        const qreal ratio = prepared.devicePixelRatio() > 0 ? prepared.devicePixelRatio() : 1.0;
+        const QSize logical(qRound(prepared.width() / ratio), qRound(prepared.height() / ratio));
+        QRect card(0, 0, logical.width(), logical.height());
+        card.moveCenter(option.rect.center());
+        painter->drawPixmap(card, prepared, QRectF(prepared.rect()));
+    }
+};
+
 PdfNotebookOpsDialog::PdfNotebookOpsDialog(const QString &projectDir,
                                            const PdfSessionManifest &manifest, int anchorPage,
                                            QWidget *parent)
@@ -625,6 +751,9 @@ void PdfNotebookOpsDialog::buildUi()
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->setMinimumWidth(560);
+    /// The card is drawn by a delegate of this screen's own, not by the style's icon drawing: see
+    /// PdfPreviewDelegate for the measurement behind that.
+    m_table->setItemDelegate(new PdfPreviewDelegate(m_table));
     connect(m_table, &QTableWidget::itemSelectionChanged, this, [this]() { refreshFooter(); });
     /// On the viewport rather than on the table: the viewport is the widget the press, the moves
     /// and the release actually arrive at, and it sees them before the view turns them into a
@@ -653,6 +782,14 @@ void PdfNotebookOpsDialog::buildUi()
         }
     };
     m_canvas->turned = [this](int degrees) { setSelectedTurn(degrees); };
+    /// What the pane is about to draw, in device pixels. When the row's own preview has fewer pixels
+    /// than that, the navigator is asked for a fresh one rather than the small one stretched.
+    m_canvas->needsPreview = [this](const QSize &devicePixels) {
+        const int row = m_table->currentRow();
+        if (row >= 0 && row < m_rows.size()) {
+            requestPreviewIfTooSmall(m_rows[row], devicePixels);
+        }
+    };
     preview->addWidget(m_canvas, 1);
     m_angle = new QLabel(this);
     m_angle->setObjectName(QStringLiteral("pdfio_ops_angle"));
@@ -722,6 +859,12 @@ void PdfNotebookOpsDialog::buildUi()
     connect(m_apply, &QPushButton::clicked, this, &QDialog::accept);
     layout->addWidget(box);
 
+    /// The navigator writes a preview in the background and says so when it lands; that is when a
+    /// row that asked for one takes the new pixels. Connected here, once everything the handler
+    /// touches exists.
+    connect(PdfPageNavigator::instance(), &PdfPageNavigator::thumbnailReady, this,
+            [this](int index) { adoptFreshPreview(index); });
+
     resize(1180, 720);
 }
 
@@ -737,17 +880,14 @@ void PdfNotebookOpsDialog::refresh()
             ++position;
         }
 
-        /// The row's card shows the page as the change would leave it: the preview that was read,
-        /// turned by the difference the screen is holding on top of the turn it was drawn at. The
-        /// pixels are kept in the row rather than read from the record's thumbFile because a turn
-        /// drops that stale name, and the list must not go blank exactly where a page is turned.
+        /// The row's card shows the page as the change would leave it, at the pixels the screen
+        /// will draw it with. The pixels are kept in the row rather than read from the record's
+        /// thumbFile because a turn drops that stale name, and the list must not go blank exactly
+        /// where a page is turned.
         auto *thumbnail = new QTableWidgetItem;
         loadPreview(row);
-        if (!row.preview.isNull()) {
-            thumbnail->setIcon(QIcon(turnedPixmap(row.preview,
-                                                  row.record.extraRotation - row.previewRotation)));
-        }
         m_table->setItem(i, ThumbnailColumn, thumbnail);
+        applyCardIcon(i);
 
         const auto cell = [this, i, &row](Column column, const QString &text) {
             auto *item = new QTableWidgetItem(text);
@@ -1180,6 +1320,157 @@ void PdfNotebookOpsDialog::refreshCanvas()
     m_canvas->setPage(selected.preview, selected.previewRotation, selected.record.extraRotation,
                       selected.record.sizePt);
     m_angle->setText(i18n("Turn: %1", turnLabel(selected.record.extraRotation)));
+}
+
+PdfNotebookOpsDialog::PreparedPreview PdfNotebookOpsDialog::cardPreview(int row) const
+{
+    PreparedPreview prepared;
+    if (!m_table || row < 0 || row >= m_rows.size()) {
+        return prepared;
+    }
+
+    const Row &card = m_rows.at(row);
+    if (card.preview.isNull()) {
+        return prepared;
+    }
+
+    /// Turned first, then fitted: a quarter turn swaps the page's sides, so the box the card is
+    /// drawn in is the turned one and not the one it had before.
+    const QPixmap turned = turnedPixmap(card.preview,
+                                        card.record.extraRotation - card.previewRotation);
+    const QSize fitted = turned.size().scaled(m_table->iconSize(), Qt::KeepAspectRatio);
+    const qreal ratio = m_table->devicePixelRatioF() > 0 ? m_table->devicePixelRatioF() : 1.0;
+
+    prepared.sourcePixels = card.preview.size();
+    prepared.logicalSize = fitted;
+    prepared.pixmap = pdfioPreviewForDisplay(turned, fitted, ratio);
+    prepared.devicePixelRatio = ratio;
+    return prepared;
+}
+
+PdfNotebookOpsDialog::PreparedPreview PdfNotebookOpsDialog::canvasPreview() const
+{
+    PreparedPreview prepared;
+    if (!m_canvas) {
+        return prepared;
+    }
+
+    prepared.pixmap = m_canvas->preparedPreview();
+    prepared.sourcePixels = m_canvas->sourcePixels();
+    prepared.devicePixelRatio = prepared.pixmap.isNull() ? 1.0 : prepared.pixmap.devicePixelRatio();
+    if (!prepared.pixmap.isNull()) {
+        const qreal ratio = prepared.devicePixelRatio > 0 ? prepared.devicePixelRatio : 1.0;
+        prepared.logicalSize = QSize(qRound(prepared.pixmap.width() / ratio),
+                                     qRound(prepared.pixmap.height() / ratio));
+    }
+    return prepared;
+}
+
+void PdfNotebookOpsDialog::applyCardIcon(int row)
+{
+    if (!m_table || row < 0 || row >= m_rows.size()) {
+        return;
+    }
+
+    QTableWidgetItem *item = m_table->item(row, ThumbnailColumn);
+    if (!item) {
+        return;
+    }
+
+    const PreparedPreview card = cardPreview(row);
+    /// The prepared pixels are what the delegate draws. The icon is kept as well, so the item still
+    /// carries a decoration for anything that reads one -- the style never draws it, the delegate
+    /// does.
+    item->setData(CardPixmapRole, QVariant::fromValue(card.pixmap));
+    item->setIcon(card.pixmap.isNull() ? QIcon() : QIcon(card.pixmap));
+}
+
+int PdfNotebookOpsDialog::navigatorIndexFor(const PdfPageRecord &record) const
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook() || record.kraFile.isEmpty()) {
+        return -1;
+    }
+
+    /// The same project, or nothing: a preview is written into the notebook it belongs to, and a
+    /// screen showing another one must not cause a write there.
+    if (QFileInfo(navigator->projectDir()).absoluteFilePath()
+        != QFileInfo(m_projectDir).absoluteFilePath()) {
+        return -1;
+    }
+
+    const QList<PdfPageRecord> &pages = navigator->manifest().pages;
+    for (int i = 0; i < pages.size(); ++i) {
+        if (pages.at(i).kraFile == record.kraFile) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void PdfNotebookOpsDialog::requestPreviewIfTooSmall(Row &row, const QSize &devicePixels)
+{
+    if (row.previewRequested || row.record.thumbFile.isEmpty() || devicePixels.isEmpty()) {
+        return;
+    }
+
+    const bool enough = !row.preview.isNull() && row.preview.width() >= devicePixels.width()
+        && row.preview.height() >= devicePixels.height();
+    if (enough) {
+        return;
+    }
+
+    const int index = navigatorIndexFor(row.record);
+    if (index < 0) {
+        /// A page this change brought in -- an insertion, a merge, a duplicate -- has no page in the
+        /// navigator's notebook to ask about. Its own preview is what it has.
+        return;
+    }
+
+    /// Asked once per row: a preview that is still small after the ask would otherwise be asked for
+    /// again on every repaint.
+    row.previewRequested = true;
+    PdfPageNavigator::instance()->ensureThumbnail(index);
+}
+
+void PdfNotebookOpsDialog::adoptFreshPreview(int navigatorIndex)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook() || navigatorIndex < 0
+        || navigatorIndex >= m_original.pages.size()) {
+        return;
+    }
+    if (QFileInfo(navigator->projectDir()).absoluteFilePath()
+        != QFileInfo(m_projectDir).absoluteFilePath()) {
+        return;
+    }
+
+    /// The file the navigator has just written, and the turn it was made at: the notebook's own
+    /// committed turn, not the one this screen is holding on top of it.
+    const PdfPageRecord &page = m_original.pages.at(navigatorIndex);
+
+    for (int i = 0; i < m_rows.size(); ++i) {
+        Row &row = m_rows[i];
+        if (!row.previewRequested || row.record.kraFile != page.kraFile) {
+            continue;
+        }
+
+        const QPixmap fresh(QDir(row.fromDir).filePath(page.thumbFile));
+        if (fresh.isNull()) {
+            continue;
+        }
+
+        row.preview = fresh;
+        row.previewRotation = page.extraRotation;
+        applyCardIcon(i);
+
+        /// A preview that arrived while the hand is turning the page would move it under the hand;
+        /// the pane takes the new pixels when the turn is done.
+        if (m_canvas && m_table->currentRow() == i && !m_canvas->isTurning()) {
+            m_canvas->setPage(row.preview, row.previewRotation, row.record.extraRotation,
+                              row.record.sizePt);
+        }
+    }
 }
 
 bool PdfNotebookOpsDialog::eventFilter(QObject *watched, QEvent *event)

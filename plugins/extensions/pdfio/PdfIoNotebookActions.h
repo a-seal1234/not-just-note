@@ -37,4 +37,17 @@ void runPdfIoQuickAction(PdfNotebookQuicks::Action action);
 /// Opens the Notebook ops screen for the notebook that is open, and says so when there is none.
 void openPdfIoNotebookOpsScreen();
 
+/**
+ * Whether there is a notebook change to undo right now.
+ *
+ * The notebook's undo is one change deep by design: an operation closes the page it was made on, so
+ * it is its own unit and "undo" means the last one. Asked here so the panel's button and the
+ * submenu entry are enabled by the same question.
+ */
+bool pdfIoCanUndoNotebookChange();
+
+/// Undoes the last notebook change, through the same gate as every other operation: the open pages
+/// are written first, and the notebook is reloaded onto the page the undo answers with.
+void pdfIoUndoNotebookChange();
+
 #endif // PDFIONOTEBOOKACTIONS_H

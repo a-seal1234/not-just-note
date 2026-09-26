@@ -1786,6 +1786,22 @@ void openPdfIoNotebookOpsScreen()
     openNotebookOpsScreen(nullptr);
 }
 
+bool pdfIoCanUndoNotebookChange()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    return navigator->hasNotebook() && PdfNotebookOps::canUndo(navigator->projectDir());
+}
+
+void pdfIoUndoNotebookChange()
+{
+    /// One change deep, which is what the notebook's undo has always been: an operation closes the
+    /// page it was made on, so it is its own unit of undo, and this is that unit. Inserting pages
+    /// and merging a notebook are operations like any other, so both come back whole.
+    applyNotebookOperation(i18n("Undo the last notebook change"), [](const QString &dir, int) {
+        return PdfNotebookOps::undoLast(dir);
+    });
+}
+
 void PdfIoPlugin::slotInsertPages()
 {
     PdfPageNavigator *navigator = PdfPageNavigator::instance();

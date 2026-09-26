@@ -30,6 +30,24 @@ class PdfPageCanvas;
 class PdfRowDropIndicator;
 
 /**
+ * \a source prepared for a widget that draws it into \a logicalSize at \a devicePixelRatio.
+ *
+ * A saved preview is small: an A4 page's is 180x256 pixels. A card is 46x62 LOGICAL pixels, which on
+ * a 2-2.5x tablet is 115x155 DEVICE pixels -- and handing Qt the 180-pixel picture for a 46-pixel
+ * box, to be stretched by the screen's ratio in the painter, is what made the thumbnails look
+ * pixelated. The scale is done here instead, to the device size, and the result is TAGGED with the
+ * ratio, so Qt draws the pixels it was given, one for one, rather than stretching them again.
+ *
+ * The scale is smooth: a turned page has already been resampled once by the time it arrives, and
+ * resampling it again with a nearest filter is what turns an edge into a staircase.
+ *
+ * The result is \a logicalSize * \a devicePixelRatio device pixels, whatever the source held. Whether
+ * the source had enough pixels to fill that is the caller's business: the canvas asks the navigator
+ * for a fresh preview when it has not (see PdfNotebookOpsDialog::PreparedPreview).
+ */
+QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, qreal devicePixelRatio);
+
+/**
  * The Notebook ops screen: the notebook's pages as one list, worked on as a whole.
  *
  * The menu entries act on the page that is open, one operation at a time. This screen shows every
@@ -57,6 +75,13 @@ class PdfRowDropIndicator;
  * number under it turn and nothing else does -- and it lands as ONE pending edit on release, so one
  * drag is one change and one undo takes the whole turn back. The row's own preview is turned on
  * screen with it, rather than only described.
+ *
+ * Both the card and the canvas scale their preview to the pixels the screen will actually draw --
+ * the size times the screen's device pixel ratio, tagged with that ratio -- because on a
+ * high-density tablet the picture was being handed to Qt at a third of the size it was painted at.
+ * When the row's preview still has fewer pixels than the canvas is about to draw, the page is asked
+ * for again from the navigator rather than stretched, and the new preview is taken in when it
+ * arrives.
  */
 class PdfNotebookOpsDialog : public QDialog
 {
@@ -115,6 +140,32 @@ public:
     };
     void setNotebookMerger(const NotebookMerger &merger);
 
+    /**
+     * A preview as the screen draws it: the pixels prepared for the screen, what the row's own
+     * preview held, and the ratio the prepared pixmap carries.
+     *
+     * Public because the two things that make a preview crisp -- that it is prepared at the size the
+     * screen will draw it at rather than at the size of the file, and that it is tagged with the
+     * screen's device pixel ratio so Qt does not stretch it again -- are facts a test can check and
+     * an eye cannot. "It looks sharper" is not a test, and this is.
+     */
+    struct PreparedPreview {
+        /// The pixels as prepared: \c pixmap.size() is the drawn size in DEVICE pixels.
+        QPixmap pixmap;
+        /// The size the pixmap is drawn at, in logical pixels: \c pixmap.size() is this times
+        /// \c devicePixelRatio, and the ratio is what keeps Qt from scaling it a second time.
+        QSize logicalSize;
+        /// What the row's preview held. Smaller than \c pixmap on a high-density screen, which is
+        /// exactly the case the canvas asks the navigator about.
+        QSize sourcePixels;
+        qreal devicePixelRatio = 1.0;
+    };
+    /// The card for page \a row as it is drawn: prepared for the table's icon size at its ratio.
+    PreparedPreview cardPreview(int row) const;
+    /// The canvas's own preview: prepared for the pane it is drawn in, at its ratio. Empty until the
+    /// canvas has painted, so ask it to paint (QWidget::grab) before reading.
+    PreparedPreview canvasPreview() const;
+
 private:
     struct Row {
         PdfPageRecord record;
@@ -133,6 +184,9 @@ private:
         /// The turn \c preview was drawn at, so what is drawn on top of it is the difference this
         /// screen is holding rather than the whole turn a second time.
         int previewRotation = 0;
+        /// A fresh preview of this page has been asked of the navigator. Asked once: a preview that
+        /// is still small after the ask is not asked for again on every repaint.
+        bool previewRequested = false;
         /// The user dropped it: still listed, struck through, until Apply or Cancel.
         bool removed = false;
         /// It did not exist when the screen opened.
@@ -183,6 +237,19 @@ private:
     /// Reads the row's preview into memory, once, when the file is there. A row that already has one,
     /// or whose record names no preview at all, is left alone.
     void loadPreview(Row &row);
+    /// Puts the row's card on the table: the preview prepared for the icon size at the table's
+    /// device pixel ratio, turned by whatever this screen is holding on top of it.
+    void applyCardIcon(int row);
+    /// The navigator's page index for \a record, or -1 when the navigator has no notebook open or a
+    /// different one -- so a preview is never asked of, or written into, the wrong project.
+    int navigatorIndexFor(const PdfPageRecord &record) const;
+    /// Asks the navigator for a fresh preview of the row's page when the row's own preview has fewer
+    /// pixels than \a devicePixels, which is the size the canvas is about to draw at. Asked once per
+    /// row; the answer arrives through adoptFreshPreview().
+    void requestPreviewIfTooSmall(Row &row, const QSize &devicePixels);
+    /// The navigator has a preview for its page \a navigatorIndex: the rows showing that page take
+    /// the new pixels, because the ones they hold are what it held before.
+    void adoptFreshPreview(int navigatorIndex);
     /// Puts the selected page on the canvas, with the turn it already carries and the turn this
     /// screen is holding, and writes the angle in the readout beside it. Called whenever the
     /// selection or the pending turn changes, so the two can never disagree.
