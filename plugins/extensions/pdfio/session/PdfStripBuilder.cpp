@@ -230,8 +230,13 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
 
             layer->paintDevice()->convertFromQImage(entry.second, nullptr,
                                                     slot.rect.x(), slot.rect.y());
+            /// The artifact and the directory, not only the page: an ink restore that read another
+            /// notebook's file has to be visible in one line, and the slot's own size next to it
+            /// says whether the pixels could even be this notebook's.
             qWarning() << "[pdfio] strip: page" << (slot.page + 1) << "restored layer"
-                       << entry.first << entry.second.size() << "at" << slot.rect.topLeft();
+                       << entry.first << entry.second.size() << "at" << slot.rect.topLeft()
+                       << "from" << kraPath << "in" << projectDir
+                       << "on a page" << slot.rect.size();
         }
     }
 

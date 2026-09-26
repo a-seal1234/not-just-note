@@ -889,9 +889,11 @@ void extractPageRange()
     }
 
     /// The open pages are written first, exactly as every other operation does, so the range that
-    /// is read off the manifest is the one that is on screen.
+    /// is read off the manifest is the one that is on screen. The refusal names the page that could
+    /// not be written and what the writer said, in the log and to the user.
     QString why;
     if (!navigator->prepareForNotebookChange(&why)) {
+        say(QStringLiteral("extract refused before it started: %1").arg(why));
         QMessageBox::warning(nullptr, i18n("Extract a page range"),
                              i18n("The notebook could not be written, so nothing was extracted: %1",
                                   why));
@@ -1469,15 +1471,14 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
         return;
     }
 
+    /// NO WRITE GATE BEFORE SHOWING THE SCREEN, deliberately.
+    ///
+    /// The screen changes nothing until Apply, and the manifest it lists the pages from does not
+    /// depend on the ink at all. A preflight save before merely SHOWING it is what refused to open
+    /// the screen after an import -- "the notebook could not be written" -- so the user could not
+    /// reach a screen that had nothing to do with the write. The gate belongs where the change is
+    /// APPLIED: applyNotebookOperation() still runs it, and there it names the page and the reason.
     QString why;
-    if (!navigator->prepareForNotebookChange(&why)) {
-        say(QStringLiteral("the notebook ops screen was not opened: %1").arg(why));
-        QMessageBox::warning(nullptr, i18n("Notebook ops"),
-                             i18n("The notebook could not be written, so nothing was opened: %1",
-                                  why));
-        return;
-    }
-
     const PdfSessionManifest manifest = PdfSession::openProject(navigator->projectDir(), &why);
     if (!manifest.isValid(&why)) {
         say(QStringLiteral("the notebook ops screen could not read the notebook: %1").arg(why));
@@ -1510,8 +1511,9 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
     showNotebookOpsPage(dialog);
 
     if (dialog.result() != QDialog::Accepted) {
-        /// Cancel discards the pending page-list edits and removes any unpacked transport copy. It
-        /// does not undo the preflight save prepareForNotebookChange() performs before this screen.
+        /// Cancel discards the pending page-list edits and removes any unpacked transport copy.
+        /// Nothing was written for this screen to begin with: the write gate runs when Apply does,
+        /// in applyNotebookOperation(), and not before the screen is shown.
         if (!unpackedNotebook.isEmpty()) {
             QDir(unpackedNotebook).removeRecursively();
         }

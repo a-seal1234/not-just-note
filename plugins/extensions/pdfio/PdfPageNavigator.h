@@ -76,8 +76,12 @@ public:
      * The strip holds its ink in one layer, and which page a stroke belongs to is decided by the
      * rectangle it sits in -- so the cropping can be done whenever, for as many pages as are open,
      * rather than only for the page being left.
+     *
+     * \a why names the page that could not be written and what the writer said about it, because
+     * every caller that refuses an action on a false answer has to be able to tell the user which
+     * page and why -- "the notebook could not be written" on its own is a refusal nobody can act on.
      */
-    bool saveStripPages();
+    bool saveStripPages(QString *why = nullptr);
 
     /**
      * The document a page write starts from: \a page's own layers, cropped to the rectangle \a index
@@ -473,6 +477,16 @@ Q_SIGNALS:
 private:
     /// The half of reloadNotebook() that waits for the old view to go: see it for the contract.
     void finishReload();
+
+    /**
+     * Waits, bounded, for a reload that is already on its way in, and returns whether one is still
+     * pending. The event loop runs while it waits, because that is what lands the reload.
+     *
+     * A reload is not a failure of the open notebook: it is the same notebook, re-read after a page
+     * list changed. A gate that refuses ordinary work because a reload happened to be in the air is
+     * worse than the bug it exists to prevent, so prepareForNotebookChange() waits here first.
+     */
+    void waitForReloadToLand();
 
     /// Installs the window's save hook and sets its bound to the current scope, once. The page
     /// switch then cannot run without the policy in front of it.

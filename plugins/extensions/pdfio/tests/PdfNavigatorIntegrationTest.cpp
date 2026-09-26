@@ -185,6 +185,12 @@ private Q_SLOTS:
     /// source-renderer cache, keyed on the relative file name, used to hand back as the old one's.
     void testImportingWhileANotebookIsOpenReplacesIt();
 
+    /// A notebook that cannot be BUILT must not replace the one that is open: adoptNotebook() swaps
+    /// the manifest and directory before the build, and a build that fails used to leave the new
+    /// notebook's name and geometry over the old notebook's document -- ink that then went to the
+    /// wrong files.
+    void testANotebookThatCannotBeBuiltLeavesTheOpenOneInPlace();
+
 
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
@@ -4557,6 +4563,86 @@ void PdfNavigatorIntegrationTest::testImportingWhileANotebookIsOpenReplacesIt()
     QCOMPARE(navigator->projectDir(), dirA);
     QVERIFY(navigator->currentDocument());
     QCOMPARE(navigator->currentDocument()->property("pdfioProjectDir").toString(), dirA);
+}
+
+/**
+ * A notebook that cannot be BUILT must not replace the one that is open.
+ *
+ * adoptNotebook() swaps m_projectDir and m_manifest before showPage() builds the new strip, because
+ * the builder resolves every source and every artifact against them. When the build then FAILS, the
+ * old state was already gone: the tab, the docker and the ops screen read the NEW manifest, and every
+ * save resolves its file names against the NEW project directory, while the OLD document is still on
+ * the canvas. Its ink is then written through the new notebook's file names, and the next build of
+ * the new notebook restores it -- the reported "the old notebook's ink and its Inserted image drawn
+ * over the imported pages".
+ *
+ * This drives that failure deterministically: a notebook whose manifest is valid but whose source is
+ * NOT a PDF cannot render a page, so the build fails after the swap but before any document is made.
+ * The assertion is the invariant: the navigator still describes -- and still shows -- the notebook
+ * that was open, and that notebook still works.
+ *
+ * What it does not cover: the UI paths. openNotebookReplacing() and the ops screen are not in this
+ * binary; what is covered is the navigator contract every one of them rests on.
+ */
+void PdfNavigatorIntegrationTest::testANotebookThatCannotBeBuiltLeavesTheOpenOneInPlace()
+{
+    StripRestore restore;
+
+    const QString fixture = QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf");
+    QVERIFY2(QFileInfo::exists(fixture), "the fixture is missing");
+
+    const QString dirA = m_dir.filePath(QStringLiteral("adopt-keeps-a"));
+    const QString dirBad = m_dir.filePath(QStringLiteral("adopt-bad-source"));
+    QString why;
+
+    QVERIFY2(writeCollidingSourceNotebook(dirA, fixture, QStringLiteral("same-name.pdf"),
+                                          QStringLiteral("Notebook A"), { 0, 1, 2 },
+                                          { QSizeF(595, 842), QSizeF(420, 595), QSizeF(300, 300) },
+                                          &why), qPrintable(why));
+
+    /// A source file that is not a PDF at all: the manifest is valid, the renderer cannot open it.
+    const QString notAPdf = m_dir.filePath(QStringLiteral("not-a-pdf"));
+    {
+        QFile file(notAPdf);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QVERIFY(file.write("this is not a PDF\n") > 0);
+    }
+    QVERIFY2(writeCollidingSourceNotebook(dirBad, notAPdf, QStringLiteral("broken.pdf"),
+                                          QStringLiteral("Broken"), { 0 },
+                                          { QSizeF(595, 842) }, &why), qPrintable(why));
+
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    navigator->setScope(3);
+    QVERIFY2(navigator->openNotebookDir(dirA, &why), qPrintable(why));
+
+    KisDocument *const documentA = navigator->currentDocument();
+    QVERIFY(documentA);
+    const QString captionA = documentA->caption();
+    const int pagesA = navigator->manifest().pages.size();
+    QCOMPARE(navigator->projectDir(), dirA);
+    QCOMPARE(pagesA, 3);
+
+    /// The open fails on the source that cannot be rendered...
+    why.clear();
+    QVERIFY2(!navigator->openNotebookDir(dirBad, &why),
+             "a notebook whose source is not a PDF must not open");
+    QVERIFY2(!why.isEmpty(), "a failed open has to say why");
+
+    /// ...and NOTHING about the notebook that was open has moved. This is the invariant: the
+    /// navigator may never describe one notebook while showing another.
+    QCOMPARE(navigator->projectDir(), dirA);
+    QCOMPARE(navigator->manifest().displayName(), QStringLiteral("Notebook A"));
+    QCOMPARE(navigator->manifest().pages.size(), pagesA);
+    QVERIFY2(navigator->currentDocument() == documentA,
+             "the document that was open was replaced by a notebook that did not build");
+    QCOMPARE(navigator->currentDocument()->caption(), captionA);
+
+    /// And the notebook that is open still WORKS: its strip is the one the rollback put back, so a
+    /// turn to a page already in the window is the cheap unlock it always was.
+    navigator->setScope(3);
+    QVERIFY2(navigator->showPage(1, &why), qPrintable(why));
+    QCOMPARE(navigator->currentIndex(), 1);
+    QCOMPARE(navigator->projectDir(), dirA);
 }
 
 /**

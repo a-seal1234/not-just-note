@@ -1404,6 +1404,44 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
     /// work; the other finds the document clean and does nothing.
     hookApplicationQuitOnce();
 
+    /// AND NOTHING MAY STILL BE LANDING when the manifest below changes.
+    ///
+    /// A write computes the file it writes from m_projectDir + m_manifest at the moment its own
+    /// turn comes, not at the moment it was asked for. One requested for the OLD notebook and
+    /// started after the swap below would write the OLD document's pixels into the NEW project --
+    /// and its own page number, index and rectangle are the new notebook's, so the artifact that
+    /// comes back is the previous notebook's ink on the new notebook's page. Waiting for the queue
+    /// to empty before the swap is what makes every write belong to exactly one notebook.
+    {
+        QString drainWhy;
+        if (!drainWrites(&drainWhy)) {
+            /// Nothing to refuse: the queue is wedged and the swap cannot make it worse. The write
+            /// that never lands is named, and the checks below still hold.
+            say(QStringLiteral("adopting %1 with a write still in the air: %2").arg(projectDir, drainWhy));
+        }
+    }
+
+    /// Everything that describes the notebook being replaced, kept so a new notebook that cannot be
+    /// BUILT can be put back. The invariant is the one the report broke: the navigator may never
+    /// describe one notebook while showing another -- the tab, the docker and the ops screen all
+    /// read the manifest, and the ink restore and every save resolve their files against the project
+    /// directory, so a swap that is not followed by a document is a notebook's pixels served under
+    /// another notebook's geometry.
+    const QString previousDir = m_projectDir;
+    const PdfSessionManifest previousManifest = m_manifest;
+    const PdfPageWindow previousWindow = m_window;
+    const QList<int> previousStripPages = m_stripPages;
+    const QList<QRect> previousStripRects = m_stripRects;
+    const QList<QRect> previousStripCells = m_stripCells;
+    const QList<KisNodeSP> previousStripPaper = m_stripPaper;
+    const int previousActiveSlot = m_stripActiveSlot;
+    const int previousWindowSlot = m_windowSlot;
+    const QHash<int, qint64> previousSaveStamps = m_saveStamps;
+    const QList<int> previousThumbnailQueue = m_thumbnailQueue;
+    const qint64 previousInkChange = m_lastInkChange;
+    const qint64 previousAutoSave = m_lastAutoSave;
+    const bool hadOpenDocument = m_document && m_document->image();
+
     /// The new notebook starts with an empty window, and its counters describe one notebook rather
     /// than the whole process.
     m_window.clear();
@@ -1460,6 +1498,55 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
 
     const int anchor = qBound(0, anchorPage, manifest.pages.size() - 1);
     const bool shown = showPage(anchor, why);
+
+    /// THE SWAP IS NOT COMPLETE UNTIL THE DOCUMENT IS. showPage() below can refuse -- a page turn
+    /// already in progress, a source that cannot be rendered, a build that comes back empty -- and
+    /// when it does, the manifest and the project directory have already been replaced. That is the
+    /// mixed state: the imported notebook's name, page count and geometry in every reader (the tab,
+    /// the docker, the ops screen) and every path resolution, with the previous notebook's document
+    /// still on the canvas. Its ink is then saved through the NEW manifest's file names, and the
+    /// next build of the new notebook restores that ink onto the new pages -- the reported "old
+    /// notebook's ink and its Inserted image drawn over the imported pages".
+    ///
+    /// So a new notebook that cannot be built is put back. The document was never touched --
+    /// showPage refuses before showImage, or not at all -- and the notebook that was in force is
+    /// described again. The refusal is loud and the caller's open fails, which is the honest answer.
+    ///
+    /// The window and the strip bookkeeping go back only when their DOCUMENT is still there: a
+    /// caller that closed the old view first (the plugin's Import, "Open a notebook") leaves nothing
+    /// for them to describe, and restoring page rectangles for a document that is gone would be the
+    /// same class of lie this is fixing, the other way round.
+    if (!shown) {
+        m_projectDir = previousDir;
+        m_manifest = previousManifest;
+        if (hadOpenDocument) {
+            m_window = previousWindow;
+            m_stripPages = previousStripPages;
+            m_stripRects = previousStripRects;
+            m_stripCells = previousStripCells;
+            m_stripPaper = previousStripPaper;
+            m_stripActiveSlot = previousActiveSlot;
+            m_windowSlot = previousWindowSlot;
+            m_saveStamps = previousSaveStamps;
+            m_thumbnailQueue = previousThumbnailQueue;
+            m_lastInkChange = previousInkChange;
+            m_lastAutoSave = previousAutoSave;
+
+            /// pageChanged tells every reader which notebook is in force again -- the tab, the docker
+            /// and the recently-added list all get it from the navigator.
+            Q_EMIT pageChanged(m_index, pageCount(), QFileInfo(m_manifest.sourceFile).completeBaseName());
+        }
+
+        /// The renderers were cleared for the notebook that did NOT open. The one that is in force
+        /// gets its own back on demand -- same project directory, same relative names -- so nothing
+        /// needs restoring here; the cache is a cache.
+        say(QStringLiteral("the notebook at %1 was not adopted (%2); %3 is the notebook in force")
+                .arg(projectDir,
+                     why && !why->isEmpty() ? *why : QStringLiteral("no reason recorded"),
+                     m_manifest.displayName()));
+        return false;
+    }
+
     Q_EMIT pageChanged(m_index, pageCount(), label);
 
     /// Watched on a timer rather than from the canvas: panning arrives as wheel or touch events
@@ -1940,9 +2027,13 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             continue;
         }
 
+        /// The DIRECTORY and the full path are said, not only the page number: a restore that reads
+        /// another notebook's artifact is the report this line has to be able to answer, and
+        /// "page 2" alone cannot say which notebook's page 2 it was.
         const QString kraPath =
             QDir(m_projectDir).filePath(m_manifest.pages.at(slot.page).kraFile);
-        say(QStringLiteral("strip: reading the layers of page %1").arg(slot.page + 1));
+        say(QStringLiteral("strip: reading the layers of page %1 from %2")
+                .arg(slot.page + 1).arg(kraPath));
         pageLayers.insert(slot.page, PdfInkLoader::loadInkLayersFromSidecar(kraPath, nullptr));
         say(QStringLiteral("strip: page %1 came back with %2 layer(s)")
                 .arg(slot.page + 1)
@@ -3188,16 +3279,19 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
     return true;
 }
 
-bool PdfPageNavigator::saveStripPages()
+bool PdfPageNavigator::saveStripPages(QString *why)
 {
     if (m_stripPages.isEmpty()) {
         /// A document holding one page has nothing to crop; the usual save is the whole of it --
         /// and through the queue, so this save cannot start while an idle write is still in the
         /// air (two in the air is the wedge, and this action is exactly the one a user reaches
         /// for while the idle write may be running).
-        QString why;
-        if (!saveThroughQueue(m_index, &why)) {
-            say(QStringLiteral("could not save the page: %1").arg(why));
+        QString saveWhy;
+        if (!saveThroughQueue(m_index, &saveWhy)) {
+            say(QStringLiteral("could not save the page: %1").arg(saveWhy));
+            if (why) {
+                *why = QStringLiteral("page %1: %2").arg(m_index + 1).arg(saveWhy);
+            }
             return false;
         }
         return true;
@@ -3226,9 +3320,12 @@ bool PdfPageNavigator::saveStripPages()
     m_savingPages = true;
     bool ok = true;
     for (int page : pages) {
-        QString why;
-        if (!savePageAndWait(page, &why)) {
-            say(QStringLiteral("could not save page %1 (%2)").arg(page + 1).arg(why));
+        QString saveWhy;
+        if (!savePageAndWait(page, &saveWhy)) {
+            say(QStringLiteral("could not save page %1 (%2)").arg(page + 1).arg(saveWhy));
+            if (why) {
+                *why = QStringLiteral("page %1: %2").arg(page + 1).arg(saveWhy);
+            }
             ok = false;
             break;
         }
@@ -3380,19 +3477,32 @@ bool PdfPageNavigator::prepareForNotebookChange(QString *why)
         fail(why, QStringLiteral("no notebook is open"));
         return false;
     }
+
+    /// A reload on its way in is BENIGN: it is this same notebook re-read, and it lands in a
+    /// moment. Wait for it rather than refuse the work that is asking.
     if (m_reloadPending) {
-        fail(why, QStringLiteral("the notebook is already being reloaded"));
+        waitForReloadToLand();
+    }
+    if (m_reloadPending) {
+        fail(why, QStringLiteral("the notebook is being reloaded; try again in a moment"));
         return false;
     }
 
     /// The ink first, and waited for. Everything an operation does is decided by the manifest, and
     /// a page written after the manifest changed would be written against a page list that no
     /// longer describes the document in front of it.
-    if (!saveStripPages()) {
-        fail(why, QStringLiteral("the notebook could not be written, so nothing was changed"));
+    ///
+    /// The reason comes back with the page that failed: a refusal that says only "the notebook could
+    /// not be written" cannot be acted on by the user and cannot be diagnosed from the log.
+    QString saveWhy;
+    if (!saveStripPages(&saveWhy)) {
+        fail(why, saveWhy.isEmpty()
+                      ? QStringLiteral("the notebook could not be written, so nothing was changed")
+                      : QStringLiteral("the notebook could not be written: %1").arg(saveWhy));
         return false;
     }
 
+    /// A write already in the air is waited for, not refused: drainWrites() is the wait.
     QString drainWhy;
     if (!drainWrites(&drainWhy)) {
         fail(why, QStringLiteral("a page write was still in flight: %1").arg(drainWhy));
@@ -3459,6 +3569,16 @@ bool PdfPageNavigator::reloadNotebook(int anchorPage, QString *why)
     closeCurrentPage();
     QTimer::singleShot(ReloadSettleMs, this, &PdfPageNavigator::finishReload);
     return true;
+}
+
+void PdfPageNavigator::waitForReloadToLand()
+{
+    /// Bounded at two of the reload's own timers: a reload that has not landed by then is not on its
+    /// way in any more, and the caller refuses with a reason rather than spinning for ever.
+    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + 2 * ReloadSettleMs;
+    while (m_reloadPending && QDateTime::currentMSecsSinceEpoch() < deadline) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    }
 }
 
 void PdfPageNavigator::finishReload()
@@ -3673,6 +3793,29 @@ bool PdfPageNavigator::saveCurrentPage(QString *why, int index, std::function<vo
     /// The rectangle that page occupies in the strip. A document holding one page has none, and
     /// needs no cropping. Worked out in one place, so every writer of a page crops by the same one.
     const QRect pageArea = pageAreaFor(page);
+
+    /// A STRIP whose page rectangles are gone is not a document to write.
+    ///
+    /// Without a rectangle this writes the WHOLE image into one page's artifact -- every page, with
+    /// every page's ink, under one page's file name. That is the shape a notebook that was half
+    /// adopted leaves behind (the manifest swapped, the strip bookkeeping cleared, the old document
+    /// still up), and on the device it was a fifteen second export that timed out and then refused
+    /// every action behind the write gate. A single-page document is the other case of an invalid
+    /// rectangle, and it is fine: it has exactly one page background and the whole image IS the page.
+    if (!pageArea.isValid() && m_document && m_document->image()) {
+        int bands = 0;
+        for (quint32 i = 0; i < m_document->image()->root()->childCount(); ++i) {
+            if (PdfPageSaver::isPageBackground(m_document->image()->root()->at(i))) {
+                ++bands;
+            }
+        }
+        if (bands > 1) {
+            fail(why, QStringLiteral("the strip's page rectangles are gone, so page %1 cannot be "
+                                     "cropped out of it")
+                          .arg(page + 1));
+            return false;
+        }
+    }
 
     /// Which layers are written is PdfPageSaver's decision now: the page's own layers, every one of
     /// them, and never the render of the source page. It used to be decided here, by finding the
