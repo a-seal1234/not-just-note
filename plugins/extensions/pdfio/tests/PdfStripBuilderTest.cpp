@@ -132,50 +132,6 @@ private:
     }
 };
 
-namespace {
-
-/**
- * The rectangle the page's own pixels occupy inside \a layer, over \a band.
- *
- * A slot's layer holds the desk colour over the band it owns and the rendered page drawn into it,
- * so the layer's own bounds are that band and no longer the page -- there is no desk layer under
- * the papers any more. Scanning for everything that is not the desk colour is what says where the
- * page landed and how big it is, which is what the assertions below are about.
- */
-QRect pageRectInBand(KisPaintLayer *layer, const QRect &band)
-{
-    if (!layer) {
-        return QRect();
-    }
-    const QImage pixels = layer->paintDevice()->convertToQImage(0, band);
-    if (pixels.isNull()) {
-        return QRect();
-    }
-
-    int x0 = pixels.width();
-    int y0 = pixels.height();
-    int x1 = -1;
-    int y1 = -1;
-    for (int y = 0; y < pixels.height(); ++y) {
-        for (int x = 0; x < pixels.width(); ++x) {
-            const QColor at = pixels.pixelColor(x, y);
-            if (qAbs(at.red() - 96) <= 1 && qAbs(at.green() - 96) <= 1 && qAbs(at.blue() - 96) <= 1) {
-                continue;
-            }
-            x0 = qMin(x0, x);
-            y0 = qMin(y0, y);
-            x1 = qMax(x1, x);
-            y1 = qMax(y1, y);
-        }
-    }
-    if (x1 < 0) {
-        return QRect();
-    }
-    return QRect(band.topLeft() + QPoint(x0, y0), band.topLeft() + QPoint(x1, y1));
-}
-
-} // namespace
-
 void PdfStripBuilderTest::testImageIsTheLayoutSize()
 {
     PopplerRenderBackend backend;
@@ -287,21 +243,16 @@ void PdfStripBuilderTest::testPagesAreWhereTheLayoutSays()
     QVERIFY2(strip.image, qPrintable(why));
 
     /// The page is painted at its own place in the strip, not at the origin: the top of its own
-    /// slot, which is where the ink is expected to line up too.
-    ///
-    /// The layer's own bounds are the BAND it owns -- the desk colour it carries plus the page --
-    /// so where the page is inside that band is read off the pixels: the page's own rectangle is
-    /// everything that is not the desk colour.
+    /// slot, which is where the ink is expected to line up too. The layer holds the page and
+    /// nothing else -- the room around it is transparent now -- so its own bounds ARE the page's.
     for (const PdfStripLayout::Slot &slot : strip.layout.slots()) {
         KisNodeSP background = childNamed(strip.image, PdfStripBuilder::backgroundLayerName(slot.page));
         const QRect bounds = background->paintDevice()->exactBounds();
 
-        QCOMPARE(bounds, slot.cell);
-
-        const QRect pagePixels = pageRectInBand(qobject_cast<KisPaintLayer *>(background.data()),
-                                                slot.cell);
-        QCOMPARE(pagePixels.size(), slot.rect.size());
-        QCOMPARE(pagePixels.topLeft(), slot.rect.topLeft());
+        QCOMPARE(bounds.width(), slot.rect.width());
+        QCOMPARE(bounds.height(), slot.rect.height());
+        QCOMPARE(bounds.top(), slot.rect.top());
+        QCOMPARE(bounds.left(), slot.rect.left());
     }
 }
 
@@ -465,10 +416,8 @@ void PdfStripBuilderTest::testASlotIsRenderedFromItsRecordAndNotItsPosition()
     /// And the paper really is that page, from that file: the page's own rectangle inside the band
     /// is the size of the render the record asks for, and not the size of the page the slot's
     /// position would have picked out of the first source.
-    const QRect boundsFirst = pageRectInBand(qobject_cast<KisPaintLayer *>(paperFirst.data()),
-                                             strip.layout.slots().at(slotFirst).cell);
-    const QRect boundsSecond = pageRectInBand(qobject_cast<KisPaintLayer *>(paperSecond.data()),
-                                              strip.layout.slots().at(slotSecond).cell);
+    const QRect boundsFirst = paperFirst->paintDevice()->exactBounds();
+    const QRect boundsSecond = paperSecond->paintDevice()->exactBounds();
     qInfo("slot 0 -> %s: %dx%d (positional would be %dx%d); slot 1 -> %s: %dx%d (positional %dx%d)",
           qPrintable(paperFirst->name()), boundsFirst.width(), boundsFirst.height(),
           positionalFirst.width(), positionalFirst.height(), qPrintable(paperSecond->name()),
@@ -534,8 +483,7 @@ void PdfStripBuilderTest::testAnAngledPageOccupiesItsBox()
     QVERIFY2(paper, qPrintable(paperName));
     QVERIFY(paper->userLocked());
 
-    const QRect bounds = pageRectInBand(qobject_cast<KisPaintLayer *>(paper.data()),
-                                        strip.layout.slots().at(slot).cell);
+    const QRect bounds = paper->paintDevice()->exactBounds();
     QVERIFY2(qAbs(bounds.width() - rect.width()) <= 2 && qAbs(bounds.height() - rect.height()) <= 2,
              qPrintable(QStringLiteral("the page is %1x%2 where the layout made room for %3x%4")
                             .arg(bounds.width()).arg(bounds.height())
@@ -592,8 +540,7 @@ void PdfStripBuilderTest::testRightAnglePagesMatchTheRasterExactly()
         QVERIFY2(paper, qPrintable(name));
 
         /// Equality, not a tolerance: for a right angle there is nothing to round differently.
-        /// The page's own pixels, read out of the band its layer carries.
-        const QRect bounds = pageRectInBand(qobject_cast<KisPaintLayer *>(paper.data()), slot.cell);
+        const QRect bounds = paper->paintDevice()->exactBounds();
         QCOMPARE(bounds.size(), slot.rect.size());
         QCOMPARE(bounds.topLeft(), slot.rect.topLeft());
     }

@@ -1361,6 +1361,21 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
                 .arg(sizeNow.width()).arg(sizeNow.height()));
 
         KisImageSP image = m_document->image();
+
+        /// The resize's own undo command STAYS, and that is a recorded limitation rather than an
+        /// oversight. KisDocument::setCurrentImage installs the document's KisDocumentUndoStore on
+        /// this image, so cropImage()/resizeImage() push a command, and there are two costs: a
+        /// Ctrl+Z after a window move takes the resize back instead of the reader's stroke (it
+        /// corrects itself on the next roll), and the crop command RETAINS the pixels it removed so
+        /// they can be restored -- the memory the crop was meant to free.
+        ///
+        /// Detaching the store around the resize was TRIED AND CANNOT BE DONE: KisImage::setUndoStore()
+        /// does m_d->undoStore.reset(store) (kis_image.cc:1862) on a QScopedPointer (:265), so
+        /// detaching with nullptr DELETES the document's own store and any pointer kept to restore it
+        /// dangles -- the crash was a KisImage constructor lambda purging the freed store. Dropping
+        /// just that command needs a store of our own that filters it, which is a new class whose one
+        /// rule must be that it never loses a stroke; not worth building for a Ctrl+Z that only
+        /// misbehaves when the user's last action was a window move.
         if (targetSize.width() < sizeNow.width() || targetSize.height() < sizeNow.height()) {
             image->cropImage(QRect(QPoint(0, 0), targetSize));
         } else {
@@ -1543,11 +1558,15 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
             ? wasHeld.united(slots.at(i).cell)
             : slots.at(i).cell;
         if (paper) {
+            /// Cleared, and deliberately NOT filled with a colour afterwards: the room around the
+            /// page is left transparent and Krita's own canvas background shows through it. The
+            /// fill was what materialised tiles for every side area of every cell -- in a window of
+            /// mixed page sizes, most of the width of a wide page's cell -- and with the Desk layer
+            /// gone there is nothing left that needs the colour. The clearing is still the task-9
+            /// fix: the band the paper owned before the move has to go, or its pixels stay on
+            /// screen.
             paper->paintDevice()->fill(paperWipe,
                                        KoColor(Qt::transparent, m_document->image()->colorSpace()));
-            /// The desk colour for the room around the page, then the page itself.
-            paper->paintDevice()->fill(slots.at(i).cell,
-                                       KoColor(QColor(96, 96, 96), m_document->image()->colorSpace()));
         }
 
         /// Krita is told the slot changed. Writing into a paint device directly does not do that,

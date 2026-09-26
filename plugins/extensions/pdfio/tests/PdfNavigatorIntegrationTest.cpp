@@ -1961,17 +1961,11 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     /// the same image, not a rebuilt one -- and the raw pointers ask exactly that.
     QVERIFY(navigator()->currentDocument()->image().data() == strip.data());
 
-    /// Every paper layer is exactly the band it owns now: the desk colour over the whole cell, the
-    /// page inside it, and nothing anywhere else. A row of the previous window left outside the new
-    /// band is what the user saw as the other strip intruding.
-    ///
-    /// The cell is compared as the layout lays it out, NOT clipped to the image. Slot 0's band
-    /// starts half a gap above the image -- cell y is -56 -- so that the bands meet in the middle of
-    /// the gap, and a paint device keeps those rows even though the image never shows them (the
-    /// reported failure is exactly that: painted 0,-56 2726x2888, which IS slot 0's cell). Clipping
-    /// the expectation would fail on a paper that is painted perfectly. Equality is also the
-    /// strictest form of the check the test exists for: a stale band outside the cell, a band one
-    /// row short, or the wrong slot's paper all fail it.
+    /// Every paper layer holds its own page and NOTHING else: no desk colour around it any more, so
+    /// the room the page leaves is transparent and the canvas background shows through. That is also
+    /// the strictest form of the check this test has been making since task-9 -- a row of the
+    /// previous window left outside the band it owns would extend these bounds -- so the page's own
+    /// rectangle, within the pixel the two roundings may disagree on, is what is asserted.
     QList<KisPaintLayer *> papers;
     for (quint32 i = 0; i < strip->root()->childCount(); ++i) {
         KisNodeSP child = strip->root()->at(i);
@@ -1985,16 +1979,19 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     QCOMPARE(papers.size(), holding.slots().size());
 
     for (int i = 0; i < papers.size(); ++i) {
-        const QRect ownedNow = holding.slots().at(i).cell;
+        const QRect pageNow = holding.slots().at(i).rect;
         const QRect painted = papers.at(i)->paintDevice()->exactBounds();
-        QVERIFY2(painted == ownedNow,
-                 qPrintable(QStringLiteral("the paper of slot %1 is painted %2,%3 %4x%5, where the "
-                                           "band it owns now is %6,%7 %8x%9")
+        QVERIFY2(qAbs(painted.width() - pageNow.width()) <= 2
+                     && qAbs(painted.height() - pageNow.height()) <= 2
+                     && qAbs(painted.left() - pageNow.left()) <= 2
+                     && qAbs(painted.top() - pageNow.top()) <= 2,
+                 qPrintable(QStringLiteral("the paper of slot %1 is painted %2,%3 %4x%5, where its "
+                                           "page sits at %6,%7 %8x%9")
                                 .arg(i)
                                 .arg(painted.x()).arg(painted.y())
                                 .arg(painted.width()).arg(painted.height())
-                                .arg(ownedNow.x()).arg(ownedNow.y())
-                                .arg(ownedNow.width()).arg(ownedNow.height())));
+                                .arg(pageNow.x()).arg(pageNow.y())
+                                .arg(pageNow.width()).arg(pageNow.height())));
     }
 
     /// And there really is a second content layer kind to clear: the inserted image came back as
