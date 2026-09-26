@@ -127,6 +127,10 @@ private Q_SLOTS:
     /// before they offer an operation, and one call that both make when one is chosen.
     void testQuickPageOperations();
 
+    /// A page can be set down at an angle that is not a right angle: the record keeps the angle, the
+    /// artifact is turned by it, and the page the reader gets is the rectangle that holds the sheet.
+    void testAPageCanBeSetDownAtAnAngle();
+
     /// Inserting pages from a PDF: it becomes a source of the notebook (copied into the project
     /// once, reused after that), every inserted page gets its own artifact number, and nothing is
     /// written for a page until it is drawn on.
@@ -2517,6 +2521,69 @@ void PdfSessionTest::testQuickPageOperations()
     /// Every one of them was one change the undo walks back, which is what makes a button that
     /// applies immediately safe to offer at all.
     QVERIFY(PdfNotebookOps::canUndo(project));
+}
+
+/**
+ * A page set down at an angle that is not a right angle.
+ *
+ * The notebook used to record only quarter turns, so a page was either upright or on its side. An
+ * angle is now a number the record keeps, and this is the operation the two interfaces above it
+ * call: the paper's turn is the manifest's, the ink's turn is the artifact's, and the size the
+ * reader gets is the rectangle that holds the turned sheet -- bigger than the page, which is the
+ * price of the angle and the thing a later reader has to be told about rather than discover.
+ */
+void PdfSessionTest::testAPageCanBeSetDownAtAnAngle()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("angled"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    /// Ink on the page, so "the ink was turned by 37 degrees" is a statement about a file the
+    /// rotator was handed rather than about a call the operation never made.
+    const QByteArray ink = QByteArrayLiteral("ink of the angled page");
+    writeBytes(QDir(project).filePath(before.pages.at(0).kraFile), ink);
+
+    StubRotator rotator;
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::rotatePages(project, 0, 1, 37, rotator.fn(), 0);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// The artifact was turned by the angle that was asked for, and the paper by the same one.
+    QCOMPARE(rotator.calls.size(), 1);
+    QCOMPARE(rotator.calls.at(0).degrees, 37);
+
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.at(0).extraRotation, 37);
+    QCOMPARE(after.pages.at(1).extraRotation, 0);
+
+    /// The page the reader gets is the sheet's bounding box: 595x842 set down at 37 degrees is
+    /// 595*cos37 + 842*sin37 by 595*sin37 + 842*cos37, to the nearest point.
+    const QSizeF turned = after.pages.at(0).displaySizePt();
+    QCOMPARE(qRound(turned.width()), 982);
+    QCOMPARE(qRound(turned.height()), 1031);
+    QVERIFY(turned.width() > after.pages.at(0).sizePt.width());
+    QVERIFY(turned.height() > after.pages.at(0).sizePt.height());
+
+    /// And it survives a reopen, which is what storing the angle rather than turning the paper and
+    /// forgetting is for.
+    QCOMPARE(PdfSession::openProject(project, &why).pages.at(0).extraRotation, 37);
+
+    /// A turn of nothing is refused rather than written as an operation that did nothing.
+    QVERIFY(!PdfNotebookOps::rotatePages(project, 0, 1, 0, rotator.fn(), 0).ok);
+    QCOMPARE(rotator.calls.size(), 1);
+
+    /// And the undo puts the page back the way up it was, angle and all.
+    const PdfNotebookOps::Outcome undone = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undone.ok, qPrintable(undone.why));
+    QCOMPARE(PdfSession::openProject(project, &why).pages.at(0).extraRotation, 0);
 }
 
 QTEST_MAIN(PdfSessionTest)
