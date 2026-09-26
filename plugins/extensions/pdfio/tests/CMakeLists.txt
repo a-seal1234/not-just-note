@@ -88,6 +88,7 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
     add_executable(PdfExporterTest
         PdfExporterTest.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../backends/poppler/PopplerRenderBackend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfAssembler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfExporter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookOps.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSession.cpp

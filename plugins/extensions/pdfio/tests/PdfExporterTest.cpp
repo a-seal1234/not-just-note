@@ -5,6 +5,7 @@
  */
 
 #include "backends/poppler/PopplerRenderBackend.h"
+#include "session/PdfAssembler.h"
 #include "session/PdfExporter.h"
 #include "session/PdfSession.h"
 
@@ -68,6 +69,14 @@ private Q_SLOTS:
     void testAMovedNotebookExportsInNotebookOrder();
     void testADuplicatedPageExportsTwiceWithItsOwnInk();
     void testAMultiSourceNotebookIsRefusedWithTheReason();
+
+    /// Assembling a notebook that draws on several PDFs into ONE file (task-34). The first test is
+    /// the one that matters: the fixture has the shape every page of the user's own manual has --
+    /// no /Resources and no /MediaBox on the page object, both inherited from the /Pages node --
+    /// and a copier that passes its own fixtures without resolving that writes blank paper.
+    void testAssemblingTwoSourcesWritesOneFileInNotebookOrder();
+    void testAnAssembledPageKeepsItsInheritedPaperAndResources();
+    void testTheAssemblerNamesASourceItCannotRead();
 
 private:
     QString fixturePath(const QString &name) const
@@ -1412,6 +1421,157 @@ void PdfExporterTest::testACroppedPageExportsOnlyItsBox()
                             .arg(paperWhere.right()).arg(paperWhere.bottom())
                             .arg(expectedWhere.left()).arg(expectedWhere.top())
                             .arg(expectedWhere.right()).arg(expectedWhere.bottom())));
+}
+
+
+/// A notebook whose pages come from two PDFs assembles into ONE file, in notebook order.
+///
+/// Page one is the fixture that carries nothing of its own (the manual's shape), page two comes
+/// from text-fixture.pdf. The assembled file has to hold both, each rendering as the source page
+/// its record names, and the plan has to say what it inherited -- that flag is the difference
+/// between a page with paper and a page with nothing.
+void PdfExporterTest::testAssemblingTwoSourcesWritesOneFileInNotebookOrder()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString first = dir.filePath(QStringLiteral("inherited.pdf"));
+    const QString second = dir.filePath(QStringLiteral("second.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("inherited-attrs.pdf")), first));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("text-fixture.pdf")), second));
+
+    PdfSessionManifest manifest;
+    manifest.name = QStringLiteral("Two sources");
+    PdfSourceRecord recordA;
+    recordA.file = QStringLiteral("inherited.pdf");
+    recordA.sha256 = PdfSessionManifest::sha256OfFile(first);
+    recordA.byteSize = QFileInfo(first).size();
+    PdfSourceRecord recordB;
+    recordB.file = QStringLiteral("second.pdf");
+    recordB.sha256 = PdfSessionManifest::sha256OfFile(second);
+    recordB.byteSize = QFileInfo(second).size();
+    manifest.sourceFile = recordA.file;
+    manifest.sourceSha256 = recordA.sha256;
+    manifest.sourceByteSize = recordA.byteSize;
+    manifest.sources << recordA << recordB;
+
+    /// Notebook order: the inherited fixture first, then text-fixture's first page. The notebook
+    /// page NUMBER (kraFile) is what an artifact is called; the export walks pages, not sources.
+    manifest.pages.append(PdfPageRecord{ 0, QSizeF(595, 842), 0,
+                                         PdfSession::pageFileName(0), QString(), 0, 0 });
+    manifest.pages.append(PdfPageRecord{ 0, QSizeF(595, 842), 0,
+                                         PdfSession::pageFileName(1), QString(), 0, 1 });
+
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QList<PdfAssembler::PagePlan> written;
+    QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, out, &written, &why), qPrintable(why));
+    QCOMPARE(written.size(), 2);
+
+    QVERIFY2(written.at(0).inheritsResources,
+             "the fixture's page carries no /Resources of its own; the plan has to know");
+    QVERIFY2(written.at(0).inheritsMediaBox,
+             "the fixture's page carries no /MediaBox of its own; the plan has to know");
+    QCOMPARE(written.at(0).sizePt, QSizeF(595, 842));
+
+    PopplerRenderBackend assembled;
+    QVERIFY2(assembled.open(out), qPrintable(why));
+    QCOMPARE(assembled.pageCount(), 2);
+    QCOMPARE(assembled.pageInfo(0).sizePt, QSizeF(595, 842));
+    QVERIFY2(assembled.pageText(0).contains(QStringLiteral("Inherited page one")),
+             qPrintable(assembled.pageText(0)));
+    QVERIFY2(assembled.pageText(1).contains(QStringLiteral("Page one heading")),
+             qPrintable(assembled.pageText(1)));
+}
+
+/// THE SHAPE THE USER'S OWN FILE HAS, and the reason this module exists.
+///
+/// Every page of the real manual has no /Resources and no /MediaBox of its own: /Pages carries
+/// them. A copier that reads a page dictionary standalone writes a page with no paper size and no
+/// font, which renders as blank paper -- and a page whose PAPER is missing renders "successfully"
+/// in every naive check. So the assertions are the rendered size AND pixels: the text has to be
+/// there, drawn with the font the /Pages node carried.
+void PdfExporterTest::testAnAssembledPageKeepsItsInheritedPaperAndResources()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("inherited.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("inherited-attrs.pdf")), source));
+
+    /// The source on its own, to compare against: the same page, rendered by the same backend.
+    PopplerRenderBackend original;
+    QVERIFY(original.open(source));
+    const QImage expected = original.renderPage(0, 72.0);
+    QVERIFY2(!expected.isNull(), "the fixture itself did not render");
+    QVERIFY2(darkPixels(expected) > 0, "the fixture itself has no text to preserve");
+
+    PdfSessionManifest manifest;
+    manifest.name = QStringLiteral("Inherited");
+    PdfSourceRecord record;
+    record.file = QStringLiteral("inherited.pdf");
+    record.sha256 = PdfSessionManifest::sha256OfFile(source);
+    record.byteSize = QFileInfo(source).size();
+    manifest.sourceFile = record.file;
+    manifest.sourceSha256 = record.sha256;
+    manifest.sourceByteSize = record.byteSize;
+    manifest.sources << record;
+    manifest.pages.append(PdfPageRecord{ 0, QSizeF(595, 842), 0,
+                                         PdfSession::pageFileName(0), QString(), 0, 0 });
+
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why), qPrintable(why));
+
+    PopplerRenderBackend assembled;
+    QVERIFY2(assembled.open(out), qPrintable(why));
+    QCOMPARE(assembled.pageCount(), 1);
+
+    /// The paper came from the ancestor...
+    QCOMPARE(assembled.pageInfo(0).sizePt, QSizeF(595, 842));
+    const QImage rendered = assembled.renderPage(0, 72.0);
+    QVERIFY(!rendered.isNull());
+    /// ...and so did the font: without the inherited /Resources this page is blank, and that is
+    /// exactly the failure this test exists to catch.
+    QVERIFY2(darkPixels(rendered) > 0,
+             "the assembled page came out blank: the inherited /Resources did not travel with it");
+    QVERIFY2(rendered.size() == expected.size(),
+             qPrintable(QStringLiteral("the assembled page is %1x%2, the source's is %3x%4")
+                            .arg(rendered.width()).arg(rendered.height())
+                            .arg(expected.width()).arg(expected.height())));
+}
+
+/// A source the assembler cannot read is NAMED, and nothing is written.
+///
+/// ex-objstm-50p.pdf is PDF 1.5 with a cross-reference stream -- the modern shape the user's own
+/// files do not have and this reader deliberately does not guess at. The per-source export stays
+/// the fallback for it; a half-read source written out as a file that only looks right is the one
+/// outcome worse than a refusal, so the refusal also has to leave no file behind.
+void PdfExporterTest::testTheAssemblerNamesASourceItCannotRead()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString modern = dir.filePath(QStringLiteral("modern.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("ex-objstm-50p.pdf")), modern));
+
+    PdfSessionManifest manifest;
+    manifest.name = QStringLiteral("Modern");
+    PdfSourceRecord record;
+    record.file = QStringLiteral("modern.pdf");
+    record.sha256 = PdfSessionManifest::sha256OfFile(modern);
+    record.byteSize = QFileInfo(modern).size();
+    manifest.sourceFile = record.file;
+    manifest.sourceSha256 = record.sha256;
+    manifest.sourceByteSize = record.byteSize;
+    manifest.sources << record;
+    manifest.pages.append(PdfPageRecord{ 0, QSizeF(595, 842), 0,
+                                         PdfSession::pageFileName(0), QString(), 0, 0 });
+
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QVERIFY2(!PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why),
+             "a source with a cross-reference stream was assembled as if it had been read");
+    QVERIFY2(why.contains(QStringLiteral("modern.pdf")),
+             qPrintable(QStringLiteral("the refusal does not name the source: %1").arg(why)));
+    QVERIFY2(!QFileInfo::exists(out), "a refusal left a half-written file behind");
 }
 
 QTEST_MAIN(PdfExporterTest)
