@@ -1077,8 +1077,8 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
     dialog.setNotebookMerger(merger);
 
     if (dialog.exec() != QDialog::Accepted) {
-        /// Cancel is the whole promise: nothing was written, so there is nothing to undo -- and the
-        /// unpacked copy of a notebook that was only being read goes with it.
+        /// Cancel discards the pending page-list edits and removes any unpacked transport copy. It
+        /// does not undo the preflight save prepareForNotebookChange() performs before this screen.
         if (!unpackedNotebook.isEmpty()) {
             QDir(unpackedNotebook).removeRecursively();
         }
@@ -1100,6 +1100,11 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
     const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(
         navigator->projectDir(), dialog.edits(), PdfPageRotator::rotateInto);
     if (!outcome.ok) {
+        /// The .pnb was only unpacked so this change could read its files. It never became part of
+        /// the notebook, so an unsuccessful Apply must discard that transport copy as well.
+        if (!unpackedNotebook.isEmpty()) {
+            QDir(unpackedNotebook).removeRecursively();
+        }
         say(QStringLiteral("the notebook ops screen was refused: %1").arg(outcome.why));
         QMessageBox::warning(nullptr, i18n("Notebook ops"), outcome.why);
         return;

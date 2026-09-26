@@ -1523,8 +1523,9 @@ void PdfNavigatorIntegrationTest::testMergingANotebookInAddsItsPagesAndKeepsTheR
  *
  * The two things the design insists on are assertions here rather than intentions: Apply is off while
  * nothing has changed (a no-op would still close and reopen the notebook), and a page that cannot be
- * deleted or moved says so instead of leaving a greyed button mute. Nothing in this test reaches the
- * disk through the screen: it only ever edits its own copy, which is what makes Cancel free.
+ * deleted or moved says so instead of leaving a greyed button mute. This test exercises the dialog's
+ * in-memory copy only; the plugin pre-saves open pages before showing it, so plugin-level Cancel is
+ * not necessarily byte-for-byte disk-neutral.
  */
 void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
 {
@@ -1537,6 +1538,9 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
         project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
     QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
     QCOMPARE(manifest.pages.size(), 3);
+    QFile manifestBeforeFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestBeforeFile.open(QIODevice::ReadOnly));
+    const QByteArray manifestBefore = manifestBeforeFile.readAll();
 
     /// Ink on the first page, so the change has a real file to carry: "the duplicate brings its
     /// files" is then a statement about bytes rather than about a name.
@@ -1748,6 +1752,18 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
     QVERIFY(!deleteOnly->isEnabled());
     QVERIFY2(hintOnly->text().contains(QStringLiteral("at least one page")),
              qPrintable(hintOnly->text()));
+
+    /// Reject after building a composite page-list change: the dialog itself never writes its
+    /// pending copy. The plugin's separate preflight save is outside this dialog-only test.
+    dialog.reject();
+    QCOMPARE(dialog.result(), int(QDialog::Rejected));
+    QFile manifestAfterFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestAfterFile.open(QIODevice::ReadOnly));
+    QCOMPARE(manifestAfterFile.readAll(), manifestBefore);
+    const QString pendingDuplicate = QDir(project).filePath(PdfSession::pageFileNameForNumber(4));
+    QVERIFY(!QFileInfo::exists(pendingDuplicate));
+    QVERIFY(!QFileInfo::exists(pendingDuplicate + QStringLiteral(".layers")));
+    QVERIFY(!QFileInfo::exists(pendingDuplicate + QStringLiteral(".layers.txt")));
 }
 
 /**
