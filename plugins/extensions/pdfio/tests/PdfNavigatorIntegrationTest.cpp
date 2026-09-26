@@ -33,10 +33,14 @@
 
 #include <QApplication>
 #include <QDialog>
+#include <QImage>
 #include <QLabel>
 #include <QMessageBox>
+#include <QMouseEvent>
+#include <QPainter>
 #include <QPushButton>
 #include <QTableWidget>
+#include <QWidget>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -44,6 +48,7 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QtMath>
 #include <QtTest>
 
 /**
@@ -95,6 +100,11 @@ private Q_SLOTS:
     /// The page list's own gesture: a swipe turns the row it was made on, by the same quarter turn
     /// the buttons use, and a movement that is not a swipe turns nothing.
     void testSwipingAPageTurnsIt();
+    /// The canvas: the selected page turned by hand, by an angle no button can name, and the turn
+    /// landing in the pending list like every other edit.
+    void testTheCanvasTurnsTheSelectedPageByAnyAngle();
+    /// The REAL rotator at an angle that is not a right angle, which no other test runs.
+    void testTheRealRotatorTurnsAPageByAnAngleThatIsNotARightAngle();
     /// Last on purpose: it swaps the fixture and the scope, restores both, and runs after every
     /// test that would care -- so a failure inside it cascades to nothing that runs after it.
     void testRollWritesEveryWindowPageAndRedrawsFromDisk();
@@ -1993,6 +2003,298 @@ void PdfNavigatorIntegrationTest::testSwipingAPageTurnsIt()
     QVERIFY2(turnRight, "the screen has no turn button to compare the gesture with");
     turnRight->click();
     QCOMPARE(dialog.edits().pages.at(2).extraRotation, 90);
+}
+
+namespace {
+
+/**
+ * The rectangle the page's card occupies on the canvas: every pixel that is not the canvas backdrop.
+ *
+ * The backdrop is read off the top-left corner, which the card never reaches, so a card that was
+ * really turned measures as a different shape rather than only being described differently. That is
+ * the difference between "the preview was rotated" and "a number changed".
+ */
+QRect cardOnCanvas(const QImage &image)
+{
+    if (image.isNull()) {
+        return QRect();
+    }
+
+    const QColor backdrop = image.pixelColor(0, 0);
+    const auto isBackdrop = [&backdrop](const QColor &pixel) {
+        return qAbs(pixel.red() - backdrop.red()) <= 8
+            && qAbs(pixel.green() - backdrop.green()) <= 8
+            && qAbs(pixel.blue() - backdrop.blue()) <= 8;
+    };
+
+    int x0 = image.width();
+    int y0 = image.height();
+    int x1 = -1;
+    int y1 = -1;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (isBackdrop(image.pixelColor(x, y))) {
+                continue;
+            }
+            x0 = qMin(x0, x);
+            y0 = qMin(y0, y);
+            x1 = qMax(x1, x);
+            y1 = qMax(y1, y);
+        }
+    }
+    return x1 < 0 ? QRect() : QRect(QPoint(x0, y0), QPoint(x1, y1));
+}
+
+} // namespace
+
+/**
+ * The canvas turns the selected page by an angle no button can name, as a pending edit.
+ *
+ * The buttons can only mean a quarter turn and a swipe carries a direction rather than an angle, so
+ * the canvas is where a page is set down at an angle like 135 degrees -- not a right angle by any
+ * reading. A gesture is a PREVIEW while the hand is down -- the picture and the readout turn, and
+ * nothing else -- and lands as ONE pending edit on release, so a whole drag is one change and one
+ * undo takes it back. What is asserted is that this pending edit is the same kind as every other:
+ * edits() carries the angle, the manifest on disk does not, and Cancel leaves the notebook byte for
+ * byte what it was. The preview is really turned too, which is why the card's SHAPE on the canvas is
+ * measured rather than only the number beside it.
+ *
+ * The gesture is analog, so the angle it lands on is compared with the readout and with the list
+ * rather than with a literal degree: an arbitrary pixel drag cannot promise one, and making it snap
+ * to a right angle is exactly what this screen must not do. The exact quarter turn is the buttons'
+ * contract, and it is asserted here through the button.
+ */
+void PdfNavigatorIntegrationTest::testTheCanvasTurnsTheSelectedPageByAnyAngle()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("canvas"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest manifest = PdfSession::createProject(
+        project, QStringLiteral(FILES_DATA_DIR) + QStringLiteral("text-fixture.pdf"), backend);
+    QVERIFY2(manifest.isValid(), "the notebook this screen test needs could not be made");
+    QCOMPARE(manifest.pages.size(), 3);
+    QVERIFY2(!manifest.pages.at(0).thumbFile.isEmpty(), "the first page records no preview name");
+
+    /// A preview to turn: a wide card with a red block at its left end, so a card that was really
+    /// rotated has a different shape and different pixels from one whose number changed.
+    /// PdfSession::createProject() names a preview but draws none until a save has happened, so the
+    /// test draws this one itself.
+    QImage card(160, 40, QImage::Format_ARGB32_Premultiplied);
+    card.fill(Qt::white);
+    {
+        QPainter painter(&card);
+        painter.fillRect(QRect(0, 0, 40, 40), QColor(Qt::red));
+    }
+    const QString thumbPath = QDir(project).filePath(manifest.pages.at(0).thumbFile);
+    QVERIFY2(card.save(thumbPath), qPrintable(thumbPath));
+
+    QFile manifestBeforeFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestBeforeFile.open(QIODevice::ReadOnly));
+    const QByteArray manifestBefore = manifestBeforeFile.readAll();
+
+    PdfNotebookOpsDialog dialog(project, manifest, 0);
+    auto *canvas = dialog.findChild<QWidget *>(QStringLiteral("pdfio_ops_canvas"));
+    QVERIFY2(canvas, "the ops screen has no canvas to turn a page on");
+    auto *readout = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_angle"));
+    QVERIFY2(readout, "the canvas has no live readout of the angle");
+    auto *summary = dialog.findChild<QLabel *>(QStringLiteral("pdfio_ops_summary"));
+    QVERIFY(summary);
+    auto *apply = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_apply"));
+    QVERIFY(apply);
+    QVERIFY2(!apply->isEnabled(), "Apply was offered before anything changed");
+
+    /// Laid out and shown: a gesture is a position, and a canvas that was never laid out has no
+    /// centre to turn around.
+    dialog.show();
+    QTest::qWait(50);
+
+    /// The gesture as the widget receives it: press, move, release. Sent straight to the canvas
+    /// rather than through the window system, so the positions under test are the widget's own.
+    const auto press = [canvas](const QPoint &at) {
+        QMouseEvent event(QEvent::MouseButtonPress, at, canvas->mapToGlobal(at),
+                          Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &event);
+    };
+    const auto moveTo = [canvas](const QPoint &at) {
+        QMouseEvent event(QEvent::MouseMove, at, canvas->mapToGlobal(at),
+                          Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &event);
+    };
+    const auto releaseAt = [canvas](const QPoint &at) {
+        QMouseEvent event(QEvent::MouseButtonRelease, at, canvas->mapToGlobal(at),
+                          Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &event);
+    };
+
+    auto *table = dialog.findChild<QTableWidget *>();
+    QVERIFY(table);
+    /// The Turn column, in the order the table builds them: thumbnail, position, source, size, turn,
+    /// ink.
+    constexpr int TurnColumn = 4;
+
+    /// Before anything is turned the page's own preview is on the canvas, upright: the card is wide,
+    /// and the page's own shape is portrait, so a canvas that ignored the preview could not be
+    /// showing this.
+    const QRect uprightCard = cardOnCanvas(canvas->grab().toImage());
+    QVERIFY2(uprightCard.isValid(), "the canvas drew nothing at all");
+    QVERIFY2(uprightCard.width() > uprightCard.height(),
+             "the canvas is not showing the preview the page records");
+
+    /// The point the widget measures its angles from: the same centre its own painting uses.
+    /// Driving the gesture from anywhere else adds a degree or two to both of its ends -- an earlier
+    /// run of this test pressed from QRect::center(), half a pixel away from the centre the widget
+    /// turns around, and landed on 92 degrees while asking for 90. That is what an analog gesture
+    /// does; this test is about what the gesture records, not about an exact degree from a pixel
+    /// drag.
+    const QPointF hub = QRectF(canvas->rect()).center();
+    const QPoint threeOClock = (hub + QPointF(100, 0)).toPoint();
+    const QPoint sixOClock = (hub + QPointF(0, 100)).toPoint();
+
+    /// One gesture, a quarter around that centre: taken hold of at three o'clock and let go at six.
+    /// While the hand is down it is a PREVIEW: the drawn page has already turned and the readout has
+    /// already followed it, while the record, the list and the pending change are exactly as they
+    /// were.
+    const QString standing = readout->text();
+    press(threeOClock);
+    moveTo(sixOClock);
+
+    QCOMPARE(dialog.edits().pages.at(0).extraRotation, 0);
+    QVERIFY2(!apply->isEnabled(), "a gesture in progress was treated as a pending edit");
+    QVERIFY2(readout->text() != standing, "the readout did not follow the hand");
+    QVERIFY(table->item(0, TurnColumn));
+    QVERIFY2(table->item(0, TurnColumn)->text().contains(QStringLiteral("as it is")),
+             qPrintable(table->item(0, TurnColumn)->text()));
+    const QRect previewCard = cardOnCanvas(canvas->grab().toImage());
+    QVERIFY2(previewCard.isValid() && previewCard.height() > previewCard.width(),
+             "the preview did not turn while the hand was still down");
+
+    /// The hand is up: now it is ONE pending edit -- one change in the summary, so one undo takes
+    /// the whole turn back -- and nothing has been written. The gesture is analog, so what is
+    /// asserted is that the readout, the list and the pending edit all say the SAME angle, and that
+    /// this drag really is the quarter turn it looks like.
+    releaseAt(sixOClock);
+    const int quarter = dialog.edits().pages.at(0).extraRotation;
+    QVERIFY2(readout->text().contains(QString::number(quarter)),
+             "the readout and the pending edit disagree");
+    QVERIFY2(table->item(0, TurnColumn)->text().contains(QString::number(quarter)),
+             qPrintable(table->item(0, TurnColumn)->text()));
+    QVERIFY2(qAbs(quarter - 90) <= 4,
+             qPrintable(QStringLiteral("a drag from three o'clock to six landed at %1").arg(quarter)));
+    QVERIFY2(apply->isEnabled(), "a turn made on the canvas is not a pending edit");
+    QVERIFY2(summary->text().contains(QStringLiteral("1 change(s) pending")),
+             qPrintable(summary->text()));
+
+    /// And an angle that is not a right angle at all: from three o'clock to half past four is 45
+    /// degrees on top of what is already there, and it too is only a preview until the hand comes up.
+    const QString settled = readout->text();
+    const QPoint halfPastFour = (hub + QPointF(70, 70)).toPoint();
+    press(threeOClock);
+    moveTo(halfPastFour);
+    QCOMPARE(dialog.edits().pages.at(0).extraRotation, quarter);
+    QVERIFY2(readout->text() != settled, "the readout did not follow the second gesture");
+    releaseAt(halfPastFour);
+    const int angled = dialog.edits().pages.at(0).extraRotation;
+    QVERIFY2(angled != quarter, "the second gesture recorded no turn at all");
+    QVERIFY2(angled % 90 != 0, "the angle under test turned out to be a right angle");
+    QVERIFY2(readout->text().contains(QString::number(angled)),
+             "the readout and the pending edit disagree at an arbitrary angle");
+
+    /// The button still adds exactly a quarter turn on top of the angle the gesture left, which is
+    /// the contract the buttons have always had.
+    const int afterButton = (angled + 90) % 360;
+    dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_turn_right"))->click();
+    QCOMPARE(dialog.edits().pages.at(0).extraRotation, afterButton);
+
+    /// The canvas follows the selection: page 2 was never turned, so the readout says so and edits()
+    /// still has it upright.
+    table->selectRow(1);
+    QCOMPARE(dialog.edits().pages.at(1).extraRotation, 0);
+    QVERIFY2(readout->text().contains(QStringLiteral("0")), qPrintable(readout->text()));
+    QCOMPARE(dialog.edits().pages.at(0).extraRotation, afterButton);
+
+    /// Nothing has been written: the turn is pending, and the notebook on disk is as it was.
+    QFile manifestAfterFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestAfterFile.open(QIODevice::ReadOnly));
+    QCOMPARE(manifestAfterFile.readAll(), manifestBefore);
+
+    /// Cancel writes nothing either, which is the whole promise of the screen. Apply is where the
+    /// change leaves it, and the plugin then commits it as one change (the screen test above covers
+    /// that half).
+    dialog.reject();
+    QCOMPARE(dialog.result(), int(QDialog::Rejected));
+    QFile manifestRejectedFile(PdfSession::manifestPath(project));
+    QVERIFY(manifestRejectedFile.open(QIODevice::ReadOnly));
+    QCOMPARE(manifestRejectedFile.readAll(), manifestBefore);
+}
+
+/**
+ * The real rotator at an angle that is not a right angle, over a page that was really drawn on.
+ *
+ * Every rotation test at the ops level passes a stub, so the arithmetic the stub stands in for --
+ * Krita turning the ink, the turned sheet measuring the box the page says it measures, and the
+ * artifact reading back at that size -- had never been run. 37 degrees is the smallest interesting
+ * angle: it is not a right angle, its box is bigger than the page in both directions, and a notebook
+ * that recorded it while the artifact stayed upright would put the ink on the wrong lines.
+ */
+void PdfNavigatorIntegrationTest::testTheRealRotatorTurnsAPageByAnAngleThatIsNotARightAngle()
+{
+    QVERIFY(useNotebook(QStringLiteral("real-angle")));
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    /// Turning away from the page is what writes it, so there is a real artifact to turn.
+    QString why;
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    const QString project = navigator()->projectDir();
+    const QString artifact = artifactFor(0);
+    QVERIFY2(waitForInk(artifact), qPrintable(artifact));
+
+    const QSize upright = PdfInkLoader::artifactSize(artifact, &why);
+    QVERIFY2(!upright.isEmpty(), qPrintable(why));
+
+    const PdfNotebookOps::Outcome turned =
+        PdfNotebookOps::rotatePages(project, 0, 1, 37, PdfPageRotator::rotateInto, 0);
+    QVERIFY2(turned.ok, qPrintable(turned.why));
+
+    /// The record says 37, and the size the reader sees is the box the turned sheet fits in -- not
+    /// the page's own size, and not the swapped size of a right angle.
+    PdfSessionManifest after = PdfSessionManifest::readFrom(PdfSession::manifestPath(project), &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.at(0).extraRotation, 37);
+
+    const QSizeF size = after.pages.at(0).sizePt;
+    const QSizeF box = after.pages.at(0).displaySizePt();
+    const qreal radians = qDegreesToRadians(37.0);
+    const qreal cosine = qAbs(qCos(radians));
+    const qreal sine = qAbs(qSin(radians));
+    QVERIFY2(qAbs(box.width() - (size.width() * cosine + size.height() * sine)) < 0.01,
+             qPrintable(QStringLiteral("the box is %1 wide, where the turned sheet says %2")
+                            .arg(box.width())
+                            .arg(size.width() * cosine + size.height() * sine)));
+    QVERIFY2(qAbs(box.height() - (size.width() * sine + size.height() * cosine)) < 0.01,
+             qPrintable(QStringLiteral("the box is %1 tall, where the turned sheet says %2")
+                            .arg(box.height())
+                            .arg(size.width() * sine + size.height() * cosine)));
+    QVERIFY2(box.width() > size.width() && box.height() > size.height(),
+             "a page set down at 37 degrees has to be BIGGER than its sizePt");
+
+    /// And the page's image, reopened from the artifact the manifest names, measures the same box in
+    /// the pixels it was written at: the ink really was turned with the paper.
+    const QSize reopened = PdfInkLoader::artifactSize(QDir(project).filePath(after.pages.at(0).kraFile),
+                                                      &why);
+    QVERIFY2(!reopened.isEmpty(), qPrintable(why));
+    const QSize expected(qRound(upright.width() * cosine + upright.height() * sine),
+                         qRound(upright.width() * sine + upright.height() * cosine));
+    QVERIFY2(qAbs(reopened.width() - expected.width()) <= 1
+                 && qAbs(reopened.height() - expected.height()) <= 1,
+             qPrintable(QStringLiteral("the turned page reopens as %1x%2, where the box says %3x%4")
+                            .arg(reopened.width())
+                            .arg(reopened.height())
+                            .arg(expected.width())
+                            .arg(expected.height())));
 }
 
 int main(int argc, char *argv[])

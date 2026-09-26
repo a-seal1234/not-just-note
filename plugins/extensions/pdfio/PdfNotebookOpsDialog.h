@@ -11,6 +11,7 @@
 #include <QList>
 #include <QPair>
 #include <QPoint>
+#include <QPixmap>
 #include <QSizeF>
 #include <QStringList>
 
@@ -20,6 +21,10 @@ class QEvent;
 class QLabel;
 class QPushButton;
 class QTableWidget;
+
+/// The preview pane beside the list: the selected page, large, turned by hand. Defined with its
+/// painting and its gestures in PdfNotebookOpsDialog.cpp.
+class PdfPageCanvas;
 
 /**
  * The Notebook ops screen: the notebook's pages as one list, worked on as a whole.
@@ -39,6 +44,16 @@ class QTableWidget;
  * Two things the footer keeps honest: Apply is disabled while nothing has changed (no operation is
  * run for a no-op), and the hint line says why an action is not available -- the last page cannot be
  * deleted, the first page cannot move up -- rather than letting a greyed button stand there mute.
+ *
+ * Beside the list is the canvas: the selected page, large, which can be turned directly by dragging
+ * it around its own centre (a pen and a mouse) or by twisting two fingers on it (touch). A page is
+ * often set down on an angle that is not a right angle, and a screen that can only offer "Turn
+ * left"/"Turn right" makes that a hunt for a button that does not exist. The canvas records the same
+ * pending edit as every button -- the row's extraRotation -- and it writes nothing: Apply is still
+ * the only thing that commits. A drag is a PREVIEW while the hand is down -- the picture and the
+ * number under it turn and nothing else does -- and it lands as ONE pending edit on release, so one
+ * drag is one change and one undo takes the whole turn back. The row's own preview is turned on
+ * screen with it, rather than only described.
  */
 class PdfNotebookOpsDialog : public QDialog
 {
@@ -102,6 +117,19 @@ private:
         PdfPageRecord record;
         /// Where this page's files are now: the project, or the notebook a new page was copied from.
         QString fromDir;
+        /**
+         * The page's preview, read once and kept in memory.
+         *
+         * The record's own thumbFile is the durable name, and a turn drops it -- nothing on disk
+         * shows the turn yet, and a preview left as it was would show the page the wrong way up. The
+         * pixels are what the canvas shows while the change is still pending, so they are kept here:
+         * the canvas and the row's own card are turned from them rather than from a file that is on
+         * its way out.
+         */
+        QPixmap preview;
+        /// The turn \c preview was drawn at, so what is drawn on top of it is the difference this
+        /// screen is holding rather than the whole turn a second time.
+        int previewRotation = 0;
         /// The user dropped it: still listed, struck through, until Apply or Cancel.
         bool removed = false;
         /// It did not exist when the screen opened.
@@ -120,10 +148,20 @@ private:
     void deleteSelected();
     void keepSelected();
     void rotateSelected(int degrees);
-    /// Turns \a row by \a degrees. Both the buttons and the swipe come through here, so the two
-    /// cannot turn a page by different amounts or leave a different trail behind.
+    /// Turns \a row by \a degrees. The buttons, the swipe and the canvas all come through here, so
+    /// no two ways of turning a page can record a different amount or leave a different trail.
     void turnRow(int row, int degrees);
+    /// Turns the selected row to \a degrees, the whole-degree angle the canvas reports. Any angle is
+    /// legal, and it lands in the same record field the buttons write to.
+    void setSelectedTurn(int degrees);
     void dropThumbnail(Row &row);
+    /// Reads the row's preview into memory, once, when the file is there. A row that already has one,
+    /// or whose record names no preview at all, is left alone.
+    void loadPreview(Row &row);
+    /// Puts the selected page on the canvas, with the turn it already carries and the turn this
+    /// screen is holding, and writes the angle in the readout beside it. Called whenever the
+    /// selection or the pending turn changes, so the two can never disagree.
+    void refreshCanvas();
     void insertPagesFromPdf();
     void mergeNotebookIn();
     void addPagesFromSource(const PdfToAdd &pdf, int first, int count);
@@ -150,8 +188,9 @@ private:
      *
      * The buttons are still the way to do it with a mouse, but a page is turned far more often than
      * a page is deleted, and on a tablet a button is a small thing to find while a list of pages is
-     * a large thing to swipe. One swipe is one quarter turn -- the unit the notebook records -- so
-     * the gesture cannot land the paper on an angle the ink was never turned to.
+     * a large thing to swipe. One swipe is one quarter turn: a swipe carries a direction and no
+     * angle, so it cannot mean "37 degrees". The canvas beside the list is where an angle is asked
+     * for.
      */
     bool eventFilter(QObject *watched, QEvent *event) override;
 
@@ -184,6 +223,9 @@ private:
     int m_nextNumber = 0;
 
     QTableWidget *m_table = nullptr;
+    /// The selected page, large, and turned by hand; and the live readout of its angle.
+    PdfPageCanvas *m_canvas = nullptr;
+    QLabel *m_angle = nullptr;
     /// Where a swipe started and which row it started on: the gesture acts on the row it was made
     /// on, not on whatever was selected before it.
     QPoint m_swipeFrom;
