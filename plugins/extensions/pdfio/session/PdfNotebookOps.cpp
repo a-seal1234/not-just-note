@@ -1163,6 +1163,144 @@ PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, i
     return outcome;
 }
 
+int PdfNotebookOps::nextFreePageNumber(const QString &projectDir)
+{
+    QString why;
+    const PdfSessionManifest manifest = PdfSession::openProject(projectDir, &why);
+    if (!manifest.isValid()) {
+        return -1;
+    }
+    return manifest.effectiveNextPageNumber();
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir,
+                                                       const PageEdits &edits,
+                                                       const ArtifactRotator &rotator)
+{
+    PdfSessionManifest before;
+    QString why;
+    if (!loadManifest(projectDir, &before, &why)) {
+        return refused(why);
+    }
+
+    /// The same rules a notebook always has: at least one page, and a PDF to draw them from.
+    if (edits.pages.isEmpty()) {
+        return refused(QStringLiteral("a notebook keeps at least one page"));
+    }
+    if (edits.sources.isEmpty()) {
+        return refused(QStringLiteral("the page list has no PDF to be drawn from"));
+    }
+
+    Plan plan;
+    plan.after = before;
+    plan.after.sources = edits.sources;
+    plan.after.pages = edits.pages;
+    plan.after.sourceFile = edits.sources.first().file;
+    plan.after.sourceSha256 = edits.sources.first().sha256;
+    plan.after.sourceByteSize = edits.sources.first().byteSize;
+    plan.opName = "edits";
+    plan.copyExternal = edits.copyExternal;
+    plan.copyExternalDirs = edits.copyExternalDirs;
+    plan.removeAfter = edits.removeAfter;
+    plan.summary = edits.summary;
+    /// The turns are read off the records rather than listed separately: whatever extraRotation a
+    /// page's record has gained over the record it came from is what its artifact has to be turned
+    /// by. For a page that stayed that is its own record before; for a duplicate it is the record it
+    /// was copied from, found through the copy's source path. One place the turn lives means a
+    /// caller cannot ask for a turned artifact and an unturned record -- which is paper and ink
+    /// disagreeing, the defect this project keeps designing against.
+    QHash<QString, int> turnBefore;
+    for (const PdfPageRecord &page : before.pages) {
+        turnBefore.insert(page.kraFile, page.extraRotation);
+    }
+    QHash<QString, QString> copiedFrom;
+    for (const QPair<QString, QString> &pair : plan.copyExternal) {
+        copiedFrom.insert(pair.second, pair.first);
+    }
+    for (const PdfPageRecord &page : plan.after.pages) {
+        int from = 0;
+        const QHash<QString, int>::const_iterator own = turnBefore.constFind(page.kraFile);
+        if (own != turnBefore.constEnd()) {
+            from = own.value();
+        } else {
+            const QString source = copiedFrom.value(page.kraFile);
+            const QString sourceName =
+                source.isEmpty() ? QString() : QDir(projectDir).relativeFilePath(source);
+            const QHash<QString, int>::const_iterator origin = turnBefore.constFind(sourceName);
+            if (origin == turnBefore.constEnd()) {
+                /// A page arriving from another notebook or PDF: its artifact is copied as it was
+                /// stored, so there is nothing to turn.
+                continue;
+            }
+            from = origin.value();
+        }
+
+        const int turn = ((page.extraRotation - from) % 360 + 360) % 360;
+        if (turn == 0) {
+            continue;
+        }
+        if (turn != 90 && turn != 180 && turn != 270) {
+            return refused(QStringLiteral("page %1 would be turned by %2 degrees, which is not a "
+                                          "quarter turn")
+                               .arg(page.kraFile).arg(turn));
+        }
+        Plan::Rotation rotation;
+        rotation.kraFile = page.kraFile;
+        rotation.degrees = turn;
+        plan.rotations.append(rotation);
+    }
+
+    /// Every path this change creates goes into the rollback's and the undo's list -- and none of
+    /// them may be a path the notebook already names. A screen that miscounted its numbers would
+    /// otherwise write over a page's ink, which is the one thing the allocator exists to prevent.
+    QSet<QString> named;
+    for (const PdfPageRecord &page : before.pages) {
+        named.insert(page.kraFile);
+        if (!page.thumbFile.isEmpty()) {
+            named.insert(page.thumbFile);
+        }
+    }
+    const auto acceptDestination = [&](const QString &relative) {
+        if (named.contains(relative)) {
+            why = QStringLiteral("the change would write over %1, which the notebook already has")
+                      .arg(relative);
+            return false;
+        }
+        plan.added.append(relative);
+        return true;
+    };
+    for (const QPair<QString, QString> &pair : plan.copyExternal) {
+        if (!acceptDestination(pair.second)) {
+            return refused(why);
+        }
+    }
+    for (const QPair<QString, QString> &pair : plan.copyExternalDirs) {
+        if (!acceptDestination(pair.second)) {
+            return refused(why);
+        }
+    }
+
+    /// The list the caller built is checked BEFORE anything is written: the commit below would
+    /// refuse it anyway, but by then the journal would already hold a copy of the old manifest and
+    /// the user would be told about a change that never started.
+    if (!plan.after.isValid(&why)) {
+        return refused(QStringLiteral("the page list this change builds is not a valid notebook: %1")
+                           .arg(why));
+    }
+
+    Outcome outcome;
+    if (!applyPlan(projectDir, plan, rotator, &why)) {
+        outcome.why = why;
+        return outcome;
+    }
+
+    outcome.ok = true;
+    outcome.anchorPage = 0;
+    outcome.summary = edits.summary.isEmpty() ? QStringLiteral("the notebook's pages were changed")
+                                              : edits.summary;
+    return outcome;
+}
+
 bool PdfNotebookOps::canUndo(const QString &projectDir)
 {
     if (projectDir.isEmpty()) {

@@ -194,6 +194,17 @@ public:
      * file. Nothing in the plugin calls it.
      */
     static void setFailBeforeCommitForTests(bool fail);
+
+    /**
+     * How many times writeTo() has committed a manifest in this process, and a reset for a test.
+     *
+     * The Notebook ops screen's whole promise is that a page list it built is committed ONCE, and a
+     * test has to be able to see that rather than take it on trust. Nothing in the plugin reads
+     * either of these.
+     */
+    static int writeCountForTests();
+    static void resetWriteCountForTests();
+
     static PdfSessionManifest readFrom(const QString &path, QString *why = nullptr);
 
     static QByteArray sha256OfFile(const QString &path);

@@ -203,6 +203,24 @@ void PdfSessionManifest::setFailBeforeCommitForTests(bool fail)
     failBeforeCommitForTests() = fail;
 }
 
+/// How many times writeTo() has committed, for the seam above. A file-scope counter rather than a
+/// static member so the header does not have to name a storage. 
+static int &committedManifests()
+{
+    static int count = 0;
+    return count;
+}
+
+int PdfSessionManifest::writeCountForTests()
+{
+    return committedManifests();
+}
+
+void PdfSessionManifest::resetWriteCountForTests()
+{
+    committedManifests() = 0;
+}
+
 bool PdfSessionManifest::isValid(QString *why) const
 {
     if (schema != CurrentSchema) {
@@ -455,6 +473,8 @@ bool PdfSessionManifest::writeTo(const QString &path, QString *why) const
         fail(why, QStringLiteral("cannot put %1 in place: %2").arg(path, file.errorString()));
         return false;
     }
+
+    ++committedManifests();
     return true;
 }
 

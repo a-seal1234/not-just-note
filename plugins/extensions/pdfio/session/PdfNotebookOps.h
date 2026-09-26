@@ -194,6 +194,54 @@ public:
     static Outcome mergeNotebook(const QString &projectDir, int at, const QString &sourceDir,
                                  int currentPage = -1);
 
+    /**
+     * A whole change to the notebook's page list, in one piece.
+     *
+     * This is what the Notebook ops screen hands over: the page list it built, the sources that list
+     * needs, the files to bring in from elsewhere, the artifacts to turn, the files the change
+     * displaces, and a line for the log. Every per-operation entry above is a smaller version of it.
+     *
+     * Paths are relative to the project directory unless stated otherwise. The screen must have
+     * named any NEW page's artifact with a number from nextFreePageNumber(): the caller decides the
+     * names, the allocator is only asked once, at apply time, for the manifest it commits.
+     *
+     * A turn is NOT listed here: it is read off the records. Whatever extraRotation a page's record
+     * has gained over the record it came from -- for a page that stayed, its own record before; for
+     * a duplicate, the one it was copied from -- is what its artifact is turned by. One place the
+     * turn lives means the paper and the ink cannot be asked to disagree.
+     */
+    struct PageEdits {
+        /// The page list the notebook should have afterwards, in order.
+        QList<PdfPageRecord> pages;
+        /// Every source that list draws from; the first is the notebook's own.
+        QList<PdfSourceRecord> sources;
+        /// absolute source outside the project -> relative destination inside it, for files.
+        QList<QPair<QString, QString>> copyExternal;
+        /// The same, for whole trees: a page's sidecar directory arriving from elsewhere.
+        QList<QPair<QString, QString>> copyExternalDirs;
+        /// relative paths the journal takes over after the commit: deleted pages, dropped previews.
+        QStringList removeAfter;
+        /// One line for the log and the user.
+        QString summary;
+    };
+
+    /**
+     * The next artifact number this notebook would hand out, so a screen can name the pages it is
+     * about to add instead of guessing. -1 when the notebook cannot be read.
+     */
+    static int nextFreePageNumber(const QString &projectDir);
+
+    /**
+     * Applies \a edits as ONE change: journal, the new files, the turns, one manifest write, then
+     * the removals -- the same order every operation uses, so the screen gets one journal entry, one
+     * commit to undo, and nothing half-applied.
+     *
+     * A destination that the notebook already names is refused rather than written over: a screen
+     * that miscounted its numbers must not be able to overwrite a page's ink.
+     */
+    static Outcome applyPageEdits(const QString &projectDir, const PageEdits &edits,
+                                  const ArtifactRotator &rotator);
+
     /// Whether there is a change that can be undone.
     static bool canUndo(const QString &projectDir);
 

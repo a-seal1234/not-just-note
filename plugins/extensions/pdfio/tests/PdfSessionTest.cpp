@@ -148,6 +148,10 @@ private Q_SLOTS:
     void testMergingANotebookThatSharesTheTargetsSource();
     void testMergingRefusesWhatItCannotDo();
 
+    /// The model the Notebook ops screen stands on: a whole page-list change -- a move, a delete, a
+    /// duplicate and a turn together -- is ONE commit, one journal entry and one undo step.
+    void testAWholePageListChangeIsOneCommit();
+
     // Where a manifest's own file names are checked: once, at the boundary, so that no consumer
     // has to, and so a directory copied onto the machine cannot make one read or write outside it.
     void testRejectsEscapingManifestPaths();
@@ -1595,6 +1599,121 @@ void PdfSessionTest::testMergingRefusesWhatItCannotDo()
     QVERIFY(!changed.ok);
     QVERIFY2(changed.why.contains(QStringLiteral("changed")), qPrintable(changed.why));
     QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+}
+
+/**
+ * A whole page-list change is ONE commit: one manifest write, one journal entry, one undo step.
+ *
+ * This is the model the Notebook ops screen stands on. The screen edits a copy of the page list and
+ * applies it once -- here a move, a turn, a duplicate and a delete in a single change -- so the
+ * notebook is never left half-edited, and the commit protocol (new files, one atomic manifest, then
+ * the removals) is exactly the one every other operation uses.
+ */
+void PdfSessionTest::testAWholePageListChangeIsOneCommit()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+    QCOMPARE(before.pages.size(), 3);
+
+    /// The number a screen would ask for before naming the pages it is about to add.
+    QCOMPARE(PdfNotebookOps::nextFreePageNumber(project), 4);
+
+    /// Files for all three pages, a sidecar and a preview, so the change has something of every kind
+    /// to carry, copy, drop and turn.
+    const PdfPageRecord a = before.pages.at(0);
+    const PdfPageRecord b = before.pages.at(1);
+    const PdfPageRecord c = before.pages.at(2);
+    writeBytes(QDir(project).filePath(a.kraFile), QByteArrayLiteral("ink of A"));
+    writeBytes(QDir(project).filePath(a.kraFile + QStringLiteral(".layers/Ink.png")),
+               QByteArrayLiteral("a layer"));
+    writeBytes(QDir(project).filePath(a.thumbFile), QByteArrayLiteral("preview of A"));
+    writeBytes(QDir(project).filePath(b.kraFile), QByteArrayLiteral("ink of B"));
+    writeBytes(QDir(project).filePath(c.kraFile), QByteArrayLiteral("ink of C"));
+    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+
+    /// One plan: B first (a move), A turned (a rotate), a copy of A under the free number (a
+    /// duplicate), and C gone (a delete, with A's preview dropped because the turn invalidates it).
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = before.sources;
+    PdfPageRecord turned = a;
+    turned.extraRotation = 90;
+    PdfPageRecord copy = a;
+    copy.kraFile = PdfSession::pageFileNameForNumber(4);
+    copy.thumbFile = PdfSession::thumbFileNameForNumber(4);
+    edits.pages << b << turned << copy;
+    edits.copyExternal << qMakePair(QDir(project).filePath(a.kraFile), copy.kraFile)
+                       << qMakePair(QDir(project).filePath(a.thumbFile), copy.thumbFile);
+    edits.copyExternalDirs
+        << qMakePair(QDir(project).filePath(a.kraFile + QStringLiteral(".layers")),
+                     copy.kraFile + QStringLiteral(".layers"));
+    edits.removeAfter << c.kraFile << a.thumbFile;
+    edits.summary = QStringLiteral("moved, turned, duplicated and deleted");
+
+    StubRotator rotator;
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(project, edits, rotator.fn());
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// ONE manifest write for the whole change...
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 1);
+    /// ...and ONE journal entry, holding the manifest exactly as it was.
+    QVERIFY2(PdfNotebookOps::canUndo(project), "the change left nothing to undo");
+    QCOMPARE(readBytes(QDir(PdfNotebookOps::journalDir(project))
+                           .filePath(QStringLiteral("before.json"))),
+             manifestBefore);
+
+    /// The change is the one that was asked for: the order, the turn, the duplicate's files, and
+    /// the deleted page's file in the journal rather than gone.
+    QString why;
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.pages.size(), 3);
+    QCOMPARE(after.pages.at(0).kraFile, b.kraFile);
+    QCOMPARE(after.pages.at(1).kraFile, a.kraFile);
+    QCOMPARE(after.pages.at(1).extraRotation, 90);
+    QCOMPARE(after.pages.at(2).kraFile, copy.kraFile);
+
+    QCOMPARE(rotator.calls.size(), 1);
+    QCOMPARE(rotator.calls.at(0).source, QDir(project).filePath(a.kraFile));
+    QCOMPARE(rotator.calls.at(0).degrees, 90);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("turned"));
+    QCOMPARE(readBytes(QDir(project).filePath(copy.kraFile)), QByteArrayLiteral("ink of A"));
+    QVERIFY(QFileInfo::exists(QDir(project).filePath(copy.kraFile
+                                                    + QStringLiteral(".layers/Ink.png"))));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(c.kraFile)));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(a.thumbFile)));
+
+    /// ONE undo puts every part of it back.
+    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undo.ok, qPrintable(undo.why));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    QCOMPARE(readBytes(QDir(project).filePath(a.kraFile)), QByteArrayLiteral("ink of A"));
+    QCOMPARE(readBytes(QDir(project).filePath(a.thumbFile)), QByteArrayLiteral("preview of A"));
+    QCOMPARE(readBytes(QDir(project).filePath(c.kraFile)), QByteArrayLiteral("ink of C"));
+    QVERIFY(!QFileInfo::exists(QDir(project).filePath(copy.kraFile)));
+
+    /// And the safety net the screen depends on: a plan that would write over a page the notebook
+    /// already has is refused before anything is written, not after.
+    PdfNotebookOps::PageEdits clobber;
+    clobber.sources = before.sources;
+    clobber.pages = before.pages;
+    clobber.copyExternal << qMakePair(QDir(project).filePath(b.kraFile), b.kraFile);
+    why.clear();
+    PdfSessionManifest::resetWriteCountForTests();
+    const PdfNotebookOps::Outcome refused =
+        PdfNotebookOps::applyPageEdits(project, clobber, rotator.fn());
+    QVERIFY(!refused.ok);
+    QVERIFY2(refused.why.contains(QStringLiteral("write over")), qPrintable(refused.why));
+    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
+    /// Nothing was written at all: the refusal happens before the journal is even made.
+    QCOMPARE(PdfSessionManifest::writeCountForTests(), 0);
+    QVERIFY(!PdfNotebookOps::canUndo(project));
 }
 
 /**
