@@ -1475,6 +1475,31 @@ void showNotebookOpsMenuForShot(int attemptsLeft)
     qWarning("[pdfio] PDFIO_PROBE_MENU: the Notebook ops submenu is up");
 }
 
+/**
+ * Opens the Notebook ops screen for a screenshot run, once a notebook is really open.
+ *
+ * The same terms as the submenu above: the container's script cannot click, so the screen opens
+ * itself. \c PDFIO_PROBE has already asked for a notebook; this waits until it is on disk, because
+ * the screen reads the manifest rather than anything the running session holds.
+ */
+void showNotebookOpsScreenForShot(PdfIoPlugin *plugin, int attemptsLeft)
+{
+    if (PdfPageNavigator::instance()->hasNotebook()) {
+        qWarning("[pdfio] PDFIO_PROBE_OPS_SCREEN: opening the Notebook ops screen");
+        openNotebookOpsScreen(plugin);
+        qWarning("[pdfio] PDFIO_PROBE_OPS_SCREEN: the screen is up");
+        return;
+    }
+
+    if (attemptsLeft > 0) {
+        QTimer::singleShot(500, qApp, [plugin, attemptsLeft]() {
+            showNotebookOpsScreenForShot(plugin, attemptsLeft - 1);
+        });
+        return;
+    }
+    qWarning("[pdfio] PDFIO_PROBE_OPS_SCREEN: no notebook was open, so no screen was shown");
+}
+
 } // namespace
 
 PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
@@ -1489,6 +1514,16 @@ PdfIoPlugin::PdfIoPlugin(QObject *parent, const QVariantList &)
         if (!scheduled) {
             scheduled = true;
             QTimer::singleShot(4000, qApp, []() { showNotebookOpsMenuForShot(20); });
+        }
+    }
+
+    /// The screen itself for a screenshot run: one level further in than the submenu, and later,
+    /// because it needs the notebook PDFIO_PROBE opens to be there first.
+    if (qEnvironmentVariableIntValue("PDFIO_PROBE_OPS_SCREEN") > 0) {
+        static bool scheduled = false;
+        if (!scheduled) {
+            scheduled = true;
+            QTimer::singleShot(6000, qApp, [this]() { showNotebookOpsScreenForShot(this, 30); });
         }
     }
 
