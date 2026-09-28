@@ -419,9 +419,12 @@ void PdfIoDocker::refresh(int index, int pageCount, const QString &label)
     const QString shown = name.isEmpty() ? label : name;
     setWindowTitle(shown.isEmpty() ? QStringLiteral("Notebook") : shown);
 
+    const bool hasNotebook = PdfPageNavigator::instance()->hasNotebook();
     m_status->setText(pageCount > 0
                           ? QStringLiteral("%1 — page %2 of %3").arg(shown).arg(index + 1).arg(pageCount)
-                          : QStringLiteral("No notebook is open"));
+                          : (hasNotebook
+                                 ? QStringLiteral("No pages — insert pages from a PDF to continue")
+                                 : QStringLiteral("No notebook is open")));
 
     if (index >= 0 && index < m_pages->count()) {
         const QSignalBlocker blocker(m_pages);

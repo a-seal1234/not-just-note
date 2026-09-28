@@ -11,6 +11,7 @@
 
 #include <QString>
 #include <QStringList>
+#include <QSize>
 
 #include <functional>
 
@@ -257,6 +258,15 @@ public:
          */
         QStringList additions;
         /**
+         * The KIND of each addition, in the same order, for the sources they land as: empty (or a
+         * shorter list) means a PDF, "image" means a picture the notebook is taking in as a page.
+         *
+         * Parallel to \c additions rather than folded into it so that every caller written before
+         * pictures existed keeps working unchanged, and so that the one thing a caller has to say
+         * extra is what the file IS.
+         */
+        QStringList additionKinds;
+        /**
          * Files to place in the notebook's \c assets/ , as absolute paths: a notebook being merged
          * in keeps whatever its content layers point at.
          *
@@ -277,6 +287,29 @@ public:
          */
         ArtifactClipper clipper;
     };
+
+    /**
+     * Pixel dimensions describe the page as it would be rendered at a chosen DPI. PDF points are
+     * converted with px = points * DPI / 72; this does not rasterize or alter the source PDF.
+     */
+    static QSize pixelSizeAtDpi(const PdfPageRecord &page, int dpi);
+
+    /**
+     * Uniformly scale a page to fit inside a boundsPx at a dpi, preserving its proportions. The
+     * returned size is the actual fitted pixel size (one side may be smaller than the bound).
+     * Refuses scales outside the UI's 10%-800% range.
+     */
+    static bool scaleForPixelBounds(const PdfPageRecord &page, const QSize &boundsPx, int dpi,
+                                    qreal *extraScale, QSize *fittedSizePx, QString *why);
+
+    /**
+     * Fit selected zero-based page positions inside one pixel bound and commit the scale changes as
+     * one undoable notebook operation. Existing preview names are kept, but their stale files are
+     * journalled so the reader regenerates them at the new size.
+     */
+    static Outcome resizePagesToPixelBounds(const QString &projectDir, const QList<int> &pageIndices,
+                                            const QSize &boundsPx, int dpi, int currentPage,
+                                            const ArtifactRotator &rotator);
 
     /**
      * The next artifact number this notebook would hand out, so a screen can name the pages it is

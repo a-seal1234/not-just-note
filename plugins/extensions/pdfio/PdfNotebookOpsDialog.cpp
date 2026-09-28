@@ -21,8 +21,10 @@
 #include <QHeaderView>
 #include <QIcon>
 #include <QImage>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineF>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -43,6 +45,27 @@
 #include <functional>
 
 namespace {
+
+/// Millimetres to points: the two units a person can be asked about a sheet of paper in. The
+/// manifest, the renderer and the exporter all speak points, and this is the only place a typed
+/// millimetre is turned into one.
+qreal millimetresToPoints(qreal millimetres)
+{
+    return millimetres * 72.0 / 25.4;
+}
+
+/// A size as a person says it: "210 x 297 mm", rounded to the millimetre.
+QString sizeInMillimetres(const QSizeF &sizePt)
+{
+    const auto mm = [](qreal points) { return qRound(points * 25.4 / 72.0); };
+    return i18n("%1 x %2 mm", mm(sizePt.width()), mm(sizePt.height()));
+}
+
+/// The smallest and largest sheet a blank page may be typed as: below a centimetre there is nothing
+/// to draw on, and above two metres it is not paper any more -- and both ends are far inside what
+/// the page budget renders at a readable resolution.
+constexpr qreal MinBlankPageMm = 10.0;
+constexpr qreal MaxBlankPageMm = 2000.0;
 
 /// The columns the table shows, in order.
 enum Column {
@@ -1402,9 +1425,38 @@ void PdfNotebookOpsDialog::buildUi()
     /// Pages can be brought in from another PDF, and another notebook can be merged in: both are
     /// edits of THIS notebook's list, so they join the pending change like any other button.
     m_insert = addButton(i18n("Insert pages from a PDF..."), [this]() { insertPagesFromPdf(); });
+
+    /// The blank page sits beside the PDF insert: both add pages to the list, and the difference is
+    /// only where the paper comes from.
+    m_insertBlank = addButton(i18n("Insert a blank page..."), [this]() { insertBlankPage(); });
+
+    /// And a picture as a page of its own, beside it: one more way for paper to arrive, and the
+    /// copy of the file is part of this screen's one Apply.
+    m_insertImage = addButton(i18n("Insert a picture as a page..."), [this]() { insertImagePage(); });
+    m_insertImage->setObjectName(QStringLiteral("pdfio_ops_insert_image"));
+    m_insertImage->setToolTip(i18n("Adds a page whose paper is a picture -- a scan, a photo, a "
+                                   "screenshot. The file is copied into the notebook when you "
+                                   "apply."));
+    m_insertBlank->setObjectName(QStringLiteral("pdfio_ops_insert_blank"));
+    m_insertBlank->setToolTip(i18n("Adds an empty page you can draw on, at a size you choose."));
     m_insert->setObjectName(QStringLiteral("pdfio_ops_insert"));
     m_merge = addButton(i18n("Merge a notebook in..."), [this]() { mergeNotebookIn(); });
     m_merge->setObjectName(QStringLiteral("pdfio_ops_merge_notebook"));
+
+    /// Pixel resize is a separate transaction, not an edit of this screen's working copy. Leave
+    /// Manage Pages first so the existing resize path can save, change the manifest, and reopen the
+    /// notebook without silently discarding pending moves/turns/deletes.
+    m_batchResize = addButton(i18n("Batch resize pages..."), [this]() {
+        if (hasPendingEdits()) {
+            return;
+        }
+        m_requested = BatchPixelResizeAction;
+        accept();
+    });
+    m_batchResize->setObjectName(QStringLiteral("pdfio_ops_batch_pixel_resize"));
+    m_batchResize->setToolTip(i18n("Set pixel bounds and DPI for checked pages. Apply or cancel any "
+                                   "pending page-list changes first."));
+
     /// Extract writes a notebook of its own, somewhere else: it cannot be part of this notebook's
     /// Apply, so it is the one entry that waits for the list to be settled.
     m_extract = addButton(i18n("Extract a page range..."), [this]() {
@@ -1485,7 +1537,8 @@ void PdfNotebookOpsDialog::refresh()
         /// page that was never drawn on has none.
         const bool inked = QFileInfo::exists(QDir(row.fromDir).filePath(row.record.kraFile));
         cell(InkColumn, row.fromMergedNotebook ? i18n("from the merged notebook")
-                                               : (row.fromAddedPdf ? i18n("new page")
+                                               : (row.fromAddedPdf || row.fromAddedImage
+                                                      ? i18n("new page")
                                                                    : (row.isNew ? i18n("new copy")
                                                                                 : (inked ? i18n("drawn on")
                                                                                          : i18n("blank")))));
@@ -1520,7 +1573,7 @@ void PdfNotebookOpsDialog::refreshFooter()
     m_moveUp->setEnabled(live && keptAbove(row));
     m_moveDown->setEnabled(live && keptBelow(row));
     m_duplicate->setEnabled(live);
-    m_delete->setEnabled(live && keptCount() > 1);
+    m_delete->setEnabled(live);
     m_keep->setEnabled(selected && m_rows.at(row).removed);
     m_rotateLeft->setEnabled(live);
     m_rotateRight->setEnabled(live);
@@ -1529,8 +1582,12 @@ void PdfNotebookOpsDialog::refreshFooter()
     /// pending, like every other button. Extract writes a notebook of its own and waits, with the
     /// hint saying why.
     m_insert->setEnabled(true);
+    m_insertBlank->setEnabled(true);
+    /// Only where the platform's chooser is wired: an entry that cannot pick anything is not offered.
+    m_insertImage->setEnabled(bool(m_adder.pickImage));
     m_merge->setEnabled(true);
     m_extract->setEnabled(!dirty);
+    m_batchResize->setEnabled(!dirty);
 
     m_hint->setText(availabilityHint());
 
@@ -1747,10 +1804,6 @@ void PdfNotebookOpsDialog::deleteSelected()
     if (row < 0 || row >= m_rows.size() || m_rows.at(row).removed) {
         return;
     }
-    if (keptCount() <= 1) {
-        return; /// the button is off, and the hint says why
-    }
-
     if (m_rows.at(row).isNew) {
         /// It never existed: dropping it drops the files it would have brought, and there is
         /// nothing for the journal to take over.
@@ -2408,16 +2461,22 @@ QStringList PdfNotebookOpsDialog::pendingDescriptions() const
     int duplicated = 0;
     int inserted = 0;
     int mergedIn = 0;
+    int pictures = 0;
     for (const Row &row : m_rows) {
         if (row.removed) {
             ++deleted;
         } else if (row.fromMergedNotebook) {
             ++mergedIn;
+        } else if (row.fromAddedImage) {
+            ++pictures;
         } else if (row.fromAddedPdf) {
             ++inserted;
         } else if (row.isNew) {
             ++duplicated;
         }
+    }
+    if (pictures > 0) {
+        parts << i18np("a picture brought in as a page", "%1 pictures brought in as pages", pictures);
     }
     if (deleted > 0) {
         parts << i18np("%1 page deleted", "%1 pages deleted", deleted);
@@ -2522,14 +2581,18 @@ QStringList PdfNotebookOpsDialog::pendingDescriptions() const
 QString PdfNotebookOpsDialog::availabilityHint() const
 {
     if (m_rows.isEmpty()) {
-        return i18n("There are no pages to list.");
+        return i18n("This notebook has no pages. Insert pages from a PDF to continue.");
     }
     const int row = m_table->currentRow();
     if (row < 0 || row >= m_rows.size()) {
         return i18n("Select a page to move, duplicate, turn or delete it.");
     }
     if (m_rows.at(row).removed) {
-        return i18n("This page is marked for deletion. \"Keep page\" brings it back; Cancel "
+        if (keptCount() == 0) {
+            return i18n("Applying this change leaves the notebook empty. Insert pages from a PDF to continue; "
+                        "click Keep page to restore this page.");
+        }
+        return i18n("This page is marked for deletion. Click Keep page to restore it; Cancel "
                     "leaves the notebook alone.");
     }
 
@@ -2537,10 +2600,11 @@ QString PdfNotebookOpsDialog::availabilityHint() const
     if (!hasPendingEdits()) {
         notes << i18n("Apply is off because nothing has changed yet.");
     } else {
-        notes << i18n("Extract writes a notebook of its own, so finish this change first.");
+        notes << i18n("Extract and batch resize are separate operations; apply or cancel this page-list "
+                       "change first.");
     }
-    if (keptCount() <= 1) {
-        notes << i18n("A notebook keeps at least one page, so this page cannot be deleted.");
+    if (keptCount() == 1) {
+        notes << i18n("Deleting this page leaves the notebook empty; insert pages from a PDF to continue.");
     }
     if (!keptAbove(row)) {
         notes << i18n("This is the first page, so it cannot move up.");
@@ -2556,6 +2620,12 @@ QString PdfNotebookOpsDialog::availabilityHint() const
 
 QString PdfNotebookOpsDialog::sourceLabel(const PdfPageRecord &record) const
 {
+    /// A blank page comes from no file: naming one would point at a PDF that has nothing to do with
+    /// it (and at "page 0" of it, the number a -1 index would print).
+    if (record.isBlank()) {
+        return i18n("Blank page, %1", sizeInMillimetres(record.sizePt));
+    }
+
     const int primary = m_original.sources.size();
 
     /// A page of a PDF this change is bringing in: that file's name, because that is where its
@@ -2592,6 +2662,11 @@ PdfNotebookOps::PageEdits PdfNotebookOpsDialog::edits() const
         }
     }
     edits.copyExternal = m_copies;
+    /// The kind of each source this change brings in, in the order the pages name them: empty is a
+    /// PDF, "image" is a picture the page is drawn from.
+    for (const Addition &addition : m_additions) {
+        edits.additionKinds.append(addition.kind);
+    }
     edits.copyExternalDirs = m_copyDirs;
     edits.assetsToMerge = m_assets;
     edits.removeAfter = m_removals;
@@ -2628,6 +2703,9 @@ PdfNotebookOps::PageEdits PdfNotebookOpsDialog::edits() const
 void PdfNotebookOpsDialog::setSourceAdder(const SourceAdder &adder)
 {
     m_adder = adder;
+    /// The picture entry is offered only where the platform's chooser is wired, and that is known
+    /// when the adder arrives -- after the screen was built, so the footer is refreshed here.
+    refreshFooter();
 }
 
 void PdfNotebookOpsDialog::setNotebookMerger(const NotebookMerger &merger)
@@ -2662,6 +2740,7 @@ int PdfNotebookOpsDialog::sourceIndexFor(const PdfSourceRecord &source, const QS
 
     Addition addition;
     addition.path = absoluteFile;
+    addition.kind = source.kind;
     addition.sha256 = source.sha256.isEmpty() ? PdfSessionManifest::sha256OfFile(absoluteFile)
                                              : source.sha256;
     if (addition.sha256.isEmpty()) {
@@ -2673,6 +2752,153 @@ int PdfNotebookOpsDialog::sourceIndexFor(const PdfSourceRecord &source, const QS
 
     m_additions.append(addition);
     return m_original.sources.size() + m_additions.size() - 1;
+}
+
+QSizeF PdfNotebookOpsDialog::askBlankPageSize()
+{
+    const int row = m_table->currentRow();
+    const auto sheetOf = [this](int at) -> QSizeF {
+        if (at < 0 || at >= m_rows.size() || m_rows.at(at).removed) {
+            return QSizeF();
+        }
+        return m_rows.at(at).record.displaySizePt();
+    };
+    const QSizeF before = sheetOf(row);
+    const QSizeF after = sheetOf(row + 1);
+
+    /// A neighbour's size is offered FIRST because it is what a reader wants nine times in ten: the
+    /// blank page is a continuation of the page beside it, and asking for a measurement there would
+    /// be asking the user to copy a number the screen already knows.
+    QStringList labels;
+    QList<QSizeF> sizes;
+    const auto offer = [&labels, &sizes](const QSizeF &size, const QString &label) {
+        if (!size.isValid() || size.isEmpty() || sizes.contains(size)) {
+            return;
+        }
+        labels << label;
+        sizes << size;
+    };
+    offer(before, i18n("Same size as the page before (%1)", sizeInMillimetres(before)));
+    offer(after, i18n("Same size as the page after (%1)", sizeInMillimetres(after)));
+    offer(QSizeF(millimetresToPoints(210), millimetresToPoints(297)), i18n("A4 portrait (210 x 297 mm)"));
+    offer(QSizeF(millimetresToPoints(297), millimetresToPoints(210)), i18n("A4 landscape (297 x 210 mm)"));
+    offer(QSizeF(millimetresToPoints(148), millimetresToPoints(210)), i18n("A5 portrait (148 x 210 mm)"));
+    offer(QSizeF(millimetresToPoints(216), millimetresToPoints(279)), i18n("Letter portrait (216 x 279 mm)"));
+
+    const QString typed = i18n("A size I type...");
+    labels << typed;
+
+    bool ok = false;
+    const QString chosen = QInputDialog::getItem(this, i18n("Insert a blank page"),
+                                                 i18n("The size of the blank page:"), labels, 0, false,
+                                                 &ok);
+    if (!ok) {
+        return QSizeF();
+    }
+    const int at = labels.indexOf(chosen);
+    if (at >= 0 && at < sizes.size()) {
+        return sizes.at(at);
+    }
+
+    /// Typed: width then height in millimetres, with the last answer as the default, so a column of
+    /// pages can be made without retyping the width.
+    static qreal lastWidthMm = 210.0;
+    static qreal lastHeightMm = 297.0;
+    const qreal widthMm = QInputDialog::getDouble(this, i18n("Blank page width"),
+                                                  i18n("Width in millimetres:"), lastWidthMm,
+                                                  MinBlankPageMm, MaxBlankPageMm, 0, &ok);
+    if (!ok) {
+        return QSizeF();
+    }
+    const qreal heightMm = QInputDialog::getDouble(this, i18n("Blank page height"),
+                                                   i18n("Height in millimetres:"), lastHeightMm,
+                                                   MinBlankPageMm, MaxBlankPageMm, 0, &ok);
+    if (!ok) {
+        return QSizeF();
+    }
+    lastWidthMm = widthMm;
+    lastHeightMm = heightMm;
+    return QSizeF(millimetresToPoints(widthMm), millimetresToPoints(heightMm));
+}
+
+void PdfNotebookOpsDialog::insertBlankPage()
+{
+    const QSizeF size = askBlankPageSize();
+    if (!size.isValid() || size.isEmpty()) {
+        return;
+    }
+
+    /// After the page the user is on, which is where a reader expects new pages to land -- the same
+    /// place the menu's own insert entry puts them.
+    const int at = qBound(0, m_table->currentRow() + 1, m_rows.size());
+
+    Row row;
+    /// The record says "no source, and no page inside one". Both halves are needed: the manifest
+    /// refuses a blank page that still names a page number, because that record can be read two ways
+    /// and one of those ways is the user's PDF appearing where the blank page is.
+    row.record.index = -1;
+    row.record.source = -1;
+    row.record.sizePt = size;
+    row.record.rotation = 0;
+    const int number = m_nextNumber++;
+    row.record.kraFile = PdfSession::pageFileNameForNumber(number);
+    row.record.thumbFile = PdfSession::thumbFileNameForNumber(number);
+    /// Nothing to copy: the page has never been drawn on, so it has no artifact, and its paper is
+    /// the renderer's business rather than a file's.
+    row.isNew = true;
+
+    m_rows.insert(at, row);
+    refresh();
+    m_table->selectRow(at);
+}
+
+void PdfNotebookOpsDialog::insertImagePage()
+{
+    if (!m_adder.pickImage) {
+        return;
+    }
+
+    ImageToAdd picture;
+    if (!m_adder.pickImage(&picture) || picture.path.isEmpty() || !picture.sizePt.isValid()) {
+        return;
+    }
+
+    /// The source this page will draw from. A picture the change is already bringing in is SHARED:
+    /// two pages of one scan is one copy of its bytes, which is the rule a PDF already follows.
+    PdfSourceRecord source;
+    source.file = QFileInfo(picture.path).fileName();
+    source.sha256 = PdfSessionManifest::sha256OfFile(picture.path);
+    source.byteSize = QFileInfo(picture.path).size();
+    source.kind = QStringLiteral("image");
+
+    QString why;
+    const int sourceIndex = sourceIndexFor(source, picture.path, &why);
+    if (sourceIndex < 0) {
+        QMessageBox::warning(this, i18n("Insert a picture as a page"), why);
+        return;
+    }
+
+    /// After the page the user is on, which is where every other insert entry puts new pages.
+    const int at = qBound(0, m_table->currentRow() + 1, m_rows.size());
+
+    Row row;
+    /// One picture is one page, and the page of a picture source is always its first: an image has
+    /// no second page to name.
+    row.record.index = 0;
+    row.record.source = sourceIndex;
+    row.record.sizePt = picture.sizePt;
+    /// The import's own answer about how big the picture is: the page's SCALE, which is the mode that
+    /// already means "show this page at this share of its own size", and what the exporter applies.
+    row.record.extraScale = picture.scale > 0.0 ? picture.scale : 1.0;
+    const int number = m_nextNumber++;
+    row.record.kraFile = PdfSession::pageFileNameForNumber(number);
+    row.record.thumbFile = PdfSession::thumbFileNameForNumber(number);
+    row.isNew = true;
+    row.fromAddedImage = true;
+
+    m_rows.insert(at, row);
+    refresh();
+    m_table->selectRow(at);
 }
 
 void PdfNotebookOpsDialog::insertPagesFromPdf()

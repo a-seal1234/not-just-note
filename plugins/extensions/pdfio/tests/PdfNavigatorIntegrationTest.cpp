@@ -5,6 +5,7 @@
  */
 
 #include "PdfNotebookOpsDialog.h"
+#include "PdfNotebookResizeDialog.h"
 #include "PdfPageNavigator.h"
 
 #include "backends/poppler/PopplerRenderBackend.h"
@@ -23,7 +24,9 @@
 #include <KisResourceCacheDb.h>
 #include <KisResourceLocator.h>
 #include <KisView.h>
+#include <kis_canvas2.h>
 #include <kis_canvas_controller.h>
+#include <kis_tool_proxy.h>
 
 #include <kis_group_layer.h>
 #include <kis_image.h>
@@ -36,11 +39,15 @@
 #include <KoTestConfig.h>
 
 #include <QApplication>
+#include <QDateTime>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QImage>
 #include <QLabel>
+#include <QListWidget>
 #include <QMessageBox>
+#include <QSpinBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
@@ -103,6 +110,7 @@ private Q_SLOTS:
     void testAPageIsWrittenToTheArtifactTheManifestNames();
     void testRefusedSaveKeepsThePageOpenAndTheInkIntact();
     void testInkIsNotWrittenWhileThePenIsStillBusy();
+    void testIdleSaveWaitsForThirtySecondsAndAnActiveToolAction();
     void testALayerThatIsNotInkIsSavedToo();
     void testQuittingWritesTheInkToo();
     void testClosingTheTabWritesTheInkAndAsksNothing();
@@ -111,6 +119,10 @@ private Q_SLOTS:
     void testAMovedPageKeepsTheReaderAndTheirInk();
     void testADeletedPageLeavesTheReaderOnTheNextOne();
     void testRotatingAPageTurnsTheInkWithThePaper();
+    void testTheRealClipperCropsThePageAndKeepsItsInk();
+    void testABlankPageIsInsertedAndOpensAsWhitePaper();
+    void testABlankPageIsWhitePaperInTheStripAsWell();
+    void testAPictureIsBroughtInAsAPage();
     void testAnExtractedRangeOpensAsItsOwnNotebook();
     void testMergingANotebookInAddsItsPagesAndKeepsTheReader();
     void testTheScreenKeepsItsChangeUntilApply();
@@ -181,6 +193,7 @@ private Q_SLOTS:
     /// A count change while a strip is open lands the document at the new size through the ROLL --
     /// the same document, the same image, the bands re-cut -- rather than a rebuild.
     void testAStripPageCountChangeResizesTheSameDocument();
+    void testResizeThenRollScalesTheSavedArtifactIntoItsNewSlot();
     /// The count is bounded by the notebook rather than by a constant of this build's.
     void testAStripPageCountIsBoundedByTheNotebook();
     /// A bigger strip at a fixed budget stays inside it (the pages get coarser); with no limit it
@@ -191,6 +204,10 @@ private Q_SLOTS:
     /// Scale and Box reset independently, and a scaled page renders at a larger SOURCE dpi rather
     /// than being upscaled.
     void testTheOpsPaneKeepsTurnScaleAndBoxApart();
+    void testPixelResizeUsesDpiAndPreservesAspectRatio();
+    void testPixelResizeDialogOffersSingleAndBatchModes();
+    void testBatchPixelResizeIsReachableFromManagePages();
+    void testBatchPixelResizeIsAtomicAndUndoable();
     void testAScaledPageIsRenderedAtALargerDpi();
 
     /// The page-loading trigger: the settle delay and the reading share, persisted, defaulted to
@@ -332,7 +349,7 @@ bool inkMarkInImage(const QImage &pixels)
 
 bool inkMarkPresent(const KisImageSP &image)
 {
-    KisPaintLayer *layer = inkLayer(image);
+    KisPaintLayer *layer = stripInkLayer(image);
     if (!layer || !image) {
         return false;
     }
@@ -589,7 +606,7 @@ void PdfNavigatorIntegrationTest::drawInk(KisDocument *document)
     const KisImageSP image = document->image();
     QVERIFY(image);
 
-    KisPaintLayer *layer = inkLayer(image);
+    KisPaintLayer *layer = stripInkLayer(image);
     QVERIFY(layer);
     layer->paintDevice()->fill(InkMark, KoColor(QColor(0, 0, 0), image->colorSpace()));
     QVERIFY2(inkMarkPresent(image), "the mark did not land on the ink layer");
@@ -812,11 +829,11 @@ void PdfNavigatorIntegrationTest::testRefusedSaveKeepsThePageOpenAndTheInkIntact
  * The pipeline used to write the ink down after 600 ms of quiet, and in a strip that means every
  * page of the window -- which page a stroke belongs to is only decided at save time -- so taking
  * notes rewrote all five artifacts, some ten megabytes, every three seconds of the session
- * (pdfio.log, 2026-09-24: seven full five-page cycles inside thirty seconds). Ten seconds of
+ * (pdfio.log, 2026-09-24: seven full five-page cycles inside thirty seconds). Thirty seconds of
  * quiet is now the earliest an idle write runs and five minutes is the longest ink may sit
- * unsaved, so a second and a half after a stroke nothing may be on disk -- and the page turn
- * must still write it and wait for the landing, because that is what stands between a turn and a
- * lost stroke.
+ * unsaved while no canvas action is held, so a second and a half after a stroke nothing may be on
+ * disk -- and the page turn must still write it and wait for the landing, because that is what
+ * stands between a turn and a lost stroke.
  */
 void PdfNavigatorIntegrationTest::testInkIsNotWrittenWhileThePenIsStillBusy()
 {
@@ -839,6 +856,53 @@ void PdfNavigatorIntegrationTest::testInkIsNotWrittenWhileThePenIsStillBusy()
     QVERIFY2(waitForInk(artifact), qPrintable(artifact));
     QVERIFY2(inkMarkInImage(PdfInkLoader::loadInk(artifact)),
              "the turn wrote the page without the ink that was on it");
+}
+
+void PdfNavigatorIntegrationTest::testIdleSaveWaitsForThirtySecondsAndAnActiveToolAction()
+{
+    QVERIFY(useNotebook(QStringLiteral("idle-save")));
+
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+    Q_EMIT page->image()->sigImageModified();
+
+    const QString artifact = artifactFor(0);
+    QVERIFY(!QFileInfo::exists(artifact));
+
+    KisView *view = navigator()->currentView();
+    QVERIFY(view && view->canvasBase());
+    KisToolProxy *toolProxy = qobject_cast<KisToolProxy *>(view->canvasBase()->toolProxy());
+    QVERIFY(toolProxy);
+
+    /// Exercise the policy without sleeping for 30 seconds: under the quiet threshold there is no
+    /// write, even though a write would be eligible if the old 10-second threshold were still in use.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    navigator()->m_lastInkChange = now - 25000;
+    navigator()->m_lastAutoSave = now - 5000;
+    navigator()->pumpAutoSave();
+    QVERIFY2(!QFileInfo::exists(artifact), "the idle write ignored the 30-second quiet period");
+
+    /// Once the threshold has elapsed, a held canvas action still blocks the timed save and the
+    /// five-minute backstop. It also refuses page changes that would otherwise evict the live ink.
+    navigator()->m_lastInkChange = now - 31000;
+    Q_EMIT toolProxy->toolPrimaryActionActivated(true);
+    QVERIFY(navigator()->m_toolActionActive);
+    navigator()->pumpAutoSave();
+    QVERIFY2(!QFileInfo::exists(artifact), "the idle write ran while a canvas action was active");
+
+    QString why;
+    QVERIFY(!navigator()->next(&why));
+    QCOMPARE(navigator()->currentIndex(), 0);
+    QVERIFY(!QFileInfo::exists(artifact));
+
+    /// On END, the next idle tick may safely write the now-settled ink.
+    Q_EMIT toolProxy->toolPrimaryActionActivated(false);
+    QVERIFY(!navigator()->m_toolActionActive);
+    navigator()->pumpAutoSave();
+    QVERIFY2(waitForInk(artifact), qPrintable(artifact));
+    QVERIFY2(inkMarkInImage(PdfInkLoader::loadInk(artifact)),
+             "the idle write did not preserve the page's ink");
 }
 
 /**
@@ -1136,7 +1200,8 @@ void PdfNavigatorIntegrationTest::testInsertingOnAStripWritesThePageAndNotTheStr
     KisImageSP image = document->image();
     QVERIFY(image);
 
-    const PdfStripLayout layout = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
+    const qreal renderDpi = navigator()->currentRenderDpi();
+    const PdfStripLayout layout = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, renderDpi);
     QVERIFY(layout.isValid());
     const int slot = layout.slotForPage(0);
     QVERIFY(slot >= 0);
@@ -1161,7 +1226,8 @@ void PdfNavigatorIntegrationTest::testInsertingOnAStripWritesThePageAndNotTheStr
 
     /// The picture, as placeInsertedImage() puts one there: its own layer, its own pixels, the place
     /// carried by the layer offset, well inside page 1.
-    const QPoint pictureOnStrip(200, 300);
+    const qreal pictureScale = renderDpi / 200.0;
+    const QPoint pictureOnStrip(qRound(200 * pictureScale), qRound(300 * pictureScale));
     const QRect pictureOnStripRect(pictureOnStrip, QSize(60, 60));
     QVERIFY2(pageRect.contains(pictureOnStripRect),
              qPrintable(QStringLiteral("the picture at %1,%2 is not inside page 1 (%3,%4 %5x%6)")
@@ -1423,6 +1489,490 @@ void PdfNavigatorIntegrationTest::testADeletedPageLeavesTheReaderOnTheNextOne()
     QCOMPARE(navigator()->currentIndex(), 0);
     QVERIFY2(inkMarkPresent(navigator()->currentDocument()->image()),
              "the page that was not deleted lost its ink to the delete");
+
+    /// The last operation may remove every remaining page. The notebook stays open with no stale
+    /// canvas, and its retained source lets the reader insert a page again.
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    const int remaining = navigator()->pageCount();
+    const PdfNotebookOps::Outcome emptied =
+        PdfNotebookOps::deletePages(navigator()->projectDir(), 0, remaining, navigator()->currentIndex());
+    QVERIFY2(emptied.ok, qPrintable(emptied.why));
+    QCOMPARE(emptied.anchorPage, -1);
+    QVERIFY2(navigator()->reloadNotebook(emptied.anchorPage, &why), qPrintable(why));
+    clock.restart();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the empty notebook reload never finished");
+    QVERIFY(navigator()->hasNotebook());
+    QCOMPARE(navigator()->pageCount(), 0);
+    QCOMPARE(navigator()->currentIndex(), -1);
+    QVERIFY(!navigator()->currentDocument());
+    QVERIFY(!navigator()->currentView());
+
+    const PdfSessionManifest empty = PdfSession::openProject(navigator()->projectDir(), &why);
+    QVERIFY2(empty.isValid(&why), qPrintable(why));
+    QVERIFY(empty.pages.isEmpty());
+    const QString sourcePath = QDir(navigator()->projectDir()).filePath(empty.sourceFile);
+    PopplerRenderBackend backend;
+    QVERIFY2(backend.open(sourcePath), qPrintable(sourcePath));
+    const PdfNotebookOps::Outcome restored =
+        PdfNotebookOps::insertPages(navigator()->projectDir(), 0, sourcePath, backend, 0, 1, -1);
+    QVERIFY2(restored.ok, qPrintable(restored.why));
+    QVERIFY2(navigator()->reloadNotebook(restored.anchorPage, &why), qPrintable(why));
+    clock.restart();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the repopulated notebook reload never finished");
+    QCOMPARE(navigator()->pageCount(), 1);
+    QCOMPARE(navigator()->currentIndex(), 0);
+    QVERIFY(navigator()->currentDocument());
+}
+
+
+
+/**
+ * A blank page's paper is WHITE in the strip as well as on its own -- and it gets a preview.
+ *
+ * A page with no source is answered by the record, but every other page's paper comes from asking the
+ * source's renderer for it. One round of this work answered the blank case AFTER that lookup, so the
+ * lookup's refusal ("this page does not record which PDF its background comes from") became the
+ * answer: the strip's band kept the colour of the DESK -- a grey sheet where the user's blank page is
+ * -- and the page never got a preview at all. The single-page path goes through PdfProjectBuilder and
+ * looked right, which is exactly why the strip needed a test of its own.
+ */
+void PdfNavigatorIntegrationTest::testABlankPageIsWhitePaperInTheStripAsWell()
+{
+    QVERIFY(useNotebook(QStringLiteral("blank-in-strip"), 3));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest before = navigator()->manifest();
+    QVERIFY(before.pages.size() >= 2);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+
+    /// Appended, so the blank page's paper layer cannot share a name with a page of the source: the
+    /// strip names a paper layer after the page it holds.
+    const int blankIndex = before.pages.size();
+    PdfPageRecord blank;
+    blank.source = -1;
+    blank.index = -1;
+    blank.sizePt = QSizeF(420, 595);
+    blank.kraFile = PdfSession::pageFileNameForNumber(before.effectiveNextPageNumber());
+    blank.thumbFile = PdfSession::thumbFileNameForNumber(before.effectiveNextPageNumber());
+
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = before.sources;
+    edits.pages = before.pages;
+    edits.pages.append(blank);
+    edits.summary = QStringLiteral("1 blank page");
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::applyPageEdits(project, edits, PdfPageRotator::rotateInto);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    QVERIFY2(navigator()->reloadNotebook(blankIndex, &why), qPrintable(why));
+    QTRY_VERIFY_WITH_TIMEOUT(!navigator()->reloadPending(), 30000);
+    QCOMPARE(navigator()->currentIndex(), blankIndex);
+    /// The STRIP is what is open, which is the path the grey sheet was reported on.
+    QCOMPARE(navigator()->scope(), 3);
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document && document->image());
+    const KisImageSP strip = document->image();
+
+    const QString paperName = PdfStripBuilder::backgroundLayerName(blankIndex);
+    KisNodeSP paper;
+    for (quint32 i = 0; i < strip->root()->childCount(); ++i) {
+        if (strip->root()->at(i)->name() == paperName) {
+            paper = strip->root()->at(i);
+            break;
+        }
+    }
+    QVERIFY2(paper, qPrintable(QStringLiteral("the strip has no paper layer named %1").arg(paperName)));
+
+    /// Where the page sits, from the same layout the strip was built with.
+    const PdfStripLayout layout = PdfStripLayout::forWindow(navigator()->manifest(), blankIndex,
+                                                            navigator()->scope(),
+                                                            navigator()->currentRenderDpi());
+    QVERIFY(layout.isValid());
+    QRect slot;
+    for (const PdfStripLayout::Slot &candidate : layout.slots()) {
+        if (candidate.page == blankIndex) {
+            slot = candidate.rect;
+        }
+    }
+    QVERIFY2(!slot.isEmpty(), "the layout has no slot for the blank page");
+
+    const QImage pixels = paper->paintDevice()->convertToQImage(0, strip->bounds());
+    QVERIFY(!pixels.isNull());
+    const QColor sheet = pixels.pixelColor(slot.center());
+    QVERIFY2(sheet == QColor(Qt::white),
+             qPrintable(QStringLiteral("the blank page's paper is %1 where it should be white")
+                            .arg(sheet.name())));
+    /// The room around it is still the desk, which is what every other page's band shows: this test
+    /// is about the PAGE being white, not about the desk changing colour.
+    const QColor desk = pixels.pixelColor(slot.x() - 4, slot.center().y());
+    QVERIFY2(desk != QColor(Qt::white), "the desk around the page came out white as well");
+
+    /// And a blank page gets a preview: the same render path produces it, and before the fix it
+    /// produced nothing at all -- a page that could never have a picture.
+    const QString preview = QDir(project).filePath(blank.thumbFile);
+    navigator()->ensureThumbnail(blankIndex);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(preview), 30000);
+    const QImage written(preview);
+    QVERIFY2(!written.isNull(), qPrintable(preview));
+    QCOMPARE(written.pixelColor(written.width() / 2, written.height() / 2), QColor(Qt::white));
+
+    /// The notebook is left the way the other tests leave theirs.
+    if (navigator()->currentDocument()) {
+        navigator()->currentDocument()->setModified(false);
+    }
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+}
+
+/**
+ * A picture goes in as a page: the screen's own entry, the copy into the notebook's sources, and the
+ * page that opens with the picture as its paper.
+ *
+ * This drives the entry the way the application does -- the screen asks the platform's chooser through
+ * the adder, so a test can hand it a file -- and then the real commit and reload, because the two
+ * halves have to agree: what the screen promised in its working copy is what the notebook has on disk
+ * afterwards, picture bytes and all.
+ */
+void PdfNavigatorIntegrationTest::testAPictureIsBroughtInAsAPage()
+{
+    QVERIFY(useNotebook(QStringLiteral("picture-page")));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest before = navigator()->manifest();
+    QVERIFY(before.pages.size() >= 2);
+
+    /// A picture with something recognisable in it, so "the paper is the picture" is a claim the
+    /// pixels can settle.
+    QImage scan(80, 50, QImage::Format_ARGB32_Premultiplied);
+    scan.fill(Qt::white);
+    for (int x = 10; x < 20; ++x) {
+        for (int y = 5; y < 15; ++y) {
+            scan.setPixelColor(x, y, QColor(Qt::black));
+        }
+    }
+    const QString pictureFile = m_dir.filePath(QStringLiteral("scan.png"));
+    QVERIFY2(scan.save(pictureFile, "PNG"), qPrintable(pictureFile));
+
+    /// The screen, with the platform's chooser stubbed: the entry's own path is what is under test.
+    PdfNotebookOpsDialog dialog(project, before, navigator()->currentIndex());
+    auto *insert = dialog.findChild<QPushButton *>(QStringLiteral("pdfio_ops_insert_image"));
+    QVERIFY2(insert, "the screen has no picture entry");
+    QVERIFY2(!insert->isEnabled(), "the entry is offered although no chooser is wired");
+
+    PdfNotebookOpsDialog::SourceAdder adder;
+    adder.pickImage = [&pictureFile](PdfNotebookOpsDialog::ImageToAdd *out) {
+        const QImage loaded(pictureFile);
+        if (loaded.isNull()) {
+            return false;
+        }
+        out->path = pictureFile;
+        out->sizePt = QSizeF(loaded.width(), loaded.height());
+        return true;
+    };
+    dialog.setSourceAdder(adder);
+    QVERIFY2(insert->isEnabled(), "the entry stayed off after a chooser was wired");
+    insert->click();
+
+    /// What the screen promises: one more page, after the page the reader is on, drawn from a source
+    /// this change brings in, at the picture's own size.
+    const PdfNotebookOps::PageEdits edits = dialog.edits();
+    QCOMPARE(edits.pages.size(), before.pages.size() + 1);
+    QCOMPARE(edits.additions.size(), 1);
+    QCOMPARE(edits.additionKinds, QStringList{QStringLiteral("image")});
+    const PdfPageRecord added = edits.pages.at(1);
+    QCOMPARE(added.sizePt, QSizeF(80, 50));
+    QCOMPARE(added.source, before.sources.size());
+    QCOMPARE(added.index, 0);
+    /// Nothing was copied yet: the screen changes nothing until Apply.
+    QVERIFY2(!QFileInfo::exists(QDir(project).filePath(QStringLiteral("sources"))),
+             "the screen copied a file before Apply");
+
+    /// Apply through the engine every other edit goes through.
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::applyPageEdits(project, edits, PdfPageRotator::rotateInto);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    /// On disk: one more source, and it is a PICTURE with the picture's own bytes.
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(&why), qPrintable(why));
+    QCOMPARE(after.sources.size(), before.sources.size() + 1);
+    const PdfSourceRecord source = after.sources.last();
+    QVERIFY2(source.isImage(), "the picture's source did not stay a picture");
+    QVERIFY2(source.file.endsWith(QStringLiteral(".png")), qPrintable(source.file));
+    const QString copied = QDir(project).filePath(source.file);
+    QVERIFY2(QFileInfo::exists(copied), qPrintable(copied));
+    QCOMPARE(PdfSessionManifest::sha256OfFile(copied), source.sha256);
+    QCOMPARE(QFileInfo(copied).size(), source.byteSize);
+    QCOMPARE(after.pages.at(1).source, after.sources.size() - 1);
+    QCOMPARE(after.pages.at(1).sizePt, QSizeF(80, 50));
+
+    /// Reload onto it: the page opens, its paper is the picture, and there is an Ink group to draw in.
+    QVERIFY2(navigator()->reloadNotebook(1, &why), qPrintable(why));
+    QTRY_VERIFY_WITH_TIMEOUT(!navigator()->reloadPending(), 30000);
+    QCOMPARE(navigator()->currentIndex(), 1);
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document && document->image());
+    const KisImageSP image = document->image();
+    const qreal dpi = image->xRes();
+    QVERIFY2(qAbs(image->width() - qRound(80 * dpi / 72.0)) <= 2
+                 && qAbs(image->height() - qRound(50 * dpi / 72.0)) <= 2,
+             qPrintable(QStringLiteral("the picture page opened %1x%2, where 80x50 points at %3 dpi "
+                                       "are %4x%5")
+                            .arg(image->width()).arg(image->height()).arg(dpi)
+                            .arg(qRound(80 * dpi / 72.0)).arg(qRound(50 * dpi / 72.0))));
+
+    KisNodeSP paper;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        if (image->root()->at(i)->name() == PdfProjectBuilder::backgroundLayerName()) {
+            paper = image->root()->at(i);
+            break;
+        }
+    }
+    QVERIFY2(paper, "the picture page has no paper layer");
+    const QImage pixels = paper->paintDevice()->convertToQImage(0, image->bounds());
+    QVERIFY(!pixels.isNull());
+    /// White where the picture is white, dark where the picture's block is: the page really is the
+    /// picture, scaled to the page the record describes.
+    const auto atPicturePixel = [&pixels, dpi](int x, int y) {
+        return pixels.pixelColor(qBound(0, qRound(x * dpi / 72.0), pixels.width() - 1),
+                                 qBound(0, qRound(y * dpi / 72.0), pixels.height() - 1));
+    };
+    QVERIFY2(qGray(atPicturePixel(2, 2).rgb()) > 200, "the picture's paper is not white");
+    QVERIFY2(qGray(atPicturePixel(15, 10).rgb()) < 100, "the picture's mark did not reach the page");
+    QVERIFY2(qGray(atPicturePixel(70, 40).rgb()) > 200, "the page is not the picture at its far end");
+    QVERIFY2(PdfProjectBuilder::inkStrokeLayer(image), "the picture page has nothing to draw on");
+
+    /// The notebook is left the way the other tests leave theirs.
+    document->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+}
+
+/**
+ * A blank page goes in through the same commit as any other page, and opens as white paper of the
+ * size it was given -- with the Ink group above it, ready for a stroke.
+ *
+ * The engine is what this drives (the ops screen's entry that asks the size is a dialog, and a modal
+ * question is not something a ctest should be clicking through): a page record with no source is
+ * inserted between two pages of a real notebook, committed, and the notebook is reloaded onto it.
+ */
+void PdfNavigatorIntegrationTest::testABlankPageIsInsertedAndOpensAsWhitePaper()
+{
+    QVERIFY(useNotebook(QStringLiteral("blank-page")));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest before = navigator()->manifest();
+    QVERIFY(before.pages.size() >= 2);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+
+    /// The record the ops screen builds: no source, no page inside one, its own size, and a name from
+    /// the notebook's own allocator so nothing the notebook already has is written over.
+    PdfPageRecord blank;
+    blank.source = -1;
+    blank.index = -1;
+    blank.sizePt = QSizeF(420, 595);
+    blank.kraFile = PdfSession::pageFileNameForNumber(before.effectiveNextPageNumber());
+
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = before.sources;
+    edits.pages = before.pages;
+    edits.pages.insert(1, blank);
+    edits.summary = QStringLiteral("1 blank page was inserted");
+
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::applyPageEdits(project, edits, PdfPageRotator::rotateInto);
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+
+    QVERIFY2(navigator()->reloadNotebook(1, &why), qPrintable(why));
+    QTRY_VERIFY_WITH_TIMEOUT(!navigator()->reloadPending(), 30000);
+    QCOMPARE(navigator()->currentIndex(), 1);
+
+    /// On disk and on screen: the notebook has one more page, and the one the reader is on is blank.
+    const PdfSessionManifest after = navigator()->manifest();
+    QCOMPARE(after.pages.size(), before.pages.size() + 1);
+    const PdfPageRecord opened = after.pages.at(1);
+    QVERIFY2(opened.isBlank(), "the blank page did not survive the commit");
+    QCOMPARE(opened.sizePt, QSizeF(420, 595));
+    /// The pages around it are untouched and still draw from their own PDF.
+    QCOMPARE(after.pages.at(2).kraFile, before.pages.at(1).kraFile);
+    QVERIFY(!after.pages.at(0).isBlank());
+
+    KisDocument *document = navigator()->currentDocument();
+    QVERIFY(document && document->image());
+    const KisImageSP image = document->image();
+    const qreal dpi = image->xRes();
+    QVERIFY2(qAbs(image->width() - qRound(opened.displaySizePt().width() * dpi / 72.0)) <= 2,
+             qPrintable(QStringLiteral("the blank page opened %1 px wide, where its own 420 points "
+                                       "at %2 dpi are %3")
+                            .arg(image->width()).arg(dpi)
+                            .arg(qRound(opened.displaySizePt().width() * dpi / 72.0))));
+
+    /// White paper, not a hole: the paper layer is there, locked, and every corner of it is white.
+    KisNodeSP paper;
+    for (quint32 i = 0; i < image->root()->childCount(); ++i) {
+        if (image->root()->at(i)->name() == PdfProjectBuilder::backgroundLayerName()) {
+            paper = image->root()->at(i);
+            break;
+        }
+    }
+    QVERIFY2(paper, "the blank page has no paper layer");
+    const QImage pixels = paper->paintDevice()->convertToQImage(0, image->bounds());
+    QVERIFY(!pixels.isNull());
+    QCOMPARE(pixels.pixelColor(0, 0), QColor(Qt::white));
+    QCOMPARE(pixels.pixelColor(pixels.width() / 2, pixels.height() / 2), QColor(Qt::white));
+
+    /// And it is drawable: the Ink group's stroke layer is the one a pen lands in.
+    QVERIFY2(PdfProjectBuilder::inkStrokeLayer(image), "the blank page has nothing to draw on");
+
+    /// The reader can leave it, and the notebook still describes it when they come back.
+    QVERIFY2(navigator()->next(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 2);
+    QVERIFY2(navigator()->previous(&why), qPrintable(why));
+    QCOMPARE(navigator()->currentIndex(), 1);
+    QVERIFY(navigator()->manifest().pages.at(1).isBlank());
+
+    /// The notebook is left the way the other tests leave theirs.
+    if (navigator()->currentDocument()) {
+        navigator()->currentDocument()->setModified(false);
+    }
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
+}
+
+/**
+ * A box crop really clips the page's artifact, and the ink the box covers survives it.
+ *
+ * The ops screen's crop was covered only with a stub clipper, which is the stub's own admission that
+ * the real one -- PdfPageRotator::clipInto, the only clipper the screen ever names -- had never been
+ * run by a test at all. It is also the operation a user reported as taking minutes and ending in an
+ * OOM on the tablet, so this drives it end to end: a real artifact with a real mark, the real
+ * clipper, and the page the reader gets afterwards.
+ */
+void PdfNavigatorIntegrationTest::testTheRealClipperCropsThePageAndKeepsItsInk()
+{
+    QVERIFY(useNotebook(QStringLiteral("ops-clip")));
+    QCOMPARE(navigator()->currentIndex(), 0);
+
+    KisDocument *page = navigator()->currentDocument();
+    QVERIFY(page);
+    drawInk(page);
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+
+    const QString project = navigator()->projectDir();
+    const QString artifact = artifactFor(0);
+    QVERIFY(QFileInfo::exists(artifact));
+
+    const QSize before = PdfInkLoader::artifactSize(artifact, &why);
+    QVERIFY2(!before.isEmpty(), qPrintable(why));
+    const QImage inkBefore = layerNamed(PdfInkLoader::loadInkLayers(artifact, &why),
+                                        PdfProjectBuilder::inkStrokeLayerName());
+    QVERIFY2(!inkBefore.isNull(), qPrintable(why));
+    const QRect markBefore = markedBounds(inkBefore);
+    QVERIFY2(!markBefore.isEmpty(), "the page has no marked pixels to follow through the crop");
+
+    /// A box over the page's left half, in the record's own points: what the box covers is kept and
+    /// the rest is dropped. The mark is drawn at the page's top-left corner (InkMark), so it is
+    /// inside the box and the crop has to carry it, unmoved, into the smaller artifact.
+    const PdfSessionManifest beforeManifest = navigator()->manifest();
+    QVERIFY(beforeManifest.pages.size() >= 1);
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = beforeManifest.sources;
+    PdfPageRecord cropped = beforeManifest.pages.at(0);
+    const QRectF sheet(0, 0, cropped.sizePt.width(), cropped.sizePt.height());
+    const QRectF box(sheet.x(), sheet.y(), sheet.width() / 2.0, sheet.height());
+    cropped.boxPt = box;
+    edits.pages << cropped;
+    for (int i = 1; i < beforeManifest.pages.size(); ++i) {
+        edits.pages << beforeManifest.pages.at(i);
+    }
+    edits.clipper = PdfPageRotator::clipInto;
+    edits.summary = QStringLiteral("1 page cropped");
+
+    QElapsedTimer clock;
+    clock.start();
+    const PdfNotebookOps::Outcome outcome =
+        PdfNotebookOps::applyPageEdits(project, edits, PdfPageRotator::rotateInto);
+    const qint64 cropMs = clock.elapsed();
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    qInfo("the crop of one page took %lld ms", static_cast<long long>(cropMs));
+
+    /// The artifact is the left half of the sheet, at the dpi it was already written at.
+    const QSize expected(qRound(before.width() * box.width() / sheet.width()),
+                         qRound(before.height() * box.height() / sheet.height()));
+    const QSize after = PdfInkLoader::artifactSize(artifact, &why);
+    QVERIFY2(qAbs(after.width() - expected.width()) <= 2 && qAbs(after.height() - expected.height()) <= 2,
+             qPrintable(QStringLiteral("the cropped artifact is %1x%2, where the left half of %3x%4 "
+                                       "is %5x%6")
+                            .arg(after.width()).arg(after.height())
+                            .arg(before.width()).arg(before.height())
+                            .arg(expected.width()).arg(expected.height())));
+
+    /// And the ink the box covered is still there, where the box put it.
+    const QImage inkAfter = layerNamed(PdfInkLoader::loadInkLayers(artifact, &why),
+                                       PdfProjectBuilder::inkStrokeLayerName());
+    QVERIFY2(!inkAfter.isNull(), qPrintable(why));
+    const QRect markAfter = markedBounds(inkAfter);
+    QVERIFY2(!markAfter.isEmpty(), "the crop dropped the ink the box covers");
+    QVERIFY2(qAbs(markAfter.left() - markBefore.left()) <= 2
+                 && qAbs(markAfter.top() - markBefore.top()) <= 2,
+             qPrintable(QStringLiteral("the mark moved from %1,%2 to %3,%4: the box keeps the page's "
+                                       "own origin")
+                            .arg(markBefore.left()).arg(markBefore.top())
+                            .arg(markAfter.left()).arg(markAfter.top())));
+
+    /// The reader gets the cropped page: the record says so, the notebook reloads onto it, and the
+    /// raster it opens with is the box, not the whole sheet with the crop's area blank.
+    QVERIFY2(navigator()->reloadNotebook(outcome.anchorPage, &why), qPrintable(why));
+    clock.restart();
+    while (navigator()->reloadPending() && clock.elapsed() < 30000) {
+        QTest::qWait(50);
+    }
+    QVERIFY2(!navigator()->reloadPending(), "the reload after the crop never finished");
+
+    const PdfPageRecord reloaded = navigator()->manifest().pages.at(0);
+    QCOMPARE(reloaded.boxPt, box);
+    const KisImageSP image = navigator()->currentDocument()->image();
+    QVERIFY(image);
+    const QSizeF displayPt = reloaded.displaySizePt();
+    QVERIFY2(qAbs(image->width() - qRound(displayPt.width() * image->xRes() / 72.0)) <= 2
+                 && qAbs(image->height() - qRound(displayPt.height() * image->xRes() / 72.0)) <= 2,
+             qPrintable(QStringLiteral("the reopened page is %1x%2, where its own box says %3")
+                            .arg(image->width()).arg(image->height())
+                            .arg(displayPt.width())));
+
+    /// The tab is closed the way the other tests that leave a page open close theirs.
+    navigator()->currentDocument()->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(50);
 }
 
 /**
@@ -1793,13 +2343,14 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
     QVERIFY(button("pdfio_ops_apply")->isEnabled());
 
     /// Insert and merge are edits of THIS list, so they stay available with a change pending; extract
-    /// writes a notebook of its own and waits, with the reason in the hint rather than a mute button.
+    /// and batch resize are separate transactions, so both wait with the reason in the hint.
     QVERIFY2(button("pdfio_ops_insert")->isEnabled(),
              "insert is an edit of this notebook's list and must not wait for the change");
     QVERIFY2(button("pdfio_ops_merge_notebook")->isEnabled(),
              "a merge-in is an edit of this notebook's list and must not wait for the change");
     QVERIFY(!button("pdfio_ops_extract")->isEnabled());
-    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("Extract writes a notebook of its own")),
+    QVERIFY(!button("pdfio_ops_batch_pixel_resize")->isEnabled());
+    QVERIFY2(label("pdfio_ops_hint").contains(QStringLiteral("Extract and batch resize are separate")),
              qPrintable(label("pdfio_ops_hint")));
 
     /// Turning the open page: the record carries the turn, the preview goes with the change, and the
@@ -1906,7 +2457,7 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
         QVERIFY2(!withMerge.copyExternalDirs.isEmpty(), "the incoming sidecar is not in the change");
     }
 
-    /// A one-page notebook cannot lose its only page, and says so.
+    /// A one-page notebook can be emptied, and the screen explains the recovery path.
     PdfSessionManifest single = manifest;
     single.pages.removeLast();
     single.pages.removeLast();
@@ -1915,9 +2466,8 @@ void PdfNavigatorIntegrationTest::testTheScreenKeepsItsChangeUntilApply()
     auto *deleteOnly = only.findChild<QPushButton *>(QStringLiteral("pdfio_ops_delete_page"));
     auto *hintOnly = only.findChild<QLabel *>(QStringLiteral("pdfio_ops_hint"));
     QVERIFY(deleteOnly && hintOnly);
-    QVERIFY(!deleteOnly->isEnabled());
-    QVERIFY2(hintOnly->text().contains(QStringLiteral("at least one page")),
-             qPrintable(hintOnly->text()));
+    QVERIFY(deleteOnly->isEnabled());
+    QVERIFY2(hintOnly->text().contains(QStringLiteral("empty")), qPrintable(hintOnly->text()));
 
     /// Reject after building a composite page-list change: the dialog itself never writes its
     /// pending copy. The plugin's separate preflight save is outside this dialog-only test.
@@ -2002,8 +2552,9 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     /// sizes -- the tilted page's box is the bigger one -- which is what the roll resizes the
     /// document between, and their bands do not line up either, which is what the rest of this test
     /// is about.
-    const PdfStripLayout holding = PdfStripLayout::forWindow(opened, 0, 5, 200.0);
-    const PdfStripLayout away = PdfStripLayout::forWindow(opened, 8, 5, 200.0);
+    const qreal holdingDpi = navigator()->currentRenderDpi();
+    const PdfStripLayout holding = PdfStripLayout::forWindow(opened, 0, 5, holdingDpi);
+    const PdfStripLayout away = PdfStripLayout::forWindow(opened, 8, 5, holdingDpi);
     QVERIFY(holding.isValid());
     QVERIFY(away.isValid());
     QVERIFY2(holding.imageSize().width() > away.imageSize().width()
@@ -2020,7 +2571,7 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     KisImageSP strip = document->image();
     QVERIFY(strip);
     QCOMPARE(QSize(strip->width(), strip->height()), holding.imageSize());
-    QVERIFY2(strip->width() > qRound(612.0 * 200.0 / 72.0),
+    QVERIFY2(strip->width() > qRound(612.0 * holdingDpi / 72.0),
              "the strip was not built wide enough for the turned page's box");
 
     /// The Ink group, and a second content layer kind inside it: the inserted image the user's own
@@ -2036,7 +2587,9 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     }
     QVERIFY2(inkGroup, "the strip has no Ink group");
 
-    const QRect picture(40, 60, 48, 48);
+    const qreal pictureScale = holdingDpi / 200.0;
+    const QRect picture(qRound(40 * pictureScale), qRound(60 * pictureScale),
+                        qRound(48 * pictureScale), qRound(48 * pictureScale));
     KisPaintLayerSP inserted = new KisPaintLayer(strip, QStringLiteral("Inserted image"),
                                                  OPACITY_OPAQUE_U8);
     inserted->paintDevice()->fill(QRect(QPoint(0, 0), picture.size()),
@@ -2054,9 +2607,11 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     QVERIFY2(navigator()->showPage(8, &why), qPrintable(why));
     QCOMPARE(navigator()->currentIndex(), 8);
     QVERIFY2(QFileInfo::exists(artifactFor(0)), "the roll did not write the tilted page");
+    const qreal awayDpi = navigator()->currentRenderDpi();
+    const PdfStripLayout awayAfterRoll = PdfStripLayout::forWindow(opened, 8, 5, awayDpi);
     QCOMPARE(QSize(navigator()->currentDocument()->image()->width(),
                    navigator()->currentDocument()->image()->height()),
-             away.imageSize());
+             awayAfterRoll.imageSize());
 
     /// And the resize must not leave the strip looking like a document to write. Krita's own
     /// cropImage()/resizeImage() go through KisProcessingApplicator, which pushes an undo command
@@ -2070,9 +2625,11 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     /// And back. This second roll is the one the report is about, and it grows the document again.
     QVERIFY2(navigator()->showPage(0, &why), qPrintable(why));
     QCOMPARE(navigator()->currentIndex(), 0);
+    const qreal holdingDpiAfterRoll = navigator()->currentRenderDpi();
+    const PdfStripLayout holdingAfterRoll = PdfStripLayout::forWindow(opened, 0, 5, holdingDpiAfterRoll);
     QCOMPARE(QSize(navigator()->currentDocument()->image()->width(),
                    navigator()->currentDocument()->image()->height()),
-             holding.imageSize());
+             holdingAfterRoll.imageSize());
 
     /// The document is the same one: a roll moves the window, it does not rebuild it. Without this
     /// the assertions below could be reading a freshly built strip and pass without proving
@@ -2107,9 +2664,15 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     QCOMPARE(papers.size(), holding.slots().size());
 
     for (int i = 0; i < papers.size(); ++i) {
-        const QRect ownedNow = holding.slots().at(i).cell;
+        const QRect ownedNow = holdingAfterRoll.slots().at(i).cell;
         const QRect painted = papers.at(i)->paintDevice()->exactBounds();
-        QVERIFY2(painted == ownedNow,
+        /// A freely rotated source is rasterized in pixels and rounded separately from the layout's
+        /// point-space box. PdfStripBuilder accepts at most two pixels of that documented render
+        /// roundoff; keep the origin exact so an old band cannot leak into its neighbour.
+        const QSize renderRoundoff = painted.size() - ownedNow.size();
+        const bool matchesOwnedBand = painted.topLeft() == ownedNow.topLeft()
+            && qAbs(renderRoundoff.width()) <= 2 && qAbs(renderRoundoff.height()) <= 2;
+        QVERIFY2(matchesOwnedBand,
                  qPrintable(QStringLiteral("the paper of slot %1 is painted %2,%3 %4x%5, where the "
                                            "band it owns now is %6,%7 %8x%9")
                                 .arg(i)
@@ -2131,22 +2694,30 @@ void PdfNavigatorIntegrationTest::testRollingBackToARotatedPageLeavesNoStripBehi
     }
     QVERIFY2(insertedBack, "the inserted image did not come back as a layer of its own");
 
-    const QRect tiltedSlot = holding.slots().at(0).rect;
-    const QRect expectedPicture(tiltedSlot.topLeft() + picture.topLeft(), picture.size());
-    QVERIFY2(insertedBack->paintDevice()->exactBounds() == expectedPicture,
-             qPrintable(QStringLiteral("the inserted image is at %1,%2 %3x%4, not at its own place "
-                                       "%5,%6 %7x%8 in the page's slot")
-                            .arg(insertedBack->paintDevice()->exactBounds().x())
-                            .arg(insertedBack->paintDevice()->exactBounds().y())
-                            .arg(insertedBack->paintDevice()->exactBounds().width())
-                            .arg(insertedBack->paintDevice()->exactBounds().height())
-                            .arg(expectedPicture.x()).arg(expectedPicture.y())
-                            .arg(expectedPicture.width()).arg(expectedPicture.height())));
+    const QRect sourceSlot = holding.slots().at(0).rect;
+    const QRect tiltedSlot = holdingAfterRoll.slots().at(0).rect;
+    const qreal scaleX = qreal(tiltedSlot.width()) / sourceSlot.width();
+    const qreal scaleY = qreal(tiltedSlot.height()) / sourceSlot.height();
+    const QPoint expectedCenter(qRound(picture.center().x() * scaleX),
+                                qRound(picture.center().y() * scaleY));
+    const QSize expectedSize(qRound(picture.width() * scaleX),
+                             qRound(picture.height() * scaleY));
+    const QRect actualPicture = insertedBack->paintDevice()->exactBounds();
+    const QRect localPicture = actualPicture.translated(-tiltedSlot.topLeft());
+    QVERIFY2((localPicture.center() - expectedCenter).manhattanLength() <= 2
+                 && qAbs(localPicture.width() - expectedSize.width()) <= 2
+                 && qAbs(localPicture.height() - expectedSize.height()) <= 2,
+             qPrintable(QStringLiteral("the inserted image is at %1,%2 %3x%4 in its page, not "
+                                       "near the scaled position %5,%6 %7x%8")
+                            .arg(localPicture.x()).arg(localPicture.y())
+                            .arg(localPicture.width()).arg(localPicture.height())
+                            .arg(expectedCenter.x()).arg(expectedCenter.y())
+                            .arg(expectedSize.width()).arg(expectedSize.height())));
 
-    const QImage picturePixels =
-        insertedBack->paintDevice()->convertToQImage(0, expectedPicture);
+    const QImage picturePixels = insertedBack->paintDevice()->convertToQImage(0, actualPicture);
     QVERIFY(!picturePixels.isNull());
-    const QColor at = picturePixels.pixelColor(QPoint(picture.width() / 2, picture.height() / 2));
+    const QColor at = picturePixels.pixelColor(QPoint(localPicture.width() / 2,
+                                                      localPicture.height() / 2));
     QVERIFY2(at.red() > 200 && at.green() < 60 && at.blue() < 60,
              qPrintable(QStringLiteral("the inserted image came back as rgb(%1,%2,%3)")
                             .arg(at.red()).arg(at.green()).arg(at.blue())));
@@ -2221,7 +2792,8 @@ void PdfNavigatorIntegrationTest::testRollWritesEveryWindowPageAndRedrawsFromDis
     QString why;
     QVERIFY2(navigator()->showPage(1, &why), qPrintable(why));
 
-    const PdfStripLayout before = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
+    const qreal renderDpi = navigator()->currentRenderDpi();
+    const PdfStripLayout before = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, renderDpi);
     QVERIFY(before.isValid());
     const int staying = 3;
     const int slot = before.slotForPage(staying);
@@ -2262,7 +2834,8 @@ void PdfNavigatorIntegrationTest::testRollWritesEveryWindowPageAndRedrawsFromDis
     /// ...and on screen, in a slot the roll wiped and repainted. The new window is five pages
     /// centred on 5, so it starts at page 3: this page did not change bands, and what shows in
     /// its slot can only be what was read back out of the artifact above.
-    const PdfStripLayout after = PdfStripLayout::forWindow(navigator()->manifest(), 5, 5, 200.0);
+    const PdfStripLayout after = PdfStripLayout::forWindow(navigator()->manifest(), 5, 5,
+                                                          navigator()->currentRenderDpi());
     const int afterSlot = after.slotForPage(staying);
     QVERIFY(afterSlot >= 0);
     KisPaintLayer *redrawn = stripInkLayer(navigator()->currentDocument()->image());
@@ -4174,8 +4747,9 @@ void PdfNavigatorIntegrationTest::testARollBetweenSameSizeWindowsDoesNotResize()
     QCOMPARE(navigator()->currentIndex(), 0);
 
     /// The two windows really are the same size, or this test would prove nothing.
-    const PdfStripLayout first = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, 200.0);
-    const PdfStripLayout second = PdfStripLayout::forWindow(navigator()->manifest(), 6, 5, 200.0);
+    const qreal renderDpi = navigator()->currentRenderDpi();
+    const PdfStripLayout first = PdfStripLayout::forWindow(navigator()->manifest(), 0, 5, renderDpi);
+    const PdfStripLayout second = PdfStripLayout::forWindow(navigator()->manifest(), 6, 5, renderDpi);
     QCOMPARE(first.imageSize(), second.imageSize());
 
     KisDocument *const document = navigator()->currentDocument();
@@ -4320,6 +4894,70 @@ void PdfNavigatorIntegrationTest::testTheStripPageCountChoosesTheWindowSize()
  * KisDocument, the same KisImage, the bands equal to the new layout's slots, every band below the Ink
  * group, the reading page where it was, and no modified flag left for Krita to autosave.
  */
+void PdfNavigatorIntegrationTest::testResizeThenRollScalesTheSavedArtifactIntoItsNewSlot()
+{
+    StripRestore restore;
+    BudgetRestore budgetRestore(PdfPageNavigator::instance()->memoryBudgetMb());
+    PdfPageNavigator::instance()->setMemoryBudgetMb(0);
+
+    const QString project = m_dir.filePath(QStringLiteral("resize-then-roll-artifact"));
+    QString why;
+    QVERIFY2(writeLetterNotebook(project, 12, &why), qPrintable(why));
+    navigator()->setScope(5);
+    QVERIFY2(navigator()->openNotebookDir(project, &why), qPrintable(why));
+
+    KisDocument *const document = navigator()->currentDocument();
+    QVERIFY(document);
+    const KisImageSP strip = document->image();
+    QVERIFY(strip);
+    drawInk(document);
+
+    /// Changing the budget takes the open strip through rollToPage's resize path. The roll saves the
+    /// dirty page artifact before resizing the same document, then scales that artifact into its new
+    /// slot.
+    PdfPageNavigator::instance()->setMemoryBudgetMb(400);
+    QVERIFY2(waitForInk(artifactFor(0)), qPrintable(artifactFor(0)));
+    const QImage stored = PdfInkLoader::loadInk(artifactFor(0));
+    QVERIFY(inkMarkInImage(stored));
+
+    QTRY_VERIFY_WITH_TIMEOUT(navigator()->currentDocument() == document, 30000);
+    QVERIFY2(navigator()->currentDocument()->image().data() == strip.data(),
+             "the resize rebuilt the strip instead of rolling it");
+    const PdfStripLayout resized = PdfStripLayout::forWindow(
+        navigator()->manifest(), navigator()->currentIndex(), navigator()->scope(),
+        navigator()->currentRenderDpi());
+    QVERIFY(resized.isValid());
+    const QRect slot = resized.slots().at(0).rect;
+    QVERIFY(slot.size() != stored.size());
+
+    KisPaintLayer *ink = stripInkLayer(strip);
+    QVERIFY(ink);
+    const QImage onStrip = ink->paintDevice()->convertToQImage(0, slot);
+    QVERIFY(!onStrip.isNull());
+    const QRect savedMark = markedBounds(stored);
+    const QRect restoredMark = markedBounds(onStrip);
+    QVERIFY(!savedMark.isEmpty());
+    QVERIFY(!restoredMark.isEmpty());
+    const qreal scaleX = qreal(slot.width()) / stored.width();
+    const qreal scaleY = qreal(slot.height()) / stored.height();
+    const QPoint expectedCenter(qRound(savedMark.center().x() * scaleX),
+                                qRound(savedMark.center().y() * scaleY));
+    QVERIFY2((restoredMark.center() - expectedCenter).manhattanLength() <= 3,
+             "the resized roll moved the ink away from its scaled position");
+    QVERIFY(qAbs(restoredMark.width() - qRound(savedMark.width() * scaleX)) <= 4);
+    QVERIFY(qAbs(restoredMark.height() - qRound(savedMark.height() * scaleY)) <= 4);
+    QVERIFY2(inkMarkInImage(onStrip), "the resized roll lost the artifact's ink");
+
+    document->setModified(false);
+    if (KisView *view = navigator()->currentView()) {
+        view->closeView();
+        QApplication::sendPostedEvents();
+        QApplication::processEvents();
+    }
+    QTest::qWait(200);
+    QApplication::processEvents();
+}
+
 void PdfNavigatorIntegrationTest::testAStripPageCountChangeResizesTheSameDocument()
 {
     StripRestore restore;
@@ -5741,6 +6379,213 @@ void PdfNavigatorIntegrationTest::testTheOpsPaneKeepsTurnScaleAndBoxApart()
     /// And the screen hands the operation the one thing a crop cannot be applied without.
     QVERIFY2(static_cast<bool>(dialog.edits().clipper),
              "the screen did not name a clipper, so a crop would be refused");
+}
+
+/** Pixel bounds are measured from PDF points at an explicit DPI and never stretch a page. */
+void PdfNavigatorIntegrationTest::testPixelResizeUsesDpiAndPreservesAspectRatio()
+{
+    PdfPageRecord a4;
+    a4.sizePt = QSizeF(612.0, 792.0);
+    QCOMPARE(PdfNotebookOps::pixelSizeAtDpi(a4, 300), QSize(2550, 3300));
+    QCOMPARE(PdfNotebookOps::pixelSizeAtDpi(a4, 150), QSize(1275, 1650));
+
+    qreal scale = 0.0;
+    QSize fitted;
+    QString why;
+    QVERIFY2(PdfNotebookOps::scaleForPixelBounds(a4, QSize(2000, 3000), 300,
+                                                 &scale, &fitted, &why), qPrintable(why));
+    QVERIFY(qAbs(scale - 2000.0 / 2550.0) < 1e-8);
+    QCOMPARE(fitted, QSize(2000, 2588));
+    QVERIFY(qAbs(qreal(fitted.width()) / fitted.height()
+                 - a4.sizePt.width() / a4.sizePt.height()) < 0.001);
+
+    PdfPageRecord turned = a4;
+    turned.extraRotation = 90;
+    QCOMPARE(PdfNotebookOps::pixelSizeAtDpi(turned, 300), QSize(3300, 2550));
+
+    /// A valid legacy scale outside today's edit range may remain unchanged; no-op targets should
+    /// not force an unrelated migration of an existing notebook record.
+    PdfPageRecord legacyScale = a4;
+    legacyScale.extraScale = 0.05;
+    qreal unchangedScale = 1.0;
+    const QSize legacyBounds = PdfNotebookOps::pixelSizeAtDpi(legacyScale, 300);
+    QVERIFY(PdfNotebookOps::scaleForPixelBounds(legacyScale, legacyBounds, 300,
+                                                &unchangedScale, &fitted, &why));
+    QCOMPARE(unchangedScale, legacyScale.extraScale);
+
+    QVERIFY2(!PdfNotebookOps::scaleForPixelBounds(a4, QSize(100, 100), 300,
+                                                  &scale, &fitted, &why),
+             "a resize below the supported 10% scale was accepted");
+    QVERIFY(why.contains(QStringLiteral("10%-800%")));
+    QVERIFY2(!PdfNotebookOps::scaleForPixelBounds(a4, QSize(30000, 40000), 300,
+                                                  &scale, &fitted, &why),
+             "a resize above the supported 800% scale was accepted");
+    QVERIFY2(!PdfNotebookOps::scaleForPixelBounds(a4, QSize(2000, 3000), 2401,
+                                                  &scale, &fitted, &why),
+             "a DPI outside the dialog range was accepted");
+}
+
+/** The current-page and batch menus share pixel units but keep page selection explicit. */
+void PdfNavigatorIntegrationTest::testPixelResizeDialogOffersSingleAndBatchModes()
+{
+    PdfPageRecord portrait;
+    portrait.sizePt = QSizeF(612.0, 792.0);
+    PdfPageRecord landscape;
+    landscape.sizePt = QSizeF(792.0, 612.0);
+    const QList<PdfPageRecord> pages = QList<PdfPageRecord>() << portrait << landscape;
+
+    PdfNotebookResizeDialog single(pages, 1, false);
+    const auto singleRequest = single.request();
+    QCOMPARE(singleRequest.pageIndices, (QList<int>() << 1));
+    QCOMPARE(singleRequest.boundsPx, QSize(3300, 2550));
+    QCOMPARE(singleRequest.dpi, 300);
+    QVERIFY(single.findChild<QSpinBox *>(QStringLiteral("pdfio_pixel_resize_width")));
+    QVERIFY(single.findChild<QSpinBox *>(QStringLiteral("pdfio_pixel_resize_height")));
+
+    PdfNotebookResizeDialog batch(pages, 0, true);
+    auto *list = batch.findChild<QListWidget *>(QStringLiteral("pdfio_pixel_resize_pages"));
+    auto *buttons = batch.findChild<QDialogButtonBox *>(QStringLiteral("pdfio_pixel_resize_buttons"));
+    auto *all = batch.findChild<QPushButton *>(QStringLiteral("pdfio_pixel_resize_all"));
+    auto *none = batch.findChild<QPushButton *>(QStringLiteral("pdfio_pixel_resize_none"));
+    QVERIFY(list && buttons && all && none);
+    QCOMPARE(list->count(), 2);
+    QCOMPARE(batch.request().pageIndices, (QList<int>() << 0 << 1));
+
+    list->item(0)->setCheckState(Qt::Unchecked);
+    QCOMPARE(batch.request().pageIndices, (QList<int>() << 1));
+    none->click();
+    QVERIFY(batch.request().pageIndices.isEmpty());
+    QVERIFY(!buttons->button(QDialogButtonBox::Ok)->isEnabled());
+    all->click();
+    QCOMPARE(batch.request().pageIndices, (QList<int>() << 0 << 1));
+    QVERIFY(buttons->button(QDialogButtonBox::Ok)->isEnabled());
+}
+
+/** A batch size change is one journal entry, preserves the open page, and is undone as a unit. */
+void PdfNavigatorIntegrationTest::testBatchPixelResizeIsReachableFromManagePages()
+{
+    QVERIFY(useNotebook(QStringLiteral("batch-pixel-resize-manage-pages")));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest manifest = navigator()->manifest();
+
+    PdfNotebookOpsDialog clean(project, manifest, navigator()->currentIndex());
+    auto *resize = clean.findChild<QPushButton *>(QStringLiteral("pdfio_ops_batch_pixel_resize"));
+    QVERIFY(resize);
+    QVERIFY(resize->isEnabled());
+    resize->click();
+    QCOMPARE(clean.requestedAction(), PdfNotebookOpsDialog::BatchPixelResizeAction);
+    QCOMPARE(clean.result(), QDialog::Accepted);
+
+    PdfNotebookOpsDialog dirty(project, manifest, navigator()->currentIndex());
+    auto *turn = dirty.findChild<QPushButton *>(QStringLiteral("pdfio_ops_turn_right"));
+    auto *dirtyResize = dirty.findChild<QPushButton *>(QStringLiteral("pdfio_ops_batch_pixel_resize"));
+    QVERIFY(turn && dirtyResize);
+    QVERIFY(dirtyResize->isEnabled());
+    turn->click();
+    QVERIFY(!dirtyResize->isEnabled());
+}
+
+void PdfNavigatorIntegrationTest::testBatchPixelResizeIsAtomicAndUndoable()
+{
+    QVERIFY(useNotebook(QStringLiteral("batch-pixel-resize")));
+    const QString project = navigator()->projectDir();
+    const PdfSessionManifest before = navigator()->manifest();
+    QVERIFY(before.pages.size() >= 2);
+    const int openPage = navigator()->currentIndex();
+    QVERIFY(openPage >= 0 && openPage < before.pages.size());
+    KisDocument *const documentBefore = navigator()->currentDocument();
+    QVERIFY(documentBefore && documentBefore->image());
+    const QSize originalOpenPageSize(documentBefore->image()->width(), documentBefore->image()->height());
+
+    const QString thumbnailName = before.pages.at(0).thumbFile;
+    QVERIFY2(!thumbnailName.isEmpty(), "the batch fixture has no durable preview name");
+    const QString thumbnailPath = QDir(project).filePath(thumbnailName);
+    QVERIFY(QDir().mkpath(QFileInfo(thumbnailPath).absolutePath()));
+
+    QList<int> selected;
+    const int lastPage = int(before.pages.size()) - 1;
+    for (const int index : {0, openPage, lastPage}) {
+        if (!selected.contains(index)) {
+            selected.append(index);
+        }
+    }
+    const QSize boundsPx(1000, 1000);
+    constexpr int dpi = 72;
+    QList<qreal> expectedScales;
+    for (const int index : selected) {
+        qreal expected = before.pages.at(index).extraScale;
+        QSize actual;
+        QString why;
+        QVERIFY2(PdfNotebookOps::scaleForPixelBounds(before.pages.at(index), boundsPx, dpi,
+                                                      &expected, &actual, &why), qPrintable(why));
+        QVERIFY2(!qFuzzyCompare(expected, before.pages.at(index).extraScale),
+                 "the chosen bounds did not resize one of the selected fixture pages");
+        expectedScales.append(expected);
+    }
+
+    QString why;
+    QVERIFY2(navigator()->prepareForNotebookChange(&why), qPrintable(why));
+    /// Seed after the save gate: it may refresh an existing preview while saving the open page.
+    QImage originalThumbnail(12, 12, QImage::Format_ARGB32_Premultiplied);
+    originalThumbnail.fill(Qt::red);
+    QVERIFY2(originalThumbnail.save(thumbnailPath, "PNG"), qPrintable(thumbnailPath));
+
+    const PdfNotebookOps::Outcome resized = PdfNotebookOps::resizePagesToPixelBounds(
+        project, selected, boundsPx, dpi, openPage, PdfPageRotator::rotateInto);
+    QVERIFY2(resized.ok, qPrintable(resized.why));
+    QCOMPARE(resized.anchorPage, openPage);
+    QVERIFY(PdfNotebookOps::canUndo(project));
+    QVERIFY2(!QFileInfo::exists(thumbnailPath),
+             "the batch resize left a preview rendered for the old size");
+
+    const PdfSessionManifest after = PdfSession::openProject(project, &why);
+    QVERIFY2(after.isValid(), qPrintable(why));
+    for (int i = 0; i < selected.size(); ++i) {
+        QVERIFY(qAbs(after.pages.at(selected.at(i)).extraScale - expectedScales.at(i)) < 1e-8);
+    }
+    for (int i = 0; i < before.pages.size(); ++i) {
+        if (!selected.contains(i)) {
+            QCOMPARE(after.pages.at(i).extraScale, before.pages.at(i).extraScale);
+        }
+    }
+    QCOMPARE(after.sources.size(), before.sources.size());
+
+    /// The reader can regenerate the new preview before pressing Undo. Undo must replace that
+    /// derived file with the preview that was journalled before the batch change.
+    QVERIFY2(navigator()->reloadNotebook(resized.anchorPage, &why), qPrintable(why));
+    QTRY_VERIFY_WITH_TIMEOUT(!navigator()->reloadPending(), 30000);
+    QCOMPARE(navigator()->currentIndex(), openPage);
+    KisDocument *const resizedDocument = navigator()->currentDocument();
+    QVERIFY(resizedDocument && resizedDocument->image());
+    const KisImageSP resizedImage = resizedDocument->image();
+    const QSizeF resizedDisplayPt = after.pages.at(openPage).displaySizePt();
+    const qreal resizedDpi = resizedImage->xRes();
+    QVERIFY2(qAbs(resizedImage->width() - qRound(resizedDisplayPt.width() * resizedDpi / 72.0)) <= 2
+                 && qAbs(resizedImage->height() - qRound(resizedDisplayPt.height() * resizedDpi / 72.0)) <= 2,
+             "the open page's raster did not match its resized display size; it would show gray around the page");
+    QVERIFY(QSize(resizedImage->width(), resizedImage->height()) != originalOpenPageSize);
+    navigator()->ensureThumbnail(0);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(thumbnailPath), 30000);
+    QVERIFY(!QImage(thumbnailPath).isNull());
+
+    const PdfNotebookOps::Outcome undone = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undone.ok, qPrintable(undone.why));
+    const QImage restoredThumbnail(thumbnailPath);
+    QVERIFY(!restoredThumbnail.isNull());
+    QCOMPARE(restoredThumbnail.pixelColor(0, 0), QColor(Qt::red));
+    const PdfSessionManifest restored = PdfSession::openProject(project, &why);
+    QVERIFY2(restored.isValid(), qPrintable(why));
+    for (int i = 0; i < before.pages.size(); ++i) {
+        QCOMPARE(restored.pages.at(i).extraScale, before.pages.at(i).extraScale);
+    }
+
+    QVERIFY2(navigator()->reloadNotebook(undone.anchorPage, &why), qPrintable(why));
+    QTRY_VERIFY_WITH_TIMEOUT(!navigator()->reloadPending(), 30000);
+    QCOMPARE(navigator()->currentIndex(), undone.anchorPage);
+    KisDocument *const restoredDocument = navigator()->currentDocument();
+    QVERIFY(restoredDocument && restoredDocument->image());
+    QCOMPARE(QSize(restoredDocument->image()->width(), restoredDocument->image()->height()),
+             originalOpenPageSize);
 }
 
 /**

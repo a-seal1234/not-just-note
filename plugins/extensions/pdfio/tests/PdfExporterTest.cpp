@@ -9,8 +9,12 @@
 #include "session/PdfExporter.h"
 #include "session/PdfSession.h"
 
+#include <QByteArray>
+#include <poppler-annotation.h>
+#include <poppler-link.h>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QHash>
 #include <QTransform>
 #include <QtMath>
 #include <QtTest>
@@ -37,6 +41,7 @@ private Q_SLOTS:
     void testPageObjects();
     void testObjectStreamPageObjects();
     void testPredictorObjectStreamPageObjects();
+    void testLzwXrefStreamExportsAndAssembles();
     void testRefusesEncrypted();
     void testRefusesUnsupportedFilter();
     void testInkLandsWhereItWasDrawn();
@@ -69,6 +74,11 @@ private Q_SLOTS:
     void testAMovedNotebookExportsInNotebookOrder();
     void testADuplicatedPageExportsTwiceWithItsOwnInk();
     void testAMultiSourceNotebookIsRefusedWithTheReason();
+    void testProjectAwareSingleSourceExportMatchesLegacyPath();
+    void testABlankPageIsWrittenAsASheetOfItsOwnSize();
+    void testAPicturePageIsWrittenAsAnImage();
+    void testProjectAwareExportAssemblesTwoSourcesAndKeepsInkOnNotebookPage();
+    void testProjectAwareExportRefusesEncryptedSourceWithoutOutput();
 
     /// Assembling a notebook that draws on several PDFs into ONE file (task-34). The first test is
     /// the one that matters: the fixture has the shape every page of the user's own manual has --
@@ -76,6 +86,14 @@ private Q_SLOTS:
     /// and a copier that passes its own fixtures without resolving that writes blank paper.
     void testAssemblingTwoSourcesWritesOneFileInNotebookOrder();
     void testAnAssembledPageKeepsItsInheritedPaperAndResources();
+    void testAssemblerReadsHybridXrefAndPackedInheritedPage();
+    void testAssemblerReadsStandaloneXrefStream();
+    void testAssemblerHonorsPrevFreeEntry();
+    void testAssemblerRejectsReferenceGenerationMismatch();
+    void testAssemblerRefusesLongIndirectValueChain();
+    void testAssemblerRefusesUnsupportedAnnotationsExplicitly();
+    void testAssemblerRemapsLocalLinkAnnotations();
+    void testAssemblerDropsTaggedLinkWithoutStructureTree();
     void testTheAssemblerNamesASourceItCannotRead();
 
 private:
@@ -269,6 +287,206 @@ private:
     }
 };
 
+namespace {
+
+QByteArray compressedPdfBytes(const QByteArray &plain)
+{
+    /// qCompress adds a four-byte size prefix; PDF FlateDecode stores only the zlib stream.
+    return qCompress(plain, 9).mid(4);
+}
+
+QByteArray integerBytes(quint64 value, int width)
+{
+    QByteArray result;
+    for (int shift = (width - 1) * 8; shift >= 0; shift -= 8) {
+        result.append(char((value >> shift) & 0xff));
+    }
+    return result;
+}
+
+void appendPdfObject(QByteArray *pdf, QHash<int, int> *offsets, int number,
+                     const QByteArray &body)
+{
+    offsets->insert(number, pdf->size());
+    *pdf += QByteArray::number(number) + " 0 obj\n" + body + "\nendobj\n";
+}
+
+/// A hybrid-reference PDF: a classic table, a supplemental xref stream, and the page dictionary
+/// plus its inherited resource dictionary packed in an ObjStm. The xref stream uses PNG predictor 12.
+QByteArray hybridXrefFixture(bool withAnnotations = false, bool withInternalLink = false, bool withStructParent = false, bool withGoToAction = false)
+{
+    QByteArray pdf("%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
+    QHash<int, int> offsets;
+    appendPdfObject(&pdf, &offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    appendPdfObject(&pdf, &offsets, 2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 595 842] "
+                    "/Resources 5 0 R >>");
+    /// The content stream's /Length is counted, not guessed: a stream whose /Length does not reach
+    /// endstream is refused long before the hybrid xref path is exercised.
+    const QByteArray pageContent = "BT /F1 20 Tf 72 760 Td (Hybrid xref page text) Tj ET\n";
+    appendPdfObject(&pdf, &offsets, 4,
+                    "<< /Length " + QByteArray::number(pageContent.size()) + " >>\nstream\n"
+                        + pageContent + "endstream");
+
+    const QByteArray page = withAnnotations
+        ? "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [9 0 R] >>"
+        : "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>";
+    const QByteArray resources = "<< /Font << /F1 7 0 R >> >>";
+    const int secondOffset = page.size() + 1;
+    const QByteArray header = "3 0 5 " + QByteArray::number(secondOffset) + " ";
+    const QByteArray objectStreamPlain = header + page + "\n" + resources;
+    const QByteArray objectStreamData = compressedPdfBytes(objectStreamPlain);
+    const QByteArray objectStreamDict = "<< /Type /ObjStm /N 2 /First "
+        + QByteArray::number(header.size()) + " /Length " + QByteArray::number(objectStreamData.size())
+        + " /Filter /FlateDecode >>";
+    offsets.insert(6, pdf.size());
+    pdf += "6 0 obj\n" + objectStreamDict + "\nstream\n" + objectStreamData
+        + "\nendstream\nendobj\n";
+    appendPdfObject(&pdf, &offsets, 7,
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    if (withAnnotations) {
+        const QByteArray destination = withGoToAction
+            ? " /A << /S /GoTo /D [3 0 R /Fit] >>"
+            : " /Dest [3 0 R /Fit]";
+        QByteArray annotation;
+        if (withInternalLink) {
+            annotation = QByteArray("<< /Type /Annot /Subtype /Link /Rect [12 24 50 60] /P 3 0 R")
+                + destination + " >>";
+        } else {
+            annotation = "<< /Type /Annot /Subtype /Text /Rect [12 24 50 60] /P 3 0 R /Contents (test) >>";
+        }
+        if (withStructParent && withInternalLink) {
+            if (withGoToAction) {
+                annotation.replace(" /A", " /StructParent 7 /A");
+            } else {
+                annotation.replace(" /Dest", " /StructParent 7 /Dest");
+            }
+        }
+        appendPdfObject(&pdf, &offsets, 9, annotation);
+    }
+
+    QByteArray predictorRows;
+    predictorRows += char(0);
+    predictorRows += char(2) + integerBytes(6, 4) + integerBytes(0, 2);
+    predictorRows += char(0);
+    predictorRows += char(2) + integerBytes(6, 4) + integerBytes(1, 2);
+    const QByteArray xrefStreamData = compressedPdfBytes(predictorRows);
+    const int xrefStreamOffset = pdf.size();
+    offsets.insert(8, xrefStreamOffset);
+    const int xrefSize = withAnnotations ? 10 : 9;
+    const QByteArray xrefSizeText = QByteArray::number(xrefSize);
+    const QByteArray xrefStreamDict = "<< /Type /XRef /Size " + xrefSizeText + " /Root 1 0 R /W [1 4 2] "
+        "/Index [3 1 5 1] /Length " + QByteArray::number(xrefStreamData.size())
+        + " /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >> >>";
+    pdf += "8 0 obj\n" + xrefStreamDict + "\nstream\n" + xrefStreamData
+        + "\nendstream\nendobj\n";
+
+    const int tableOffset = pdf.size();
+    pdf += "xref\n0 " + xrefSizeText + "\n";
+    for (int number = 0; number < xrefSize; ++number) {
+        if (number == 3) {
+            /// Deliberately stale in-use table entry: the hybrid stream must override it with type 2.
+            pdf += QByteArray::number(offsets.value(4)).rightJustified(10, '0')
+                + " 00000 n \n";
+        } else if (number == 5) {
+            pdf += "0000000000 00000 f \n";
+        } else if (number == 0) {
+            pdf += "0000000000 65535 f \n";
+        } else {
+            pdf += QByteArray::number(offsets.value(number)).rightJustified(10, '0')
+                + " 00000 n \n";
+        }
+    }
+    pdf += "trailer\n<< /Size " + xrefSizeText + " /Root 1 0 R /XRefStm " + QByteArray::number(xrefStreamOffset)
+        + " >>\nstartxref\n" + QByteArray::number(tableOffset) + "\n%%EOF\n";
+    return pdf;
+}
+
+PdfPageRecord sourcePageRecord(int sourcePage, const QSizeF &sizePt, int rotation, const QString &kraFile)
+{
+    PdfPageRecord record;
+    record.index = sourcePage;
+    record.sizePt = sizePt;
+    record.rotation = rotation;
+    record.kraFile = kraFile;
+    return record;
+}
+
+PdfSessionManifest onePageManifest(const QString &relativeFile, const QString &sourcePath,
+                                   const QSizeF &sizePt, int sourcePage = 0)
+{
+    PdfSessionManifest manifest;
+    manifest.name = QStringLiteral("Assembler fixture");
+    PdfSourceRecord source;
+    source.file = relativeFile;
+    source.sha256 = PdfSessionManifest::sha256OfFile(sourcePath);
+    source.byteSize = QFileInfo(sourcePath).size();
+    manifest.sourceFile = source.file;
+    manifest.sourceSha256 = source.sha256;
+    manifest.sourceByteSize = source.byteSize;
+    manifest.sources << source;
+    /// The helper builds one source, so the page record's source index remains its default 0.
+    manifest.pages.append(sourcePageRecord(sourcePage, sizePt, 0, PdfSession::pageFileName(0)));
+    return manifest;
+}
+
+QByteArray appendFreeObjectRevision(QByteArray pdf, int objectNumber)
+{
+    const int marker = pdf.lastIndexOf("startxref");
+    if (marker < 0) {
+        return QByteArray();
+    }
+    int at = marker + 9;
+    while (at < pdf.size() && (pdf.at(at) == char(13) || pdf.at(at) == char(10) || pdf.at(at) == ' ')) {
+        ++at;
+    }
+    const int start = at;
+    while (at < pdf.size() && pdf.at(at) >= '0' && pdf.at(at) <= '9') {
+        ++at;
+    }
+    bool ok = false;
+    const qint64 previous = pdf.mid(start, at - start).toLongLong(&ok);
+    if (!ok || previous <= 0) {
+        return QByteArray();
+    }
+
+    const int xrefOffset = pdf.size();
+    const QByteArray eol(1, char(10));
+    pdf += "xref" + eol + QByteArray::number(objectNumber) + " 1" + eol
+        + "0000000000 00001 f " + eol + "trailer" + eol
+        + "<< /Size 9 /Root 1 0 R /Prev " + QByteArray::number(previous) + " >>" + eol
+        + "startxref" + eol + QByteArray::number(xrefOffset) + eol + "%%EOF" + eol;
+    return pdf;
+}
+
+QByteArray longIndirectBoxChainFixture()
+{
+    QByteArray pdf("%PDF-1.4\n");
+    QHash<int, int> offsets;
+    appendPdfObject(&pdf, &offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    appendPdfObject(&pdf, &offsets, 2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox 4 0 R >>");
+    appendPdfObject(&pdf, &offsets, 3,
+                    "<< /Type /Page /Parent 2 0 R /Contents 69 0 R >>");
+    for (int object = 4; object < 68; ++object) {
+        appendPdfObject(&pdf, &offsets, object, QByteArray::number(object + 1) + " 0 R");
+    }
+    appendPdfObject(&pdf, &offsets, 68, "[0 0 595 842]");
+    appendPdfObject(&pdf, &offsets, 69, "<< /Length 0 >>\nstream\n\nendstream");
+
+    const int xrefOffset = pdf.size();
+    pdf += "xref\n0 70\n0000000000 65535 f \n";
+    for (int object = 1; object < 70; ++object) {
+        pdf += QByteArray::number(offsets.value(object)).rightJustified(10, '0')
+            + " 00000 n \n";
+    }
+    pdf += "trailer\n<< /Size 70 /Root 1 0 R >>\nstartxref\n"
+        + QByteArray::number(xrefOffset) + "\n%%EOF\n";
+    return pdf;
+}
+
+} // namespace
+
 void PdfExporterTest::testPageObjects()
 {
     QFile file(fixturePath(QStringLiteral("text-fixture.pdf")));
@@ -310,6 +528,53 @@ void PdfExporterTest::testPredictorObjectStreamPageObjects()
     QCOMPARE(pages, QList<int>({3, 4}));
 }
 
+void PdfExporterTest::testLzwXrefStreamExportsAndAssembles()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("fixture.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("ex-objstm-lzw.pdf")), source));
+
+    const QByteArray bytes = readFile(source);
+    QVERIFY(!bytes.isEmpty());
+    QString why;
+    const QList<int> pageObjects = PdfExporter::pageObjectNumbers(bytes, &why);
+    QVERIFY2(pageObjects.size() == 2, qPrintable(why));
+
+    PopplerRenderBackend original;
+    QVERIFY2(original.open(source), qPrintable(QStringLiteral("LZW fixture did not render")));
+    QCOMPARE(original.pageCount(), 2);
+    QVERIFY2(original.pageText(0).contains(QStringLiteral("Predictor page one")),
+             qPrintable(original.pageText(0)));
+
+    PdfSessionManifest manifest = manifestFor(original);
+    PdfSourceRecord record;
+    record.file = QStringLiteral("fixture.pdf");
+    record.sha256 = PdfSessionManifest::sha256OfFile(source);
+    record.byteSize = QFileInfo(source).size();
+    manifest.sourceFile = record.file;
+    manifest.sourceSha256 = record.sha256;
+    manifest.sourceByteSize = record.byteSize;
+    manifest.sources.append(record);
+
+    const QString exportedPath = dir.filePath(QStringLiteral("exported.pdf"));
+    QVERIFY2(PdfExporter::exportWithInk(source, manifest, {}, exportedPath, &why), qPrintable(why));
+    PopplerRenderBackend exported;
+    QVERIFY2(exported.open(exportedPath), qPrintable(why));
+    QCOMPARE(exported.pageCount(), 2);
+    QVERIFY2(exported.pageText(0).contains(QStringLiteral("Predictor page one")),
+             qPrintable(exported.pageText(0)));
+
+    const QString assembledPath = dir.filePath(QStringLiteral("assembled.pdf"));
+    QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, assembledPath, nullptr, &why),
+             qPrintable(why));
+    PopplerRenderBackend assembled;
+    QVERIFY2(assembled.open(assembledPath), qPrintable(why));
+    QCOMPARE(assembled.pageCount(), 2);
+    QVERIFY2(assembled.pageText(0).contains(QStringLiteral("Predictor page one")),
+             qPrintable(assembled.pageText(0)));
+}
+
 void PdfExporterTest::testRefusesEncrypted()
 {
     const QByteArray encrypted = readFile(fixturePath(QStringLiteral("ex-encrypted.pdf")));
@@ -336,12 +601,12 @@ void PdfExporterTest::testRefusesUnsupportedFilter()
     /// is a separate file because editing a filter name in place would move every xref offset.
     const QByteArray bytes = readFile(fixturePath(QStringLiteral("ex-objstm-badfilter.pdf")));
     QVERIFY(!bytes.isEmpty());
-    QVERIFY(bytes.contains("/LZWDecode"));
+    QVERIFY(bytes.contains("/DCTDecode"));
 
     QString why;
     QVERIFY(PdfExporter::pageObjectNumbers(bytes, &why).isEmpty());
     QVERIFY2(why.contains(QStringLiteral("unsupported stream filter")), qPrintable(why));
-    QVERIFY2(why.contains(QStringLiteral("LZWDecode")), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("DCTDecode")), qPrintable(why));
 }
 
 void PdfExporterTest::testInkLandsWhereItWasDrawn()
@@ -886,12 +1151,8 @@ void PdfExporterTest::testADuplicatedPageExportsTwiceWithItsOwnInk()
 }
 
 /**
- * A notebook that draws its pages from more than one PDF is still refused, with the reason.
- *
- * Rebuilding the page tree of one PDF is what this export does. Merging the objects of a second one
- * into the output means renumbering every reference inside them, which is a writer of its own; until
- * that exists, saying so is better than writing a file whose pages from the other PDF have lost
- * their backgrounds.
+ * The low-level single-source API still refuses a multi-source manifest with the reason. The
+ * project-aware export entry point handles assembly before calling that legacy path.
  */
 void PdfExporterTest::testAMultiSourceNotebookIsRefusedWithTheReason()
 {
@@ -919,6 +1180,313 @@ void PdfExporterTest::testAMultiSourceNotebookIsRefusedWithTheReason()
     QVERIFY2(!PdfExporter::exportWithInk(source, manifest, QHash<int, QImage>(), out, &why),
              "a notebook that draws on two PDFs was exported as if it drew on one");
     QVERIFY2(why.contains(QStringLiteral("PDFs")), qPrintable(why));
+    QVERIFY(!QFileInfo::exists(out));
+}
+
+/**
+ * A BLANK page is written into the exported PDF as a sheet of its own size, and the pages around it
+ * keep their own.
+ *
+ * The writer copies pages out of the sources, so a page with no source has nothing to copy: the
+ * assembler writes its page object (a /MediaBox and no content at all), and this proves the result by
+ * opening the exported file and rendering the blank page -- white paper at the size the record says.
+ */
+void PdfExporterTest::testABlankPageIsWrittenAsASheetOfItsOwnSize()
+{
+    const QString fixture = fixturePath(QStringLiteral("text-fixture.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixture));
+    const int fixturePages = backend.pageCount();
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString projectSource = dir.filePath(QStringLiteral("source.pdf"));
+    QVERIFY(QFile::copy(fixture, projectSource));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    PdfSourceRecord source;
+    source.file = QStringLiteral("source.pdf");
+    source.sha256 = PdfSessionManifest::sha256OfFile(projectSource);
+    source.byteSize = QFileInfo(projectSource).size();
+    manifest.sourceFile = source.file;
+    manifest.sourceSha256 = source.sha256;
+    manifest.sourceByteSize = source.byteSize;
+    manifest.sources.append(source);
+
+    /// The record the ops screen inserts: no source, no page inside one, its own size.
+    PdfPageRecord blank;
+    blank.source = -1;
+    blank.index = -1;
+    blank.sizePt = QSizeF(420, 595);
+    blank.kraFile = PdfSession::pageFileNameForNumber(manifest.effectiveNextPageNumber());
+    QString why;
+    manifest.pages.insert(1, blank);
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    const QString out = dir.filePath(QStringLiteral("withblank.pdf"));
+    QVERIFY2(PdfExporter::exportProjectWithInk(dir.path(), manifest, QHash<int, QImage>(), out, &why),
+             qPrintable(why));
+    QVERIFY(QFileInfo::exists(out));
+
+    /// Every notebook page is in the file, in order.
+    PopplerRenderBackend written;
+    QVERIFY2(written.open(out), qPrintable(out));
+    QCOMPARE(written.pageCount(), manifest.pages.size());
+
+    /// The blank page is the second one, and it is a sheet of its own size: white, and BOTH sides of
+    /// it measure what the record says. The pages the copy came from are still their own sizes.
+    const PdfPageInfo sheet = written.pageInfo(1);
+    QVERIFY(sheet.isValid());
+    QCOMPARE(qRound(sheet.sizePt.width()), 420);
+    QCOMPARE(qRound(sheet.sizePt.height()), 595);
+    QCOMPARE(qRound(written.pageInfo(0).sizePt.width()), qRound(backend.pageInfo(0).sizePt.width()));
+
+    const QImage paper = written.renderPage(1, 72.0);
+    QVERIFY(!paper.isNull());
+    QCOMPARE(paper.size(), QSize(420, 595));
+    QCOMPARE(paper.pixelColor(4, 4), QColor(Qt::white));
+    QCOMPARE(paper.pixelColor(210, 300), QColor(Qt::white));
+    QCOMPARE(paper.pixelColor(419, 594), QColor(Qt::white));
+
+    /// And the page after it is still the page of the source that was there before it: the blank page
+    /// took its place in the order without taking anybody's place.
+    QCOMPARE(written.pageCount(), fixturePages + 1);
+}
+
+/**
+ * A page drawn from a PICTURE is written as an image object of the output, and the picture is on the
+ * page.
+ *
+ * The picture's pixels are the page's paper, so the proof is the same one the session uses: render the
+ * exported page and look for the picture's mark. A page that came out white would be a page of a
+ * notebook whose scan the export silently dropped.
+ */
+void PdfExporterTest::testAPicturePageIsWrittenAsAnImage()
+{
+    const QString fixture = fixturePath(QStringLiteral("text-fixture.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixture));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString projectSource = dir.filePath(QStringLiteral("source.pdf"));
+    QVERIFY(QFile::copy(fixture, projectSource));
+
+    /// A picture with a mark, saved where the notebook keeps its sources.
+    QImage scan(40, 30, QImage::Format_ARGB32_Premultiplied);
+    scan.fill(Qt::white);
+    for (int x = 10; x < 20; ++x) {
+        for (int y = 5; y < 15; ++y) {
+            scan.setPixelColor(x, y, QColor(Qt::black));
+        }
+    }
+    const QString picture = dir.filePath(QStringLiteral("sources/scan.png"));
+    QVERIFY(QDir().mkpath(QFileInfo(picture).absolutePath()));
+    QVERIFY(scan.save(picture, "PNG"));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    PdfSourceRecord pdf;
+    pdf.file = QStringLiteral("source.pdf");
+    pdf.sha256 = PdfSessionManifest::sha256OfFile(projectSource);
+    pdf.byteSize = QFileInfo(projectSource).size();
+    manifest.sourceFile = pdf.file;
+    manifest.sourceSha256 = pdf.sha256;
+    manifest.sourceByteSize = pdf.byteSize;
+    manifest.sources.append(pdf);
+
+    PdfSourceRecord image;
+    image.file = QStringLiteral("sources/scan.png");
+    image.sha256 = PdfSessionManifest::sha256OfFile(picture);
+    image.byteSize = QFileInfo(picture).size();
+    image.kind = QStringLiteral("image");
+    manifest.sources.append(image);
+
+    /// One pixel is one point, which is the size the page was given when it was brought in.
+    PdfPageRecord page;
+    page.index = 0;
+    page.source = 1;
+    page.sizePt = QSizeF(40, 30);
+    page.kraFile = PdfSession::pageFileNameForNumber(manifest.effectiveNextPageNumber());
+    manifest.pages.append(page);
+
+    QString why;
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+
+    const QString out = dir.filePath(QStringLiteral("withpicture.pdf"));
+    QVERIFY2(PdfExporter::exportProjectWithInk(dir.path(), manifest, QHash<int, QImage>(), out, &why),
+             qPrintable(why));
+
+    PopplerRenderBackend written;
+    QVERIFY2(written.open(out), qPrintable(out));
+    QCOMPARE(written.pageCount(), manifest.pages.size());
+    const PdfPageInfo last = written.pageInfo(manifest.pages.size() - 1);
+    QVERIFY(last.isValid());
+    QCOMPARE(qRound(last.sizePt.width()), 40);
+    QCOMPARE(qRound(last.sizePt.height()), 30);
+
+    const QImage paper = written.renderPage(manifest.pages.size() - 1, 72.0);
+    QVERIFY(!paper.isNull());
+    QCOMPARE(paper.size(), QSize(40, 30));
+    QVERIFY2(qGray(paper.pixelColor(2, 2).rgb()) > 200, "the picture's paper is not white");
+    QVERIFY2(qGray(paper.pixelColor(15, 10).rgb()) < 100, "the picture's mark is not on the page");
+    QVERIFY2(qGray(paper.pixelColor(38, 28).rgb()) > 200, "the page is not the picture");
+}
+
+void PdfExporterTest::testProjectAwareSingleSourceExportMatchesLegacyPath()
+{
+    const QString fixture = fixturePath(QStringLiteral("text-fixture.pdf"));
+    PopplerRenderBackend backend;
+    QVERIFY(backend.open(fixture));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString projectSource = dir.filePath(QStringLiteral("source.pdf"));
+    QVERIFY(QFile::copy(fixture, projectSource));
+
+    PdfSessionManifest manifest = manifestFor(backend);
+    PdfSourceRecord source;
+    source.file = QStringLiteral("source.pdf");
+    source.sha256 = PdfSessionManifest::sha256OfFile(projectSource);
+    source.byteSize = QFileInfo(projectSource).size();
+    manifest.sourceFile = source.file;
+    manifest.sourceSha256 = source.sha256;
+    manifest.sourceByteSize = source.byteSize;
+    manifest.sources.append(source);
+
+    QHash<int, QImage> ink;
+    ink.insert(0, inkWithRedMark(QSize(qRound(backend.pageInfo(0).sizePt.width()),
+                                       qRound(backend.pageInfo(0).sizePt.height()))));
+    const QString legacyOutput = dir.filePath(QStringLiteral("legacy.pdf"));
+    const QString projectOutput = dir.filePath(QStringLiteral("project.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportWithInk(projectSource, manifest, ink, legacyOutput, &why),
+             qPrintable(why));
+    QVERIFY2(PdfExporter::exportProjectWithInk(dir.path(), manifest, ink, projectOutput, &why),
+             qPrintable(why));
+    QCOMPARE(readFile(projectOutput), readFile(legacyOutput));
+}
+
+void PdfExporterTest::testProjectAwareExportAssemblesTwoSourcesAndKeepsInkOnNotebookPage()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString inheritedPath = dir.filePath(QStringLiteral("inherited.pdf"));
+    const QString textPath = dir.filePath(QStringLiteral("text.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("inherited-attrs.pdf")), inheritedPath));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("text-fixture.pdf")), textPath));
+
+    PopplerRenderBackend inheritedSource;
+    PopplerRenderBackend textSource;
+    QVERIFY(inheritedSource.open(inheritedPath));
+    QVERIFY(textSource.open(textPath));
+    PdfSessionManifest manifest;
+    manifest.name = QStringLiteral("Two-source export");
+    PdfSourceRecord inheritedRecord;
+    inheritedRecord.file = QStringLiteral("inherited.pdf");
+    inheritedRecord.sha256 = PdfSessionManifest::sha256OfFile(inheritedPath);
+    inheritedRecord.byteSize = QFileInfo(inheritedPath).size();
+    PdfSourceRecord textRecord;
+    textRecord.file = QStringLiteral("text.pdf");
+    textRecord.sha256 = PdfSessionManifest::sha256OfFile(textPath);
+    textRecord.byteSize = QFileInfo(textPath).size();
+    manifest.sourceFile = inheritedRecord.file;
+    manifest.sourceSha256 = inheritedRecord.sha256;
+    manifest.sourceByteSize = inheritedRecord.byteSize;
+    manifest.sources << inheritedRecord << textRecord;
+
+    /// The notebook deliberately starts with source 1 and then returns to source 0. Its second
+    /// page is quarter-turned to exercise the page metadata that survives source/index remapping.
+    manifest.pages.append(PdfPageRecord{0, textSource.pageInfo(0).sizePt,
+                                        textSource.pageInfo(0).rotation,
+                                        PdfSession::pageFileName(0), QString(), 0, 1});
+    manifest.pages.append(PdfPageRecord{0, inheritedSource.pageInfo(0).sizePt,
+                                        inheritedSource.pageInfo(0).rotation,
+                                        PdfSession::pageFileName(1), QString(), 0, 0});
+    manifest.pages[1].extraRotation = 90;
+
+    const QSizeF selectedDisplaySize = manifest.pages.at(1).displaySizePt();
+    QHash<int, QImage> ink;
+    ink.insert(1, inkWithRedMark(QSize(qRound(selectedDisplaySize.width()),
+                                       qRound(selectedDisplaySize.height()))));
+
+    const QString withInk = dir.filePath(QStringLiteral("with-ink.pdf"));
+    const QString paperOnly = dir.filePath(QStringLiteral("paper-only.pdf"));
+    QString why;
+    QVERIFY2(PdfExporter::exportProjectWithInk(dir.path(), manifest, ink, withInk, &why),
+             qPrintable(why));
+    QVERIFY2(PdfExporter::exportProjectWithInk(dir.path(), manifest, QHash<int, QImage>(),
+                                               paperOnly, &why), qPrintable(why));
+
+    PopplerRenderBackend exported;
+    PopplerRenderBackend clean;
+    QVERIFY2(exported.open(withInk), qPrintable(why));
+    QVERIFY2(clean.open(paperOnly), qPrintable(why));
+    QCOMPARE(exported.pageCount(), 2);
+    QCOMPARE(clean.pageCount(), 2);
+    QVERIFY2(exported.pageText(0).contains(QStringLiteral("Page one heading")),
+             qPrintable(exported.pageText(0)));
+    QVERIFY2(exported.pageText(1).contains(QStringLiteral("Inherited page one")),
+             qPrintable(exported.pageText(1)));
+
+    /// Page zero is the second source's first page; its untouched background renders exactly as
+    /// it did in that source. The inherited source's text and page geometry also survive on page 1.
+    QVERIFY2(clean.renderPage(0, 72.0) == textSource.renderPage(0, 72.0),
+             "the first notebook page did not retain the second source's background");
+    QCOMPARE(clean.pageInfo(1).sizePt, manifest.pages.at(1).displaySizePt());
+    const QImage cleanSelectedPage = clean.renderPage(1, 72.0);
+    const QImage expectedSelectedPage =
+        turnedForDisplay(inheritedSource.renderPage(0, 72.0), 90);
+    QVERIFY2(!cleanSelectedPage.isNull() && darkPixels(cleanSelectedPage) > 0,
+             "the inherited source background was lost");
+    QVERIFY2(rectsClose(darkBounds(cleanSelectedPage), darkBounds(expectedSelectedPage), 4),
+             "the inherited source background did not keep its notebook turn");
+
+    const QImage unselectedPage = exported.renderPage(0, 72.0);
+    QVERIFY(redMarkBounds(unselectedPage).isEmpty());
+    const QImage inkedSelectedPage = exported.renderPage(1, 72.0);
+    const QRect mark = redMarkBounds(inkedSelectedPage);
+    QVERIFY2(mark.isValid(), "ink for notebook page 1 did not appear on its assembled page");
+    QVERIFY2(qAbs(mark.left() - 10) <= 3 && qAbs(mark.top() - 10) <= 3
+                 && qAbs(mark.width() - 50) <= 3 && qAbs(mark.height() - 50) <= 3,
+             qPrintable(QStringLiteral("the assembled-page mark came back at (%1,%2) measuring %3x%4")
+                            .arg(mark.left()).arg(mark.top()).arg(mark.width()).arg(mark.height())));
+    QVERIFY(inkedSelectedPage != cleanSelectedPage);
+}
+
+void PdfExporterTest::testProjectAwareExportRefusesEncryptedSourceWithoutOutput()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString readablePath = dir.filePath(QStringLiteral("readable.pdf"));
+    const QString encryptedPath = dir.filePath(QStringLiteral("encrypted.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("text-fixture.pdf")), readablePath));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("ex-encrypted.pdf")), encryptedPath));
+
+    PdfSessionManifest manifest;
+    PdfSourceRecord readable;
+    readable.file = QStringLiteral("readable.pdf");
+    readable.sha256 = PdfSessionManifest::sha256OfFile(readablePath);
+    readable.byteSize = QFileInfo(readablePath).size();
+    PdfSourceRecord encrypted;
+    encrypted.file = QStringLiteral("encrypted.pdf");
+    encrypted.sha256 = PdfSessionManifest::sha256OfFile(encryptedPath);
+    encrypted.byteSize = QFileInfo(encryptedPath).size();
+    manifest.sourceFile = readable.file;
+    manifest.sourceSha256 = readable.sha256;
+    manifest.sourceByteSize = readable.byteSize;
+    manifest.sources << readable << encrypted;
+    manifest.pages.append(PdfPageRecord{0, QSizeF(595, 842), 0,
+                                        PdfSession::pageFileName(0), QString(), 0, 0});
+    manifest.pages.append(PdfPageRecord{0, QSizeF(595, 842), 0,
+                                        PdfSession::pageFileName(1), QString(), 0, 1});
+
+    const QString out = dir.filePath(QStringLiteral("must-not-exist.pdf"));
+    QString why;
+    QVERIFY2(!PdfExporter::exportProjectWithInk(dir.path(), manifest, QHash<int, QImage>(),
+                                                out, &why),
+             "the project-aware path exported an encrypted source");
+    QVERIFY2(why.contains(QStringLiteral("encrypted")), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("encrypted.pdf")), qPrintable(why));
     QVERIFY(!QFileInfo::exists(out));
 }
 
@@ -1539,39 +2107,333 @@ void PdfExporterTest::testAnAssembledPageKeepsItsInheritedPaperAndResources()
                             .arg(expected.width()).arg(expected.height())));
 }
 
-/// A source the assembler cannot read is NAMED, and nothing is written.
+/// THE SHAPE THE USER'S REAL MANUAL HAS, and the reason this port exists.
 ///
-/// ex-objstm-50p.pdf is PDF 1.5 with a cross-reference stream -- the modern shape the user's own
-/// files do not have and this reader deliberately does not guess at. The per-source export stays
-/// the fallback for it; a half-read source written out as a file that only looks right is the one
-/// outcome worse than a refusal, so the refusal also has to leave no file behind.
-void PdfExporterTest::testTheAssemblerNamesASourceItCannotRead()
+/// The file is HYBRID: a classic xref TABLE, and an /XRefStm whose decoded entries are type-2 --
+/// objects packed in an /ObjStm. The classic table records the page object and its resource
+/// dictionary as FREE, which is what a hybrid file shows an old reader; the page dictionary AND the
+/// /Resources dictionary the page inherits from /Pages both live in the object stream. So a reader
+/// that follows the table alone sees a stale in-use entry for the page and a free entry for its
+/// inherited resources; a copier that does not apply the supplemental stream writes the wrong page.
+/// This is the case that separates a
+/// reader that can read the real manual from one that refuses it or silently writes nothing.
+///
+/// The assertions are the rendered page, its text and its plan: the paper is inherited from /Pages,
+/// the font comes from the /Resources dictionary packed in the /ObjStm, and the copied content
+/// stream renders pixel for pixel like the source's own page.
+void PdfExporterTest::testAssemblerReadsHybridXrefAndPackedInheritedPage()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
-    const QString modern = dir.filePath(QStringLiteral("modern.pdf"));
-    QVERIFY(QFile::copy(fixturePath(QStringLiteral("ex-objstm-50p.pdf")), modern));
+    const QString source = dir.filePath(QStringLiteral("hybrid.pdf"));
+    const QByteArray fixture = hybridXrefFixture();
+    {
+        QFile file(source);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(fixture), qint64(fixture.size()));
+    }
+
+    /// The fixture itself has to open and show its text, or a "passing" assembly would prove nothing.
+    PopplerRenderBackend original;
+    QVERIFY2(original.open(source), "the hybrid fixture itself does not open");
+    QCOMPARE(original.pageCount(), 1);
+    QCOMPARE(original.pageInfo(0).sizePt, QSizeF(595, 842));
+    const QImage expected = original.renderPage(0, 72.0);
+    QVERIFY(!expected.isNull());
+    QVERIFY2(darkPixels(expected) > 0, "the hybrid fixture itself has no text to preserve");
+
+    const PdfSessionManifest manifest =
+        onePageManifest(QStringLiteral("hybrid.pdf"), source, QSizeF(595, 842));
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QList<PdfAssembler::PagePlan> written;
+    QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, out, &written, &why), qPrintable(why));
+    QCOMPARE(written.size(), 1);
+    QVERIFY2(written.at(0).inheritsMediaBox,
+             "the fixture's page carries no /MediaBox of its own; the plan has to know");
+    QVERIFY2(written.at(0).inheritsResources,
+             "the fixture's page carries no /Resources of its own; the plan has to know");
+    QCOMPARE(written.at(0).sizePt, QSizeF(595, 842));
+
+    PopplerRenderBackend assembled;
+    QVERIFY2(assembled.open(out), qPrintable(why));
+    QCOMPARE(assembled.pageCount(), 1);
+    QCOMPARE(assembled.pageInfo(0).sizePt, QSizeF(595, 842));
+    QVERIFY2(assembled.pageText(0).contains(QStringLiteral("Hybrid xref page text")),
+             qPrintable(assembled.pageText(0)));
+    /// Pixel for pixel: the packed page dictionary and its packed /Resources, plus the inherited
+    /// paper, all came through, so the assembled page is the source's own page.
+    QCOMPARE(assembled.renderPage(0, 72.0), expected);
+}
+
+/// A MODERN STANDALONE FILE: no classic table at all -- startxref names an /XRef stream and the page
+/// dictionaries live in an /ObjStm behind it (Ghostscript wrote this one). The reader resolves each
+/// packed page by its own xref-stream entry, so two pages assemble in notebook order with their
+/// text, paper and pixels intact. This is the shape the old reader refused.
+void PdfExporterTest::testAssemblerReadsStandaloneXrefStream()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("modern.pdf"));
+    QVERIFY(QFile::copy(fixturePath(QStringLiteral("ex-objstm-50p.pdf")), source));
+
+    PopplerRenderBackend original;
+    QVERIFY(original.open(source));
+    QCOMPARE(original.pageCount(), 50);
 
     PdfSessionManifest manifest;
-    manifest.name = QStringLiteral("Modern");
+    manifest.name = QStringLiteral("Standalone xref stream");
     PdfSourceRecord record;
     record.file = QStringLiteral("modern.pdf");
-    record.sha256 = PdfSessionManifest::sha256OfFile(modern);
-    record.byteSize = QFileInfo(modern).size();
+    record.sha256 = PdfSessionManifest::sha256OfFile(source);
+    record.byteSize = QFileInfo(source).size();
     manifest.sourceFile = record.file;
     manifest.sourceSha256 = record.sha256;
     manifest.sourceByteSize = record.byteSize;
     manifest.sources << record;
-    manifest.pages.append(PdfPageRecord{ 0, QSizeF(595, 842), 0,
-                                         PdfSession::pageFileName(0), QString(), 0, 0 });
+    manifest.pages.append(sourcePageRecord(0, original.pageInfo(0).sizePt,
+                                           original.pageInfo(0).rotation, PdfSession::pageFileName(0)));
+    manifest.pages.append(sourcePageRecord(1, original.pageInfo(1).sizePt,
+                                           original.pageInfo(1).rotation, PdfSession::pageFileName(1)));
 
     const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
     QString why;
+    QList<PdfAssembler::PagePlan> written;
+    QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, out, &written, &why), qPrintable(why));
+    QCOMPARE(written.size(), 2);
+
+    PopplerRenderBackend assembled;
+    QVERIFY2(assembled.open(out), qPrintable(why));
+    QCOMPARE(assembled.pageCount(), 2);
+    QCOMPARE(assembled.pageInfo(0).sizePt, original.pageInfo(0).sizePt);
+    QCOMPARE(assembled.pageInfo(1).sizePt, original.pageInfo(1).sizePt);
+    QVERIFY2(assembled.pageText(0).contains(QStringLiteral("Page 1 heading")),
+             qPrintable(assembled.pageText(0)));
+    QVERIFY2(assembled.pageText(1).contains(QStringLiteral("Page 2 heading")),
+             qPrintable(assembled.pageText(1)));
+    QCOMPARE(assembled.renderPage(0, 72.0), original.renderPage(0, 72.0));
+    QCOMPARE(assembled.renderPage(1, 72.0), original.renderPage(1, 72.0));
+}
+
+void PdfExporterTest::testAssemblerHonorsPrevFreeEntry()
+{
+    /// The newest revision frees object 3. The older hybrid table's /XRefStm contains a type-2
+    /// entry for that same object, but it must not resurrect the tombstone from the /Prev chain.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("previous.pdf"));
+    const QByteArray fixture = appendFreeObjectRevision(hybridXrefFixture(), 3);
+    QVERIFY(!fixture.isEmpty());
+    {
+        QFile file(source);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(fixture), qint64(fixture.size()));
+    }
+
+    const PdfSessionManifest manifest =
+        onePageManifest(QStringLiteral("previous.pdf"), source, QSizeF(595, 842));
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
     QVERIFY2(!PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why),
-             "a source with a cross-reference stream was assembled as if it had been read");
-    QVERIFY2(why.contains(QStringLiteral("modern.pdf")),
-             qPrintable(QStringLiteral("the refusal does not name the source: %1").arg(why)));
+             "the older /XRefStm resurrected an object freed by the newest /Prev section");
+    QVERIFY2(why.contains(QStringLiteral("previous.pdf")), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("object 3")), qPrintable(why));
     QVERIFY2(!QFileInfo::exists(out), "a refusal left a half-written file behind");
+}
+
+void PdfExporterTest::testAssemblerRejectsReferenceGenerationMismatch()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("stale-reference.pdf"));
+    QByteArray fixture = readFile(fixturePath(QStringLiteral("text-fixture.pdf")));
+    QVERIFY(!fixture.isEmpty());
+    const int reference = fixture.indexOf("9 0 R");
+    QVERIFY(reference >= 0);
+    fixture.replace(reference, 5, "9 1 R");
+    {
+        QFile file(source);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(fixture), qint64(fixture.size()));
+    }
+
+    const PdfSessionManifest manifest =
+        onePageManifest(QStringLiteral("stale-reference.pdf"), source, QSizeF(595, 842));
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QVERIFY2(!PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why),
+             "a reference to generation 1 resolved to the current generation-0 object");
+    QVERIFY2(why.contains(QStringLiteral("generation")), qPrintable(why));
+    QVERIFY2(!QFileInfo::exists(out), "a refusal left a half-written file behind");
+}
+
+void PdfExporterTest::testAssemblerRefusesLongIndirectValueChain()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("long-chain.pdf"));
+    const QByteArray fixture = longIndirectBoxChainFixture();
+    {
+        QFile file(source);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(fixture), qint64(fixture.size()));
+    }
+
+    const PdfSessionManifest manifest =
+        onePageManifest(QStringLiteral("long-chain.pdf"), source, QSizeF(595, 842));
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QVERIFY2(!PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("64 references")), qPrintable(why));
+    QVERIFY2(!QFileInfo::exists(out), "a refusal left a half-written file behind");
+}
+
+void PdfExporterTest::testAssemblerRefusesUnsupportedAnnotationsExplicitly()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString source = dir.filePath(QStringLiteral("annotated.pdf"));
+    const QByteArray fixture = hybridXrefFixture(true);
+    {
+        QFile file(source);
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(file.write(fixture), qint64(fixture.size()));
+    }
+
+    const PdfSessionManifest manifest =
+        onePageManifest(QStringLiteral("annotated.pdf"), source, QSizeF(595, 842));
+    const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+    QString why;
+    QVERIFY2(!PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("annotation")), qPrintable(why));
+    QVERIFY2(!QFileInfo::exists(out), "a refusal left a half-written file behind");
+}
+
+void PdfExporterTest::testAssemblerRemapsLocalLinkAnnotations()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QByteArray firstFixture = hybridXrefFixture(true, true);
+    const QByteArray secondFixture = hybridXrefFixture(true, true, false, true);
+    const QString firstPath = dir.filePath(QStringLiteral("first.pdf"));
+    const QString secondPath = dir.filePath(QStringLiteral("second.pdf"));
+    QFile firstFile(firstPath);
+    QVERIFY(firstFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(firstFile.write(firstFixture), qint64(firstFixture.size()));
+    QFile secondFile(secondPath);
+    QVERIFY(secondFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(secondFile.write(secondFixture), qint64(secondFixture.size()));
+    QVERIFY(firstFile.flush());
+    QVERIFY(secondFile.flush());
+    firstFile.close();
+    secondFile.close();
+
+    const QSizeF sizePt(595, 842);
+    PdfSessionManifest manifest = onePageManifest(QStringLiteral("first.pdf"), firstPath, sizePt);
+    PdfSourceRecord secondSource;
+    secondSource.file = QStringLiteral("second.pdf");
+    secondSource.sha256 = PdfSessionManifest::sha256OfFile(secondPath);
+    secondSource.byteSize = QFileInfo(secondPath).size();
+    manifest.sources.append(secondSource);
+    PdfPageRecord secondPage = sourcePageRecord(0, sizePt, 0, PdfSession::pageFileName(1));
+    secondPage.source = 1;
+    manifest.pages.append(secondPage);
+
+    QString why;
+    QVERIFY2(manifest.isValid(&why), qPrintable(why));
+    const QString outputPath = dir.filePath(QStringLiteral("assembled.pdf"));
+    QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, outputPath, nullptr, &why), qPrintable(why));
+
+    const auto output = Poppler::Document::load(outputPath);
+    QVERIFY(output);
+    QCOMPARE(output->numPages(), 2);
+    for (int pageIndex = 0; pageIndex < 2; ++pageIndex) {
+        std::unique_ptr<Poppler::Page> page(output->page(pageIndex));
+        QVERIFY(page);
+        const auto annotations = page->annotations();
+        QCOMPARE(static_cast<int>(annotations.size()), 1);
+        auto *linkAnnotation = dynamic_cast<Poppler::LinkAnnotation *>(annotations.at(0).get());
+        QVERIFY(linkAnnotation);
+        Poppler::Link *link = linkAnnotation->linkDestination();
+        QVERIFY(link);
+        QCOMPARE(static_cast<int>(link->linkType()), static_cast<int>(Poppler::Link::Goto));
+        auto *gotoLink = dynamic_cast<Poppler::LinkGoto *>(link);
+        QVERIFY(gotoLink);
+        QVERIFY(!gotoLink->isExternal());
+        QCOMPARE(gotoLink->destination().pageNumber(), pageIndex + 1);
+    }
+}
+
+void PdfExporterTest::testAssemblerDropsTaggedLinkWithoutStructureTree()
+{
+    for (int actionForm = 0; actionForm < 2; ++actionForm) {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString source = dir.filePath(QStringLiteral("tagged-link.pdf"));
+        const QByteArray fixture = hybridXrefFixture(true, true, true, actionForm != 0);
+        {
+            QFile file(source);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QCOMPARE(file.write(fixture), qint64(fixture.size()));
+        }
+
+        const PdfSessionManifest manifest =
+            onePageManifest(QStringLiteral("tagged-link.pdf"), source, QSizeF(595, 842));
+        const QString outputPath = dir.filePath(QStringLiteral("assembled.pdf"));
+        QString why;
+        QVERIFY2(PdfAssembler::assemble(dir.path(), manifest, outputPath, nullptr, &why),
+                 qPrintable(why));
+
+        const auto output = Poppler::Document::load(outputPath);
+        QVERIFY(output);
+        QCOMPARE(output->numPages(), 1);
+        std::unique_ptr<Poppler::Page> page(output->page(0));
+        QVERIFY(page);
+        const auto annotations = page->annotations();
+        QCOMPARE(static_cast<int>(annotations.size()), 0);
+        QVERIFY(readFile(outputPath).contains("Hybrid xref page text"));
+    }
+}
+
+/// A source the assembler cannot read is NAMED, and nothing is written.
+///
+/// With xref streams, /ObjStm and their predictors now read, the sources it still refuses are the
+/// ones it must: an ENCRYPTED file (its xref may be decoded to locate the trailer) and a structural
+/// stream whose filter it does not implement (/DCTDecode). The per-source export stays the fallback for both; a
+/// half-read source written out as a file that only looks right is the one outcome worse than a
+/// refusal, so each refusal also has to leave no file behind.
+void PdfExporterTest::testTheAssemblerNamesASourceItCannotRead()
+{
+    const struct {
+        const char *fixture;
+        const char *reason;
+    } cases[] = {
+        { "ex-encrypted.pdf", "encrypted" },
+        { "ex-objstm-badfilter.pdf", "DCTDecode" },
+    };
+
+    for (const auto &testCase : cases) {
+        const QString fixture = QString::fromLatin1(testCase.fixture);
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString source = dir.filePath(QStringLiteral("refused.pdf"));
+        QVERIFY2(QFile::copy(fixturePath(fixture), source), qPrintable(fixture));
+
+        const PdfSessionManifest manifest =
+            onePageManifest(QStringLiteral("refused.pdf"), source, QSizeF(595, 842));
+
+        const QString out = dir.filePath(QStringLiteral("assembled.pdf"));
+        QString why;
+        QVERIFY2(!PdfAssembler::assemble(dir.path(), manifest, out, nullptr, &why),
+                 qPrintable(QStringLiteral("%1 was assembled as if it had been read").arg(fixture)));
+        QVERIFY2(why.contains(QString::fromLatin1(testCase.reason)),
+                 qPrintable(QStringLiteral("%1: the refusal does not name the reason: %2")
+                                .arg(fixture, why)));
+        QVERIFY2(why.contains(QStringLiteral("refused.pdf")),
+                 qPrintable(QStringLiteral("%1: the refusal does not name the source: %2")
+                                .arg(fixture, why)));
+        QVERIFY2(!QFileInfo::exists(out), "a refusal left a half-written file behind");
+    }
 }
 
 QTEST_MAIN(PdfExporterTest)

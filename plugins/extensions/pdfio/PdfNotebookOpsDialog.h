@@ -56,7 +56,8 @@ QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, 
  * The menu entries act on the page that is open, one operation at a time. This screen shows every
  * page at once -- its preview, where it comes from, how big it is, which way up it is, whether it
  * has been drawn on -- and lets a person build a whole change before any of it is written: move
- * pages, duplicate them, turn them, delete them, and then press Apply once.
+ * pages, duplicate them, turn them, delete them, and then press Apply once. Batch pixel resize is a
+ * separate action here, available while the page list has no pending edits.
  *
  * The model is a working copy of the page list and nothing else. Every button edits that copy; no
  * file is created and no manifest is touched while the screen is open, so Cancel changes nothing and
@@ -66,8 +67,8 @@ QPixmap pdfioPreviewForDisplay(const QPixmap &source, const QSize &logicalSize, 
  * never writes anything itself.
  *
  * Two things the footer keeps honest: Apply is disabled while nothing has changed (no operation is
- * run for a no-op), and the hint line says why an action is not available -- the last page cannot be
- * deleted, the first page cannot move up -- rather than letting a greyed button stand there mute.
+ * run for a no-op), and the hint line explains how to repopulate a notebook after its last page is
+ * deleted, or why an edge page cannot move farther -- rather than letting a greyed button stand mute.
  *
  * Beside the list is the canvas: the selected page, large, which can be turned directly by dragging
  * it around its own centre (a pen and a mouse) or by twisting two fingers on it (touch). A page is
@@ -115,28 +116,44 @@ public:
     DragMode dragMode() const { return m_dragMode; }
 
     /**
-     * The whole-notebook action the user asked for instead of a page-list change, if any.
-     *
-     * Insert and merge are NOT here: they change this notebook, so they are edits of the page list
-     * like any other, and they join the pending change (their PDF and their files are described in
-     * PageEdits before anything is committed). Extract is: it writes a notebook of its own somewhere
-     * else, so it cannot be part of this notebook's Apply and is offered only while the list is
-     * untouched.
+     * A notebook-level action requested from this screen instead of applying its working copy.
+     * Insert and merge remain page-list edits. Extract and pixel resize are separate transactions,
+     * so they are offered only while this screen has no pending page-list changes.
      */
     enum RequestedAction {
         NoAction,
         ExtractRangeAction,
+        BatchPixelResizeAction,
     };
     RequestedAction requestedAction() const { return m_requested; }
 
     /// What the screen needs from the application to add pages from a PDF: the picker, the one range
     /// dialog, and the reading of that PDF's pages. The screen knows nothing about renderers.
+    /// A PICTURE the screen is bringing in as one page, and the size that page will be.
+    struct ImageToAdd {
+        QString path;
+        /// The picture's own size in points: its pixels, one for one, which is the size
+        /// ImageRenderBackend reads a picture by.
+        QSizeF sizePt;
+        /**
+         * How big the page is SHOWN against that: the import's own answer ("this was scanned at
+         * 300 dpi" is 0.24). It becomes the page's scale, which is the mode that already means
+         * exactly this, so an imported picture can be rescaled afterwards like any other page.
+         */
+        qreal scale = 1.0;
+    };
+
+    /// A PDF the screen is bringing in, and the sizes of the pages it would add.
     struct PdfToAdd {
         QString path;
         QList<QSizeF> displayedSizes;
     };
     struct SourceAdder {
         std::function<bool(PdfToAdd *pdf)> pickAndRead;
+
+        /// Picks a picture and reports what size page it makes. Empty means the platform's chooser
+        /// is not wired, and the entry is not offered.
+        std::function<bool(ImageToAdd *picture)> pickImage;
         std::function<bool(int available, int *first, int *count)> askRange;
     };
     void setSourceAdder(const SourceAdder &adder);
@@ -213,6 +230,8 @@ private:
         /// notebook merged in.
         bool fromAddedPdf = false;
         bool fromMergedNotebook = false;
+        /// A picture this change is bringing in as a page of its own.
+        bool fromAddedImage = false;
     };
 
     void buildUi();
@@ -293,6 +312,30 @@ private:
     /// was undone by hand is not a change, and the preview it dropped is not one either.
     void restorePreviewIfUnchanged(Row &row);
     void insertPagesFromPdf();
+
+    /**
+     * Inserts a BLANK page after the one the user is on, at a size they choose: the page before or
+     * after this one, a preset, or a size they type.
+     *
+     * A blank page has no source PDF and no page inside one -- the record says so with source -1 and
+     * index -1, and the manifest refuses any other combination -- so this is the one entry here that
+     * adds a page nothing needs a PDF for. Its paper is white paper of the size it is given, drawn
+     * by the same renderer every other page's paper comes from.
+     */
+    void insertBlankPage();
+
+    /**
+     * Inserts a PICTURE as a page after the one the user is on.
+     *
+     * The picture is copied into the notebook's sources by the same commit as everything else (the
+     * screen only says which file and which kind), so one Apply brings the file in and adds the page
+     * together, and one undo takes both back.
+     */
+    void insertImagePage();
+
+    /// The size to insert a blank page at, asked for. An invalid size means the user backed out.
+    /// Not const: it is a question asked of the user, with this dialog as its parent.
+    QSizeF askBlankPageSize();
     void mergeNotebookIn();
     void addPagesFromSource(const PdfToAdd &pdf, int first, int count);
     void addNotebook(const NotebookToMerge &notebook);
@@ -308,6 +351,9 @@ private:
     struct Addition {
         QString path;
         QByteArray sha256;
+        /// What the file is: empty for a PDF, "image" for a picture. It travels to the manifest so
+        /// the reader that opens it tomorrow is the one that wrote it.
+        QString kind;
     };
     /// The additions in index order, and the assets another notebook carried.
     QList<Addition> m_additions;
@@ -407,8 +453,13 @@ private:
     QPushButton *m_rotateLeft = nullptr;
     QPushButton *m_rotateRight = nullptr;
     QPushButton *m_insert = nullptr;
+    /// The one entry that adds a page with no PDF behind it.
+    QPushButton *m_insertBlank = nullptr;
+    /// The one entry that adds a page whose paper is a picture the notebook takes in.
+    QPushButton *m_insertImage = nullptr;
     QPushButton *m_extract = nullptr;
     QPushButton *m_merge = nullptr;
+    QPushButton *m_batchResize = nullptr;
     RequestedAction m_requested = NoAction;
     SourceAdder m_adder;
     NotebookMerger m_merger;

@@ -6,6 +6,8 @@
 
 #include "session/PdfSourceRenderers.h"
 
+#include "backends/image/ImageRenderBackend.h"
+
 #include <QDir>
 #include <QPainter>
 #include <QTransform>
@@ -18,6 +20,8 @@ void fail(QString *why, const QString &message)
         *why = message;
     }
 }
+
+} // namespace
 
 /**
  * \a rendered -- the source page as the renderer displays it, at \a sourceDpi -- reduced to
@@ -33,7 +37,7 @@ void fail(QString *why, const QString &message)
  * exposes corners the sheet never covered, and turnedForDisplay() needs somewhere to put the
  * nothing that is really there.
  */
-QImage croppedToBox(const QImage &rendered, const QRectF &boxPt, qreal sourceDpi)
+QImage PdfSourceRenderers::croppedToBox(const QImage &rendered, const QRectF &boxPt, qreal sourceDpi)
 {
     const qreal perPoint = sourceDpi / 72.0;
     const QRect wanted(qRound(boxPt.x() * perPoint), qRound(boxPt.y() * perPoint),
@@ -54,8 +58,6 @@ QImage croppedToBox(const QImage &rendered, const QRectF &boxPt, qreal sourceDpi
     }
     return cropped;
 }
-
-} // namespace
 
 PdfSourceRenderers::PdfSourceRenderers() = default;
 
@@ -97,7 +99,7 @@ PdfRenderBackend *PdfSourceRenderers::forPage(const PdfSessionManifest &manifest
         return nullptr;
     }
 
-    return backendForFile(source.file, projectDir, why);
+    return backendForFile(source, projectDir, why);
 }
 
 PdfPageInfo PdfSourceRenderers::pageInfo(const PdfSessionManifest &manifest,
@@ -105,11 +107,44 @@ PdfPageInfo PdfSourceRenderers::pageInfo(const PdfSessionManifest &manifest,
                                          int page,
                                          QString *why)
 {
+    if (page < 0 || page >= manifest.pages.size()) {
+        fail(why, QStringLiteral("page %1 is outside the notebook").arg(page + 1));
+        return PdfPageInfo();
+    }
+
+    /// A page with no source has its geometry in its own record: there is no file to ask, and asking
+    /// one anyway is how a blank page would end up measured from somebody else's PDF.
+    const PdfPageRecord &record = manifest.pages.at(page);
+    if (record.isBlank()) {
+        PdfPageInfo info;
+        info.sizePt = record.sizePt;
+        info.rotation = 0;
+        return info;
+    }
+
     PdfRenderBackend *backend = forPage(manifest, projectDir, page, why);
     if (!backend) {
         return PdfPageInfo();
     }
-    return backend->pageInfo(manifest.pages.at(page).index);
+    return backend->pageInfo(record.index);
+}
+
+QImage PdfSourceRenderers::blankPage(const PdfPageRecord &record, qreal dpi)
+{
+    /// The same order as renderPage(): the notebook's own scale, then the box, then the turn.
+    const qreal scale = record.extraScale > 0.0 ? record.extraScale : 1.0;
+    const qreal sourceDpi = dpi * scale;
+    const QRectF box = record.boxPt.isValid() ? record.boxPt : QRectF(QPointF(0, 0), record.sizePt);
+    const qreal perPoint = sourceDpi / 72.0;
+
+    QImage paper(QSize(qMax(1, qRound(box.width() * perPoint)),
+                       qMax(1, qRound(box.height() * perPoint))),
+                 QImage::Format_ARGB32_Premultiplied);
+    if (paper.isNull()) {
+        return QImage();
+    }
+    paper.fill(Qt::white);
+    return turnedForDisplay(paper, record.extraRotation);
 }
 
 QImage PdfSourceRenderers::renderPage(const PdfSessionManifest &manifest,
@@ -118,12 +153,26 @@ QImage PdfSourceRenderers::renderPage(const PdfSessionManifest &manifest,
                                       qreal dpi,
                                       QString *why)
 {
+    if (page < 0 || page >= manifest.pages.size()) {
+        fail(why, QStringLiteral("page %1 is not part of the notebook").arg(page + 1));
+        return QImage();
+    }
+    const PdfPageRecord &record = manifest.pages.at(page);
+
+    /// A page with no source: its paper is WHITE PAPER of its own sheet, and there is no file to
+    /// open. This is the ONLY place the reader's paper comes from -- the strip, the single page, the
+    /// thumbnail and the exporter all come through here -- so it has to be answered BEFORE any
+    /// backend is looked for. It was not, for one round: forPage() runs first, a blank page has no
+    /// source to open, and the null render it returned left the strip's band the colour of the desk
+    /// (a grey sheet where the user's blank page should be) and the page with no preview at all.
+    if (record.isBlank()) {
+        return blankPage(record, dpi);
+    }
+
     PdfRenderBackend *backend = forPage(manifest, projectDir, page, why);
     if (!backend) {
         return QImage();
     }
-
-    const PdfPageRecord &record = manifest.pages.at(page);
 
     /// A scaled page is rendered at a larger SOURCE dpi and never upscaled: the same source at more
     /// dpi is more pixels of the same page, which is what keeps the pen's ink sharp and what makes
@@ -184,32 +233,46 @@ QImage PdfSourceRenderers::turnedForDisplay(const QImage &rendered, int extraRot
     return turned;
 }
 
-PdfRenderBackend *PdfSourceRenderers::backendForFile(const QString &sourceFile,
+PdfRenderBackend *PdfSourceRenderers::backendForFile(const PdfSourceRecord &source,
                                                      const QString &projectDir,
                                                      QString *why)
 {
-    PdfRenderBackend *backend = m_backends.value(sourceFile, nullptr);
+    /// The same relative name can identify different files in different notebook directories. Include
+    /// the recorded content hash as well, so replacing a source at that path cannot reuse an open
+    /// backend for its previous contents.
+    const QString sourceFile = source.file;
+    const QString cacheKey = QDir(projectDir).absoluteFilePath(sourceFile)
+        + QLatin1Char('\n') + QString::fromLatin1(source.sha256);
+    PdfRenderBackend *backend = m_backends.value(cacheKey, nullptr);
     if (backend && backend->isOpen()) {
         return backend;
     }
 
     if (!backend) {
-        if (!m_factory) {
-            fail(why, QStringLiteral("this notebook has no renderer for %1").arg(sourceFile));
-            return nullptr;
+        /// A picture is one page and needs no platform renderer: the same file, read the same way,
+        /// on every platform this runs on. A PDF needs the one this build has.
+        if (source.isImage()) {
+            backend = new ImageRenderBackend();
+        } else {
+            if (!m_factory) {
+                fail(why, QStringLiteral("this notebook has no renderer for %1").arg(sourceFile));
+                return nullptr;
+            }
+            backend = m_factory();
+            if (!backend) {
+                fail(why, QStringLiteral("no PDF render backend on this platform"));
+                return nullptr;
+            }
         }
-        backend = m_factory();
-        if (!backend) {
-            fail(why, QStringLiteral("no PDF render backend on this platform"));
-            return nullptr;
-        }
-        m_backends.insert(sourceFile, backend);
+        m_backends.insert(cacheKey, backend);
     }
 
     /// A backend whose source has gone (or whose open failed earlier) is opened again rather than
     /// thrown away: the file may be back, and a stale handle would answer with nothing.
     if (!backend->open(QDir(projectDir).filePath(sourceFile))) {
-        fail(why, QStringLiteral("the renderer cannot open %1").arg(sourceFile));
+        fail(why, source.isImage()
+                     ? QStringLiteral("the picture %1 cannot be read").arg(sourceFile)
+                     : QStringLiteral("the renderer cannot open %1").arg(sourceFile));
         return nullptr;
     }
 

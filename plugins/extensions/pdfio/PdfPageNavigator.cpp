@@ -46,6 +46,7 @@
 
 #include <kis_canvas2.h>
 #include <kis_coordinates_converter.h>
+#include <kis_tool_proxy.h>
 
 #include <KoZoomMode.h>
 #include <kis_canvas_controller.h>
@@ -242,12 +243,15 @@ constexpr int SaveLandingTimeoutMs = 15000;
 /// about ten megabytes, over and over. Measured in pdfio.log: seven full five-page cycles inside
 /// thirty seconds of taking notes.
 ///
-/// Ten seconds of quiet is a pause someone actually took. The five minute backstop is what keeps
-/// ink safe from someone who never pauses. Neither is what protects a page turn: the turn, the
-/// roll and the close each write their pages and wait for the landing themselves, which is where
-/// the ink would otherwise be lost. The idle write only decides how much is at risk if the
-/// application dies -- at most the last ten seconds, or five minutes of continuous writing.
-constexpr qint64 InkSettleMs = 10000;
+/// Thirty seconds of quiet gives long strokes and deliberate pauses room to finish before the
+/// idle writer copies the image. The canvas tool-action signal below also blocks that writer while
+/// the pen/button is still held, even when no pixels have changed recently. The five minute
+/// backstop is what keeps ink safe from someone who never pauses, but it too waits for the active
+/// tool action to end. Neither protects a page turn: the turn, the roll and the close each write
+/// their pages and wait for the landing themselves, which is where the ink would otherwise be lost.
+/// The idle write only decides how much is at risk if the application dies -- at most thirty
+/// seconds of quiet or five minutes of continuous writing (plus any time a tool action stays active).
+constexpr qint64 InkSettleMs = 30000;
 constexpr qint64 AutoSaveTickMs = 250;
 constexpr qint64 AutoSaveMinGapMs = 1000;
 constexpr qint64 AutoSaveMaxIntervalMs = 5 * 60 * 1000;
@@ -647,7 +651,9 @@ void PdfPageNavigator::checkScrollFollow()
         return;
     }
 
-    if (m_savingPages) {
+    /// A pen or tool action can stay held while producing no new pixels (for example, a long
+    /// deliberate stroke pause). Do not let scroll-follow turn or roll the page out from under it.
+    if (m_savingPages || m_toolActionActive) {
         return;
     }
 
@@ -1609,8 +1615,16 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
     /// below, because that is where the first previews are asked for.
     nameMissingPreviews();
 
-    const int anchor = qBound(0, anchorPage, manifest.pages.size() - 1);
-    const bool shown = showPage(anchor, why);
+    bool shown = true;
+    if (manifest.pages.isEmpty()) {
+        /// There is no page document to build. Close the old canvas and keep the empty notebook open
+        /// so its insertion and merge actions can repopulate it.
+        closeCurrentPage();
+        m_index = -1;
+    } else {
+        const int anchor = qBound(0, anchorPage, manifest.pages.size() - 1);
+        shown = showPage(anchor, why);
+    }
 
     /// THE SWAP IS NOT COMPLETE UNTIL THE DOCUMENT IS. showPage() below can refuse -- a page turn
     /// already in progress, a source that cannot be rendered, a build that comes back empty -- and
@@ -1669,7 +1683,11 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
         m_scrollWatch = new QTimer(this);
         connect(m_scrollWatch, &QTimer::timeout, this, &PdfPageNavigator::checkScrollFollow);
     }
-    m_scrollWatch->start(150);
+    if (manifest.pages.isEmpty()) {
+        m_scrollWatch->stop();
+    } else {
+        m_scrollWatch->start(150);
+    }
 
     /// And the idle write, on a timer of its own: the follow asks where the view has settled,
     /// this asks whether the ink has been quiet long enough to be written down. Separate
@@ -1686,6 +1704,11 @@ bool PdfPageNavigator::adoptNotebook(const QString &projectDir, const PdfSession
 
 void PdfPageNavigator::closeCurrentPage()
 {
+    if (m_toolActionConnection) {
+        disconnect(m_toolActionConnection);
+    }
+    m_toolActionActive = false;
+
     /// The view takes the document with it, and removing the document as well leaves the view
     /// alive with nothing behind it. See the note in showPage.
     if (m_view) {
@@ -1703,7 +1726,11 @@ bool PdfPageNavigator::buildForStrip(int index, QString *why)
     /// The active page's own source, opened once. This used to open "the source" and render pages
     /// by their notebook position; both are wrong the moment a notebook holds pages from more than
     /// one PDF, or in an order other than its source's.
-    if (!m_sourceRenderers.forPage(m_manifest, m_projectDir, index, why)) {
+    ///
+    /// A page with no source at all is the one case with nothing to open: its own slot is white
+    /// paper, and the builder takes that from the record.
+    if (!m_manifest.pages.at(index).isBlank()
+        && !m_sourceRenderers.forPage(m_manifest, m_projectDir, index, why)) {
         return false;
     }
 
@@ -1758,6 +1785,11 @@ bool PdfPageNavigator::rollToPage(int index, QString *why, int centreOn, bool ke
     /// A roll that does not get far must not leave the canvas anchored to a point from a window
     /// it never moved to.
     m_rollAnchored = false;
+
+    if (m_toolActionActive) {
+        fail(why, QStringLiteral("finish the current canvas action before moving the page window"));
+        return false;
+    }
 
     if (!m_document || !m_document->image()) {
         fail(why, QStringLiteral("no strip is open"));
@@ -2968,6 +3000,11 @@ qreal PdfPageNavigator::longestSidePtInWindow(int activePage, int scope) const
 
 bool PdfPageNavigator::showPage(int index, QString *why)
 {
+    if (m_toolActionActive && index != m_index) {
+        fail(why, QStringLiteral("finish the current canvas action before changing pages"));
+        return false;
+    }
+
     if (m_inPageTurn) {
         /// A second turn arriving from inside an event loop this one is waiting in -- a click
         /// while a write is landing -- is refused, not interleaved. Two turns deciding at once
@@ -3069,8 +3106,13 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
 {
     /// The page's own source: the record says which PDF this page's background comes from, and
     /// the render is of the record's own page inside that file.
-    PdfRenderBackend *backend = m_sourceRenderers.forPage(m_manifest, m_projectDir, index, why);
-    if (!backend) {
+    ///
+    /// A BLANK page has no source, so there is no file to open: its paper is white paper of its own
+    /// size, and asking for a backend that does not exist would refuse to open the page at all.
+    const bool blank = m_manifest.pages.at(index).isBlank();
+    PdfRenderBackend *backend =
+        blank ? nullptr : m_sourceRenderers.forPage(m_manifest, m_projectDir, index, why);
+    if (!blank && !backend) {
         return false;
     }
 
@@ -3083,7 +3125,9 @@ bool PdfPageNavigator::buildForSinglePage(int index, QString *why)
     /// gives.
     const qreal dpi = dpiForBudget(m_memoryBudgetMb, index, 0);
     m_renderedDpi = dpi;
-    KisImageSP image = PdfProjectBuilder::buildPageImage(m_manifest.pages.at(index), *backend, dpi, why);
+    KisImageSP image = blank
+        ? PdfProjectBuilder::buildBlankPageImage(m_manifest.pages.at(index), dpi, why)
+        : PdfProjectBuilder::buildPageImage(m_manifest.pages.at(index), *backend, dpi, why);
     if (!image) {
         return false;
     }
@@ -3319,6 +3363,25 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
 
     m_document = document;
     m_view = view;
+
+    /// KisToolProxy emits this on input BEGIN/END. Its name says "primary", but it brackets all
+    /// canvas tool actions; treating pan/alternate actions as busy is harmless and safer than
+    /// copying or replacing the image while the user still holds an input device.
+    if (m_toolActionConnection) {
+        disconnect(m_toolActionConnection);
+    }
+    m_toolActionActive = false;
+    if (m_view && m_view->canvasBase()) {
+        if (KisToolProxy *toolProxy =
+                qobject_cast<KisToolProxy *>(m_view->canvasBase()->toolProxy())) {
+            m_toolActionConnection = connect(
+                toolProxy, &KisToolProxy::toolPrimaryActionActivated, this,
+                [this](bool active) { m_toolActionActive = active; });
+        } else {
+            say(QStringLiteral("stroke guard: the page view has no KisToolProxy"));
+        }
+    }
+
     m_index = index;
     m_stripPages.clear();
     m_stripRects.clear();
@@ -3394,6 +3457,11 @@ bool PdfPageNavigator::showImage(KisImageSP image, KisNodeSP activeNode, int ind
 
 bool PdfPageNavigator::saveStripPages(QString *why)
 {
+    if (m_toolActionActive) {
+        fail(why, QStringLiteral("finish the current canvas action before saving the page artifacts"));
+        return false;
+    }
+
     if (m_stripPages.isEmpty()) {
         /// A document holding one page has nothing to crop; the usual save is the whole of it --
         /// and through the queue, so this save cannot start while an idle write is still in the
@@ -3671,11 +3739,15 @@ bool PdfPageNavigator::reloadNotebook(int anchorPage, QString *why)
     }
 
     m_reloadManifest = manifest;
-    m_reloadAnchor = qBound(0, anchorPage, manifest.pages.size() - 1);
+    m_reloadAnchor = manifest.pages.isEmpty()
+        ? -1
+        : qBound(0, anchorPage, manifest.pages.size() - 1);
     m_reloadPending = true;
 
-    say(QStringLiteral("reloading the notebook: %1 page(s), opening page %2")
-            .arg(manifest.pages.size()).arg(m_reloadAnchor + 1));
+    say(manifest.pages.isEmpty()
+            ? QStringLiteral("reloading the notebook: no pages remain")
+            : QStringLiteral("reloading the notebook: %1 page(s), opening page %2")
+                  .arg(manifest.pages.size()).arg(m_reloadAnchor + 1));
 
     /// The old view has to be gone before the new document is built; Krita closes it on the event
     /// loop, which is the same reason every notebook open defers. finishReload() does the rest.
@@ -3723,7 +3795,16 @@ void PdfPageNavigator::finishReload()
     m_lastAutoSave = QDateTime::currentMSecsSinceEpoch();
 
     QString why;
-    const bool shown = showPage(m_reloadAnchor, &why);
+    bool shown = true;
+    if (m_manifest.pages.isEmpty()) {
+        /// A committed deletion can leave no page to show; the cleared canvas is the correct empty state.
+        m_index = -1;
+        if (m_scrollWatch) {
+            m_scrollWatch->stop();
+        }
+    } else {
+        shown = showPage(m_reloadAnchor, &why);
+    }
     if (!shown) {
         say(QStringLiteral("the notebook was reloaded but page %1 did not open: %2")
                 .arg(m_reloadAnchor + 1).arg(why));
@@ -3812,9 +3893,10 @@ void PdfPageNavigator::pumpAutoSave()
     if (!hasNotebook() || !m_document || !m_document->image() || m_index < 0) {
         return;
     }
-    if (m_savingPages || m_rollingWindow || m_inPageTurn || m_saves.pendingCount() > 0) {
-        /// A turn or a write owns the notebook right now. The queue decides when writes run;
-        /// this tick only asks for one when nothing else is happening.
+    if (m_toolActionActive || m_savingPages || m_rollingWindow || m_inPageTurn
+        || m_saves.pendingCount() > 0) {
+        /// A held canvas action, turn or write owns the notebook right now. The queue decides when
+        /// writes run; this tick only asks for one when nothing else is happening.
         return;
     }
     if (m_lastInkChange <= 0) {
@@ -3850,6 +3932,11 @@ void PdfPageNavigator::pumpAutoSave()
 
     m_lastAutoSave = now;
     for (int page : mine) {
+        /// saveThroughQueue() runs a nested event loop while the file lands. A new canvas action
+        /// can begin in that loop, so do not start another page snapshot after it does.
+        if (m_toolActionActive) {
+            break;
+        }
         QString why;
         if (!saveThroughQueue(page, &why)) {
             /// The page stays marked: the next quiet tick tries again rather than pretending it

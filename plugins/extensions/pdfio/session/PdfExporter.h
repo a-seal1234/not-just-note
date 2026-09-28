@@ -28,10 +28,11 @@
  *
  * The reader understands both cross reference forms: the classic xref table and the PDF 1.5
  * cross reference stream (/Type /XRef), including pages that live inside object streams
- * (/Type /ObjStm) with FlateDecode and PNG or TIFF predictors -- which is how browsers, Ghostscript
- * and most LaTeX output store their pages today. A construct it cannot read is refused with a
+ * (/Type /ObjStm) with FlateDecode or LZWDecode and PNG or TIFF predictors. LZW honors /EarlyChange
+ * and is bounded before decoded data is allocated. A construct it cannot read is refused with a
  * precise message instead of being written out as a file that only looks right: encrypted files,
- * stream filters other than FlateDecode, and unreadable page trees are refused, never guessed.
+ * unsupported structural-stream filters, and unreadable page trees are refused, never guessed. Page
+ * content streams are copied byte-for-byte; their filters are not decoded by this reader.
  *
  * Deliberately pure C++ with no renderer dependency, so the same code runs on desktop and on
  * Android, where there is no Poppler at all.
@@ -48,6 +49,18 @@ public:
                               const QHash<int, QImage> &ink,
                               const QString &outPath,
                               QString *why = nullptr);
+
+    /**
+     * Export a project, resolving its sources from \a projectDir. A one-source project follows
+     * the existing exporter path unchanged. A multi-source project is assembled in notebook page
+     * order first, then passed through that same exporter so its page transforms and ink mapping are
+     * preserved. The final multi-source output is committed atomically.
+     */
+    static bool exportProjectWithInk(const QString &projectDir,
+                                     const PdfSessionManifest &manifest,
+                                     const QHash<int, QImage> &ink,
+                                     const QString &outPath,
+                                     QString *why = nullptr);
 
     /**
      * Object numbers of the pages, in order. Exposed for the test: it exercises the same reader

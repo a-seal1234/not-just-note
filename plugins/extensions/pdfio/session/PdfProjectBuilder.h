@@ -66,6 +66,16 @@ public:
                                      PdfRenderBackend &backend,
                                      qreal dpi,
                                      QString *why = nullptr);
+
+    /**
+     * The same for a page with NO source: white paper of the page's own sheet instead of a render.
+     *
+     * Everything after the raster -- the budget, the layer stack, the size check -- is the same code
+     * buildPageImage() runs, which is what makes a blank page a page like any other: the layout, the
+     * strip, the ink, the previews and the exporter need no case of their own.
+     */
+    static KisImageSP buildBlankPageImage(const PdfPageRecord &page, qreal dpi,
+                                          QString *why = nullptr);
 };
 
 #endif // PDFPROJECTBUILDER_H

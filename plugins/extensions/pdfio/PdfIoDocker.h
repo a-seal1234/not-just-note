@@ -98,7 +98,7 @@ private:
     /// The one entry the panel cannot serve itself: the screen, with its pickers and its one Apply.
     QPushButton *m_manage = nullptr;
 
-    /// The way back from the change that was just made -- one change deep, like the submenu entry.
+    /// The way back through notebook operations, one retained step per click, like the submenu entry.
     QPushButton *m_undo = nullptr;
 };
 

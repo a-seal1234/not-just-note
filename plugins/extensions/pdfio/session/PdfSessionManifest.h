@@ -29,6 +29,20 @@ struct PdfSourceRecord {
     QString file;
     QByteArray sha256;
     qint64 byteSize = 0;
+
+    /**
+     * What kind of file \c file is. EMPTY MEANS A PDF, which is every source of every notebook made
+     * before this field existed, so an older manifest keeps its meaning without being rewritten.
+     *
+     * "image" is a picture the notebook holds -- a scan, a photo -- and the source of exactly one
+     * page, whose paper is that picture (backends/image/ImageRenderBackend). Anything else is a
+     * value this build does not understand and is REFUSED by isValid() rather than read as a PDF: a
+     * file that is not the kind it says it is would be opened by the wrong reader.
+     */
+    QString kind;
+
+    /// Whether this source is a picture rather than a PDF.
+    bool isImage() const { return kind == QStringLiteral("image"); }
 };
 
 /**
@@ -61,7 +75,15 @@ struct PdfPageRecord {
 
     /// Which entry of PdfSessionManifest::sources the page's background is rendered from. 0 is the
     /// notebook's own source, which is every page of a notebook made before this field existed.
+    ///
+    /// -1 is a page with NO source at all: a BLANK page, whose paper is white paper of its own
+    /// \c sizePt. \c index is -1 with it, and isValid() refuses any other combination -- a record
+    /// that says "no source" while still naming a page of one is a page a reader that trusts either
+    /// field would render as somebody's PDF page.
     int source = 0;
+
+    /// Whether this page has no source at all: blank paper of its own sizePt.
+    bool isBlank() const { return source < 0; }
 
     /**
      * A turn the NOTEBOOK applies on top of the source's own /Rotate, in whole degrees: 0 to 359.
@@ -166,8 +188,14 @@ public:
      * A constexpr member, so that the default below can be the same value: a manifest built in
      * code that defaulted to the previous schema is refused by its own reader, which is exactly
      * what happened when the number lived in one place and the default in another.
+     *
+     * 4 adds pages that have no source PDF at all -- a BLANK page (source -1, index -1, its own
+     * sizePt) -- and pages whose source is a PICTURE the notebook holds rather than a PDF. A schema
+     * 3 build meeting either one refuses the notebook through this same guard: it has no way to say
+     * "blank", and its reader would take a blank page's -1 as "the notebook's own first page" and
+     * render the user's manual where the blank page was.
      */
-    static constexpr int CurrentSchema = 3;
+    static constexpr int CurrentSchema = 4;
 
     int schema = CurrentSchema;
     /// File name of the source inside the project directory, not a full path.

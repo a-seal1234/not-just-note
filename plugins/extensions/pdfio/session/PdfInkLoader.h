@@ -14,6 +14,8 @@
 
 #include <kis_types.h>
 
+class KisDocument;
+
 /**
  * Reads the ink back out of a saved page artifact.
  *
@@ -25,6 +27,33 @@
 class PdfInkLoader
 {
 public:
+    /**
+     * One layer of an artifact, as the picture it is.
+     *
+     * \a pixels covers the page area the layer's own \a x and \a y place it at, the way the artifact
+     * writes it; \a opacity is the layer's own. This is what a rewrite that only MOVES pixels needs:
+     * a crop takes a rectangle out of each picture, and nothing about it needs a document graph.
+     */
+    struct ArtifactLayer {
+        QString name;
+        QImage pixels;
+        qreal opacity = 1.0;
+        int x = 0;
+        int y = 0;
+    };
+
+    /**
+     * The artifact's layers as pictures and the size of the page they cover, read without opening a
+     * document where the PNG sidecar is there.
+     *
+     * A crop has to know both before it can cut anything, and the paths that answer it by building a
+     * Krita document -- the read, the clone, cropImage(), the packing pass -- each hold another whole
+     * page and then wait on the update scheduler for it, which on the GUI thread is a busy-wait
+     * dialog and, on the tablet, minutes. An artifact written before the sidecar existed still
+     * reads: it falls back to the document, and says so by the size it hands back.
+     */
+    static QList<ArtifactLayer> loadLayersForRewrite(const QString &kraPath, QSize *artifactSize,
+                                                     QString *why = nullptr);
     /**
      * The ink of \a kraPath, or a null image when the page has none. \a why is set only on a
      * real failure, not for a page that was simply never drawn on.
@@ -40,6 +69,46 @@ public:
      * need not carry one.
      */
     static QSize artifactSize(const QString &kraPath, QString *why = nullptr);
+
+    /**
+     * The artifact as the document graph it holds, read ONCE, owned by \a document.
+     *
+     * \a document must be a document of our own -- KisPart::instance()->createDocument() -- and the
+     * image it hands back dies with it, so it has to outlive the image.
+     *
+     * This is what a page rewritten in place -- turned, clipped -- loads with. Asking artifactSize()
+     * and then loadInkLayersInto() reads the whole artifact twice and holds two copies of every
+     * layer while it does, and on the tablet that memory ended in an OOM (2026-09-28). A null image
+     * means there is nothing to rewrite; \a why carries the reason when there was one.
+     */
+    static KisImageSP loadArtifactInto(KisDocument *document, const QString &kraPath,
+                                       QString *why = nullptr);
+
+    /**
+     * The artifact as a page image of its own, belonging to \a document, read ONCE.
+     *
+     * This is loadInkLayersInto() with the size taken from the same read. A page rewritten in place
+     * has to know the frame it is in before it can crop it, and asking artifactSize() first meant
+     * decoding the whole artifact twice -- a page per layer per read, on a tablet that then ran out
+     * of memory (2026-09-28) -- for one answer the same read already had.
+     *
+     * The layers come back as layers, cloned into the new image: the file's own copy is released
+     * before this returns, and what the caller gets is its own image, so nothing it does afterwards
+     * waits on the loader.
+     */
+    static KisImageSP loadArtifactAsPage(KisDocument *document, const QString &kraPath,
+                                         QString *why = nullptr);
+
+    /**
+     * The size the artifact's merged image announces, read from the PNG's own header inside the
+     * archive: no document, no layer graph, no decode.
+     *
+     * A page write proves what it wrote before the new file takes the old one's place, and the
+     * obvious way to prove it -- artifactSize() -- decodes the file again, a whole page per layer,
+     * for a question its first 24 bytes answer. Empty means "this archive cannot tell"; a caller
+     * that needs an answer falls back to the full read.
+     */
+    static QSize artifactSizeFromArchive(const QString &kraPath);
 
     /**
      * Puts the artifact's own layers into \a parent of \a target, keeping their names, order and

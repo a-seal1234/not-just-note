@@ -9,8 +9,11 @@
 #include "PdfIoDocker.h"
 #include "PdfIoNotebookActions.h"
 #include "PdfIoPlugin.h"
+
+#include "backends/image/ImageRenderBackend.h"
 #include "PdfIoProbe.h"
 #include "PdfNotebookOpsDialog.h"
+#include "PdfNotebookResizeDialog.h"
 #include "PdfPageNavigator.h"
 #include "PdfRendererSpike.h"
 
@@ -23,6 +26,8 @@
 #include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QComboBox>
 #include <QDir>
 #include <QEventLoop>
 #include <QFileDialog>
@@ -120,6 +125,9 @@ qint64 residentKb()
 /// Puts the notebook list on the Start screen; defined with the open helpers far below, and
 /// declared here because the plugin constructor uses it.
 void refreshWelcomePageEntries();
+
+/// Shared entry point for pixel resizing, also called from the Manage Pages screen.
+void resizeNotebookByPixels(bool batch);
 
 /// The notebook's name as it is on disk right now. Read from the manifest rather than from the
 /// navigator: the navigator holds the copy it loaded when the notebook was opened, and a rename is
@@ -696,33 +704,39 @@ void refreshWelcomePageEntries()
             extra.name = manifest.displayName();
         }
 
-        /// The picture comes from PAGE 1'S OWN RECORD, never from a name guessed out of the page's
-        /// position. A preview's name is handed out by the notebook's allocator and travels with
-        /// the page, so "thumbs/p0001.png" is the shape of the names this build happens to write and
-        /// not a rule the manifest obeys. Worse, a guessed path that is absent and a page that
-        /// records no preview are the SAME folder icon on screen -- which is how a notebook whose
-        /// preview was dropped came to look like a notebook that never had one. The two are told
-        /// apart here, in the log, because the icon cannot say it.
-        const PdfPageRecord &first = manifest.pages.first();
-        const QString thumbnail = PdfPageNavigator::thumbnailPathFor(dir, first);
-        const bool present = !thumbnail.isEmpty() && QFileInfo::exists(thumbnail);
-        if (!present) {
-            /// Which of the two causes it is, said ONCE per state rather than on every rebuild: a
-            /// page-1 save rebuilds these entries too, and a line repeated for every rebuild is a
-            /// line nobody reads. The state is the pair (this notebook, this reason), and it is
-            /// cleared when the picture is there, so losing it again is said again.
-            const QString reason = first.thumbFile.isEmpty()
-                ? QStringLiteral("page 1 records no preview name yet")
-                : QStringLiteral("page 1's recorded preview %1 is not on disk").arg(first.thumbFile);
-            if (lastStartScreenReason().value(dir) != reason) {
-                lastStartScreenReason().insert(dir, reason);
-                say(QStringLiteral("Start screen: %1 shows the plain icon: %2").arg(dir, reason));
-            }
-            askForStartScreenPreview(dir);
-        } else {
+        if (manifest.pages.isEmpty()) {
+            /// Keep an empty notebook in Recents without inventing a page-one preview.
             lastStartScreenReason().remove(dir);
+            extra.thumbnailPath = QString();
+        } else {
+            /// The picture comes from PAGE 1'S OWN RECORD, never from a name guessed out of the page's
+            /// position. A preview's name is handed out by the notebook's allocator and travels with
+            /// the page, so "thumbs/p0001.png" is the shape of the names this build happens to write and
+            /// not a rule the manifest obeys. Worse, a guessed path that is absent and a page that
+            /// records no preview are the SAME folder icon on screen -- which is how a notebook whose
+            /// preview was dropped came to look like a notebook that never had one. The two are told
+            /// apart here, in the log, because the icon cannot say it.
+            const PdfPageRecord &first = manifest.pages.first();
+            const QString thumbnail = PdfPageNavigator::thumbnailPathFor(dir, first);
+            const bool present = !thumbnail.isEmpty() && QFileInfo::exists(thumbnail);
+            if (!present) {
+                /// Which of the two causes it is, said ONCE per state rather than on every rebuild: a
+                /// page-1 save rebuilds these entries too, and a line repeated for every rebuild is a
+                /// line nobody reads. The state is the pair (this notebook, this reason), and it is
+                /// cleared when the picture is there, so losing it again is said again.
+                const QString reason = first.thumbFile.isEmpty()
+                    ? QStringLiteral("page 1 records no preview name yet")
+                    : QStringLiteral("page 1's recorded preview %1 is not on disk").arg(first.thumbFile);
+                if (lastStartScreenReason().value(dir) != reason) {
+                    lastStartScreenReason().insert(dir, reason);
+                    say(QStringLiteral("Start screen: %1 shows the plain icon: %2").arg(dir, reason));
+                }
+                askForStartScreenPreview(dir);
+            } else {
+                lastStartScreenReason().remove(dir);
+            }
+            extra.thumbnailPath = present ? thumbnail : QString();
         }
-        extra.thumbnailPath = present ? thumbnail : QString();
         extra.token = dir;
         entries.append(extra);
     }
@@ -1480,6 +1494,193 @@ bool pickPdfForScreen(PdfNotebookOpsDialog::PdfToAdd *pdf)
     return !pdf->displayedSizes.isEmpty();
 }
 
+/// The path of a PICTURE the user chose, for the screen's "insert a picture as a page".
+///
+/// On Android the picker copies what was chosen into its cache under the suggested name, so that name
+/// carries the extension the notebook records. The EXTENSION IS ONLY A NAME here: every reader in
+/// this plugin is chosen by what the manifest says the source is (`kind`) and reads the bytes, never
+/// the suffix -- which is what lets a picture that arrived as a JPEG keep a name that says so little.
+QString pickImageFilePath()
+{
+#if defined(Q_OS_ANDROID)
+    return pickedFileOnAndroid(QStringLiteral("image/*"),
+                               QStringLiteral("pdfio-picked-picture.png"));
+#else
+    return QFileDialog::getOpenFileName(
+        nullptr, i18n("Insert a picture as a page"),
+        QStandardPaths::writableLocation(QStandardPaths::PicturesLocation),
+        i18n("Pictures (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"));
+#endif
+}
+
+/// The name of a sheet a size is, when it is one: "A4", "A5", "Letter". Empty for anything else.
+///
+/// Only a convenience for the preview text -- a page is its own size either way -- but it is the word
+/// a person recognises: a 300 dpi scan of A4 comes back as 595 x 842 points, and "A4" says what
+/// 595 x 842 means.
+QString knownSheetName(const QSizeF &sizePt)
+{
+    struct Sheet {
+        const char *name;
+        QSizeF size;
+    };
+    const QList<Sheet> sheets = {
+        { "A4 portrait", QSizeF(595.28, 841.89) },
+        { "A4 landscape", QSizeF(841.89, 595.28) },
+        { "A5 portrait", QSizeF(419.53, 595.28) },
+        { "Letter portrait", QSizeF(612.0, 792.0) },
+        { "Letter landscape", QSizeF(792.0, 612.0) },
+    };
+    for (const Sheet &sheet : sheets) {
+        if (qAbs(sizePt.width() - sheet.size.width()) <= 3.0
+            && qAbs(sizePt.height() - sheet.size.height()) <= 3.0) {
+            return QString::fromLatin1(sheet.name);
+        }
+    }
+    return QString();
+}
+
+/// A size as a person reads it: "595 x 842 pt (210 x 297 mm)" and the sheet's name when it is one.
+QString describePageSize(const QSizeF &sizePt)
+{
+    if (!sizePt.isValid()) {
+        return i18n("no size");
+    }
+    const auto mm = [](qreal points) { return qRound(points * 25.4 / 72.0); };
+    const QString sheet = knownSheetName(sizePt);
+    return i18n("%1 x %2 pt (%3 x %4 mm)%5",
+                qRound(sizePt.width()), qRound(sizePt.height()),
+                mm(sizePt.width()), mm(sizePt.height()),
+                sheet.isEmpty() ? QString() : QStringLiteral(" -- ") + sheet);
+}
+
+/// Asks how big the page should be, as a SCALE of the picture's own pixels. Zero means the user
+/// backed out.
+///
+/// A picture has no size a person can see until something says how big its pixels are: the same scan
+/// is a page of A4 at 300 dpi and a poster at 72. So the question is asked at the moment the picture
+/// comes in, with the answer shown in points and millimetres AND as the sheet it works out to -- and
+/// with two answers that cover what is actually being asked for: "I scanned this at N dpi", which is
+/// the true size of the paper, and "make it N% of what it would otherwise be", which is a choice about
+/// the page rather than about the scan.
+///
+/// The last answer is remembered: a notebook is usually a run of pages from one scanner, and retyping
+/// 300 for every picture is the kind of thing a dialog should not ask twice.
+qreal askImagePageScale(const QSize &pixels)
+{
+    QDialog dialog;
+    dialog.setWindowTitle(i18n("Insert a picture as a page"));
+
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout;
+
+    auto *mode = new QComboBox(&dialog);
+    mode->setObjectName(QStringLiteral("pdfio_image_size_mode"));
+    mode->addItem(i18n("The resolution it was scanned at"));
+    mode->addItem(i18n("A share of its natural size"));
+
+    static int lastDpi = 300;
+    static int lastPercent = 100;
+
+    auto *dpi = new QSpinBox(&dialog);
+    dpi->setObjectName(QStringLiteral("pdfio_image_dpi"));
+    dpi->setRange(36, 2400);
+    dpi->setValue(lastDpi);
+    dpi->setSuffix(i18n(" dpi"));
+
+    auto *percent = new QSpinBox(&dialog);
+    percent->setObjectName(QStringLiteral("pdfio_image_percent"));
+    percent->setRange(5, 1000);
+    percent->setValue(lastPercent);
+    percent->setSuffix(QStringLiteral(" %"));
+
+    form->addRow(i18n("Size from:"), mode);
+    form->addRow(i18n("Scanned at:"), dpi);
+    form->addRow(i18n("Scale:"), percent);
+    layout->addLayout(form);
+
+    auto *preview = new QLabel(&dialog);
+    preview->setObjectName(QStringLiteral("pdfio_image_size_preview"));
+    preview->setWordWrap(true);
+    layout->addWidget(preview);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+
+    const auto chosenScale = [&]() -> qreal {
+        return mode->currentIndex() == 0 ? ImageRenderBackend::scaleForScannedDpi(dpi->value())
+                                        : ImageRenderBackend::scaleForNaturalShare(percent->value());
+    };
+    const auto chosenSize = [&]() -> QSizeF {
+        const qreal scale = chosenScale();
+        return QSizeF(pixels.width() * scale, pixels.height() * scale);
+    };
+    const auto refresh = [&]() {
+        const bool scanned = mode->currentIndex() == 0;
+        dpi->setEnabled(scanned);
+        percent->setEnabled(!scanned);
+        preview->setText(i18n("The page will be %1.", describePageSize(chosenSize())));
+    };
+    /// The int overload spelled out, the way the spin boxes below are: which of a signal's overloads a
+    /// connect means has to be said, and the Android build refuses the shorthand the desktop one lets
+    /// through.
+    QObject::connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog,
+                     [&refresh](int) { refresh(); });
+    QObject::connect(dpi, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [&refresh](int) { refresh(); });
+    QObject::connect(percent, QOverload<int>::of(&QSpinBox::valueChanged), &dialog,
+                     [&refresh](int) { refresh(); });
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    refresh();
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return 0.0;
+    }
+    lastDpi = dpi->value();
+    lastPercent = percent->value();
+    return chosenScale();
+}
+
+/// Picks a picture for the screen's own entry and says what size page it makes.
+///
+/// The file is read here, once, for two reasons: a file that is not a picture is refused BEFORE it
+/// joins the screen's working copy, and the page's size comes from the picture's own pixels -- one
+/// pixel to one point, the rule ImageRenderBackend reads it by -- so the page is the picture's shape
+/// the moment it appears in the list.
+bool pickImageForScreen(PdfNotebookOpsDialog::ImageToAdd *picture)
+{
+    const QString picked = pickImageFilePath();
+    if (picked.isEmpty()) {
+        return false;
+    }
+
+    const QImage loaded(picked);
+    if (loaded.isNull() || loaded.width() <= 0 || loaded.height() <= 0) {
+        say(QStringLiteral("%1 could not be read as a picture").arg(picked));
+        QMessageBox::warning(nullptr, i18n("Insert a picture as a page"),
+                             i18n("%1 could not be read as a picture.", picked));
+        return false;
+    }
+
+    /// And how big a page it becomes, which a picture cannot answer for itself: the same scan is A4
+    /// at 300 dpi and a poster at 72. Asked here rather than in the ops screen, because it is a
+    /// question about the FILE -- what its pixels mean -- and the screen is about the page list.
+    ///
+    /// The answer is a SCALE, not a size: the page keeps the picture's own pixels as its size and
+    /// says how big it is shown, exactly as Scale mode does for a PDF page -- so an imported picture
+    /// can be rescaled afterwards the same way, and the page is rendered at its own resolution when
+    /// the reader is at it.
+    const qreal scale = askImagePageScale(loaded.size());
+    if (scale <= 0.0) {
+        return false;
+    }
+
+    picture->path = picked;
+    picture->sizePt = QSizeF(loaded.width(), loaded.height());
+    picture->scale = scale;
+    return true;
+}
+
 /// Picks a notebook for the screen's merge button and hands over where its files are.
 ///
 /// It opens the SAME chooser the menu's merge entry does -- the recent notebooks first, then a
@@ -1606,6 +1807,9 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
             i18n("That PDF has %1 page(s). Which of them should be inserted?", available), available,
             first, count);
     };
+    adder.pickImage = [](PdfNotebookOpsDialog::ImageToAdd *picture) {
+        return pickImageForScreen(picture);
+    };
     dialog.setSourceAdder(adder);
 
     QString unpackedNotebook;
@@ -1637,7 +1841,34 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
         return;
     }
 
+    if (dialog.requestedAction() == PdfNotebookOpsDialog::BatchPixelResizeAction) {
+        if (!unpackedNotebook.isEmpty()) {
+            QDir(unpackedNotebook).removeRecursively();
+        }
+        resizeNotebookByPixels(true);
+        return;
+    }
+
     Q_UNUSED(plugin);
+
+    /// The write gate every other operation runs before it changes anything, and the one this path
+    /// was missing.
+    ///
+    /// Without it the open page's ink is still in the air while the manifest and the artifacts change
+    /// under it, and the reload below is then REFUSED -- "the open page still carries ink that is not
+    /// on disk; write the notebook before changing it". The notebook IS cropped on disk by then, and
+    /// the page on screen goes on showing the sheet it had: the user's own report of a crop that
+    /// only took effect after closing the tab and opening the notebook again. The comment above
+    /// saying "applyNotebookOperation() still runs it" was about a path this screen does not take.
+    if (!navigator->prepareForNotebookChange(&why)) {
+        if (!unpackedNotebook.isEmpty()) {
+            QDir(unpackedNotebook).removeRecursively();
+        }
+        say(QStringLiteral("the notebook ops screen was refused before it started: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Notebook ops"),
+                             i18n("The notebook could not be written, so it was not changed: %1", why));
+        return;
+    }
 
     const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(
         navigator->projectDir(), dialog.edits(), PdfPageRotator::rotateInto);
@@ -1708,6 +1939,33 @@ bool applyNotebookOperation(const QString &title,
     return true;
 }
 
+/// The pixel-target actions are intentionally separate from Scale and Box in the page-management
+/// canvas: a pixel box is a requested output size, while those modes edit the page's geometry.
+void resizeNotebookByPixels(bool batch)
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return;
+    }
+
+    const QString title = batch ? i18n("Batch resize pages by pixels")
+                                : i18n("Resize page by pixels");
+    PdfNotebookResizeDialog dialog(navigator->manifest().pages, navigator->currentIndex(), batch);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const PdfNotebookResizeDialog::Request request = dialog.request();
+    if (request.pageIndices.isEmpty()) {
+        return;
+    }
+    applyNotebookOperation(title, [request](const QString &dir, int currentPage) {
+        return PdfNotebookOps::resizePagesToPixelBounds(dir, request.pageIndices, request.boundsPx,
+                                                        request.dpi, currentPage,
+                                                        PdfPageRotator::rotateInto);
+    });
+}
+
 /// The confirmation before a page leaves the notebook, said the same way whether the operation was
 /// asked for from the submenu or from the panel: what happens to the page's notes, and what brings
 /// them back.
@@ -1760,13 +2018,18 @@ void updateNotebookOpsActions(QMenu *ops)
     set("pdfio_ops_duplicate", quick(PdfNotebookQuicks::Action::Duplicate));
     set("pdfio_ops_rotate_right", quick(PdfNotebookQuicks::Action::TurnRight));
     set("pdfio_ops_rotate_left", quick(PdfNotebookQuicks::Action::TurnLeft));
-    /// A notebook keeps at least one page, and the engine refuses to delete the last one -- which is
-    /// the same rule available() applies, so the entry cannot be offered where the engine says no.
+    set("pdfio_ops_resize_current", pages >= 1);
+    set("pdfio_ops_resize_batch", pages >= 1);
+    if (QMenu *resize = ops->findChild<QMenu *>(QStringLiteral("pdfio_ops_resize_menu"))) {
+        resize->setEnabled(open && pages >= 1);
+    }
+    /// The quick-action gate accepts deleting the final page too; the resulting empty notebook can be
+    /// repopulated with Insert pages or Merge notebook.
     set("pdfio_ops_delete", quick(PdfNotebookQuicks::Action::Delete));
     set("pdfio_ops_extract_range", pages >= 1);
     set("pdfio_ops_screen", open);
-    set("pdfio_ops_merge", pages >= 1);
-    set("pdfio_ops_merge_folder", pages >= 1);
+    set("pdfio_ops_merge", true);
+    set("pdfio_ops_merge_folder", true);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
     /// Deleting the notebook is possible exactly when there is one open, which is what a open is.
     set("pdfio_ops_delete_notebook", true);
@@ -1879,6 +2142,20 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
         runPdfIoQuickAction(PdfNotebookQuicks::Action::TurnLeft);
     });
 
+    /// Pixel dimensions and batch resize are separate from the Scale/Box gestures in the page manager.
+    QMenu *resizeMenu = ops->addMenu(i18n("Resize"));
+    resizeMenu->setObjectName(QStringLiteral("pdfio_ops_resize_menu"));
+    QAction *resizeCurrent = resizeMenu->addAction(i18n("Resize current page by pixel size..."));
+    resizeCurrent->setObjectName(QStringLiteral("pdfio_ops_resize_current"));
+    QObject::connect(resizeCurrent, &QAction::triggered, resizeMenu, []() {
+        resizeNotebookByPixels(false);
+    });
+    QAction *resizeBatch = resizeMenu->addAction(i18n("Batch resize pages by pixel size..."));
+    resizeBatch->setObjectName(QStringLiteral("pdfio_ops_resize_batch"));
+    QObject::connect(resizeBatch, &QAction::triggered, resizeMenu, []() {
+        resizeNotebookByPixels(true);
+    });
+
     QAction *removePage = ops->addAction(i18n("Delete page..."));
     removePage->setObjectName(QStringLiteral("pdfio_ops_delete"));
     QObject::connect(removePage, &QAction::triggered, ops, []() {
@@ -1914,8 +2191,8 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
     QAction *undo = ops->addAction(i18n("Undo the last notebook change"));
     undo->setObjectName(QStringLiteral("pdfio_ops_undo"));
     QObject::connect(undo, &QAction::triggered, ops, []() {
-        /// Stroke-level undo is Krita's, and it covers the page that is open. A notebook operation
-        /// closes that page, so it is its own unit of undo -- one change deep, and this is it.
+        /// Stroke-level undo is Krita's, and it covers the page that is open. Notebook operations
+        /// are separate undo steps; this action walks the bounded notebook history one step at a time.
         applyNotebookOperation(i18n("Undo the last notebook change"), [](const QString &dir, int) {
             return PdfNotebookOps::undoLast(dir);
         });
@@ -3731,8 +4008,8 @@ void PdfIoPlugin::slotExportPdf()
     }
 
     QString why;
-    if (!PdfExporter::exportWithInk(navigator->sourcePath(), navigator->manifest(),
-                                    ink, target, &why)) {
+    if (!PdfExporter::exportProjectWithInk(navigator->projectDir(), navigator->manifest(),
+                                           ink, target, &why)) {
         say(QStringLiteral("export failed: %1").arg(why));
         /// Said to the user, not only to the log. Measured on the tablet: the export can be
         /// refused before the document picker opens, and then pressing Export does nothing

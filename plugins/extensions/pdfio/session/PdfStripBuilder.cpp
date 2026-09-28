@@ -77,7 +77,9 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
     /// The active page's source, opened once. A slot whose own source cannot be opened renders
     /// nothing (below) rather than taking the whole strip down with it; the page the user is on is
     /// the one that has to be there.
-    if (!renderers.forPage(manifest, projectDir, activePage, why)) {
+    /// A blank active page has no file to open; its slot is white paper the renderer below builds.
+    if (!manifest.pages.at(activePage).isBlank()
+        && !renderers.forPage(manifest, projectDir, activePage, why)) {
         return strip;
     }
 
@@ -122,9 +124,14 @@ PdfStripBuilder::Strip PdfStripBuilder::build(const PdfSessionManifest &manifest
         }
 
         const QImage rendered = renderers.renderPage(manifest, projectDir, slot.page, dpi, nullptr);
-        KisPaintLayerSP background =
-            new KisPaintLayer(strip.image, backgroundLayerName(manifest.pages.at(slot.page).index),
-                              OPACITY_OPAQUE_U8);
+        /// The paper layer is named after the page it belongs to. A blank page has no page inside a
+        /// source to be named by (-1 would read as "PDF page 0"), so it is named by its position in
+        /// the notebook -- and the name still starts like every other paper layer's, which is what
+        /// makes a page save leave the paper out of the artifact.
+        const PdfPageRecord &slotRecord = manifest.pages.at(slot.page);
+        KisPaintLayerSP background = new KisPaintLayer(
+            strip.image, backgroundLayerName(slotRecord.isBlank() ? slot.page : slotRecord.index),
+            OPACITY_OPAQUE_U8);
         /// The desk colour for the room around the page, then the page itself: the band this slot
         /// owns IS that room. A page whose render failed keeps the colour of its band rather than a
         /// hole.

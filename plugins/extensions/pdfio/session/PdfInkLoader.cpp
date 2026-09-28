@@ -7,6 +7,7 @@
 #include "PdfInkLoader.h"
 
 #include <QDir>
+#include <QScopedPointer>
 #include <QTextStream>
 
 #include <QDebug>
@@ -77,6 +78,51 @@ void collectMergedImage(const KArchiveDirectory *directory, const QString &prefi
     }
 }
 
+/// The same walk, handing back the entries themselves: a caller that wants a header out of one does
+/// not have to inflate the whole PNG to read it, which data() above does.
+void collectMergedImageFiles(const KArchiveDirectory *directory, const QString &prefix,
+                             QList<const KArchiveFile *> *found)
+{
+    const QStringList entries = directory->entries();
+    for (const QString &entry : entries) {
+        const KArchiveEntry *child = directory->entry(entry);
+        if (!child) {
+            continue;
+        }
+
+        const QString path = prefix + QLatin1Char('/') + entry;
+        if (const KArchiveDirectory *sub = dynamic_cast<const KArchiveDirectory *>(child)) {
+            collectMergedImageFiles(sub, path, found);
+            continue;
+        }
+
+        if (const KArchiveFile *file = dynamic_cast<const KArchiveFile *>(child)) {
+            if (isMergedImage(path)) {
+                found->append(file);
+            }
+        }
+    }
+}
+
+/// The size a PNG announces in its own header, without decoding a pixel of it: eight bytes of
+/// signature, then the IHDR chunk -- four bytes of length, the type, then width and height as two
+/// big-endian 32-bit words.
+QSize pngHeaderSize(const QByteArray &bytes)
+{
+    constexpr int WidthOffset = 16;
+    if (bytes.size() < WidthOffset + 8
+        || !bytes.startsWith(QByteArrayLiteral("\x89PNG\r\n\x1a\n"))
+        || bytes.mid(12, 4) != QByteArrayLiteral("IHDR")) {
+        return QSize();
+    }
+
+    const auto word = [&bytes](int at) {
+        return (quint32(quint8(bytes.at(at))) << 24) | (quint32(quint8(bytes.at(at + 1))) << 16)
+            | (quint32(quint8(bytes.at(at + 2))) << 8) | quint32(quint8(bytes.at(at + 3)));
+    };
+    return QSize(int(word(WidthOffset)), int(word(WidthOffset + 4)));
+}
+
 } // namespace
 
 namespace {
@@ -115,6 +161,23 @@ void copyRestoredLayers(KisImageSP target, const QList<KisNodeSP> &layers, KisNo
     }
 }
 
+/// Hands a document back the way Krita wants it: removeDocument(document, true) deletes it, and a
+/// document made with KisPart::createDocument() is not ours to delete directly.
+///
+/// The delete stays QUEUED, which is Krita's own arrangement and not ours to hurry: KisDocument's
+/// destructor waits on the image's scheduler, and running it in the middle of a page rewrite put a
+/// busy-wait dialog on screen from inside the rewrite -- and a Krita sanity assert fired because the
+/// image was still referenced while its document went. So the memory is bought by making FEWER
+/// documents (one read per rewrite, no packing copy, no read-back decode), not by deleting them
+/// earlier. On the tablet this was an OOM (2026-09-28).
+void releaseDocument(KisDocument *document)
+{
+    if (!document) {
+        return;
+    }
+    KisPart::instance()->removeDocument(document, true);
+}
+
 } // namespace
 
 bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &target,
@@ -145,7 +208,7 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
         fail(why, QStringLiteral("cannot read %1").arg(kraPath));
         delete converter;
         converter = nullptr;
-        KisPart::instance()->removeDocument(document, true);
+        releaseDocument(document);
         return false;
     }
 
@@ -155,7 +218,7 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
         fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
         delete converter;
         converter = nullptr;
-        KisPart::instance()->removeDocument(document, true);
+        releaseDocument(document);
         return false;
     }
 
@@ -171,7 +234,7 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
         fail(why, QStringLiteral("%1 holds no layers").arg(kraPath));
         delete converter;
         converter = nullptr;
-        KisPart::instance()->removeDocument(document, true);
+        releaseDocument(document);
         return false;
     }
 
@@ -189,8 +252,88 @@ bool PdfInkLoader::loadInkLayersInto(const QString &kraPath, const KisImageSP &t
     copyRestoredLayers(page, layers, parent);
     delete converter;
     converter = nullptr;
-    KisPart::instance()->removeDocument(document, true);
+    releaseDocument(document);
     return true;
+}
+
+QList<PdfInkLoader::ArtifactLayer> PdfInkLoader::loadLayersForRewrite(const QString &kraPath,
+                                                                    QSize *artifactSize,
+                                                                    QString *why)
+{
+    QList<ArtifactLayer> layers;
+    if (artifactSize) {
+        *artifactSize = QSize();
+    }
+    if (!QFileInfo::exists(kraPath)) {
+        /// Not an error: a page that was never drawn on has no artifact, and a caller with nothing
+        /// to rewrite says so by the empty list it gets back.
+        return layers;
+    }
+
+    /// The sidecar first: a PNG per layer, one QImage to read and nothing else. No document, no
+    /// layer graph and no update scheduler, which is what a crop on the tablet ran out of both time
+    /// and memory in.
+    const QString index = kraPath + QStringLiteral(".layers.txt");
+    QFile list(index);
+    if (list.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        const QString dir = kraPath + QStringLiteral(".layers");
+        QTextStream in(&list);
+        while (!in.atEnd()) {
+            const QString line = in.readLine();
+            if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
+                continue;
+            }
+
+            /// index, name, file, opacity, x, y
+            const QStringList parts = line.split(QLatin1Char('\t'));
+            if (parts.size() < 4) {
+                continue;
+            }
+
+            QImage pixels;
+            if (!pixels.load(QDir(dir).filePath(parts.at(2)), "PNG") || pixels.isNull()) {
+                continue;
+            }
+
+            ArtifactLayer layer;
+            layer.name = parts.at(1);
+            layer.pixels = pixels;
+            layer.opacity = parts.at(3).toDouble();
+            layer.x = parts.size() > 4 ? parts.at(4).toInt() : 0;
+            layer.y = parts.size() > 5 ? parts.at(5).toInt() : 0;
+            layers.append(layer);
+
+            /// The page is the picture: every layer of an artifact is written over the page's own
+            /// area, so the first readable one answers the question for all of them.
+            if (artifactSize && artifactSize->isEmpty()) {
+                *artifactSize = pixels.size();
+            }
+        }
+    }
+
+    if (!layers.isEmpty()) {
+        return layers;
+    }
+
+    /// No sidecar, or nothing in it that reads: the artifact is then read as the document it is.
+    /// This is the slow way, kept for the artifacts written before the sidecar existed.
+    const QSize size = PdfInkLoader::artifactSize(kraPath, why);
+    const QList<QPair<QString, QImage>> read = loadInkLayers(kraPath, why);
+    for (const QPair<QString, QImage> &entry : read) {
+        ArtifactLayer layer;
+        layer.name = entry.first;
+        layer.pixels = entry.second;
+        layers.append(layer);
+    }
+    if (layers.isEmpty()) {
+        /// Nothing to crop with, and the caller is told why rather than handed an empty page.
+        return layers;
+    }
+    if (artifactSize) {
+        /// The document answers the size when it can; the pictures are the fallback answer.
+        *artifactSize = size.isEmpty() ? layers.first().pixels.size() : size;
+    }
+    return layers;
 }
 
 QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayersFromSidecar(const QString &kraPath,
@@ -232,6 +375,100 @@ QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayersFromSidecar(const QStri
     return layers;
 }
 
+KisImageSP PdfInkLoader::loadArtifactInto(KisDocument *document, const QString &kraPath, QString *why)
+{
+    if (!document) {
+        fail(why, QStringLiteral("no document to read %1 into").arg(kraPath));
+        return KisImageSP();
+    }
+    if (!QFileInfo::exists(kraPath)) {
+        /// Not an error in itself: a page that was never drawn on has no artifact. A caller that
+        /// has nothing to rewrite says so by the null image it gets back.
+        return KisImageSP();
+    }
+
+    KraConverter *converter = new KraConverter(document);
+    QFile file(kraPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        fail(why, QStringLiteral("cannot read %1").arg(kraPath));
+        delete converter;
+        return KisImageSP();
+    }
+
+    const KisImportExportErrorCode code = converter->buildImage(&file);
+    file.close();
+    if (!code.isOk()) {
+        fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
+        delete converter;
+        return KisImageSP();
+    }
+
+    /// The converter's image is the document's own -- buildImage() attached it there -- so it goes
+    /// back as it is, layers and all. Nothing is copied into a second image: that copy is a whole
+    /// page per layer, and it is what a crop was paying for and OOMing on.
+    const KisImageSP image = converter->image();
+    delete converter;
+    return image;
+}
+
+KisImageSP PdfInkLoader::loadArtifactAsPage(KisDocument *document, const QString &kraPath, QString *why)
+{
+    if (!document) {
+        fail(why, QStringLiteral("no document to read %1 into").arg(kraPath));
+        return KisImageSP();
+    }
+    if (!QFileInfo::exists(kraPath)) {
+        /// Not an error in itself: a page that was never drawn on has no artifact.
+        return KisImageSP();
+    }
+
+    KisDocument *loader = KisPart::instance()->createDocument();
+    if (!loader) {
+        fail(why, QStringLiteral("no document could be made for %1").arg(kraPath));
+        return KisImageSP();
+    }
+
+    /// The file is read ONCE, into a document that exists only for this. Both the frame and the
+    /// layers come out of it: a page rewritten in place has to know its size before it can crop, and
+    /// the old answer -- artifactSize() first, the layers after -- decoded the whole artifact twice.
+    KisImageSP page;
+    {
+        const KisImageSP source = loadArtifactInto(loader, kraPath, why);
+        if (source) {
+            const QSize size = source->bounds().size();
+            if (size.isEmpty()) {
+                fail(why, QStringLiteral("the artifact %1 has no page in it").arg(kraPath));
+            } else {
+                page = new KisImage(document->createUndoStore(), size.width(), size.height(),
+                                    source->colorSpace(), QStringLiteral("page"));
+                page->setResolution(source->xRes(), source->yRes());
+
+                /// The layers come across as layers: names, order and opacity kept, which reading
+                /// the file as pictures would lose. Cloned rather than moved -- a node cannot change
+                /// image -- which is also the copy that makes the file's own graph redundant from
+                /// here on.
+                QList<KisNodeSP> layers;
+                for (quint32 i = 0; i < source->root()->childCount(); ++i) {
+                    layers.append(source->root()->at(i));
+                }
+                copyRestoredLayers(page, layers, page->root());
+            }
+        }
+    }
+
+    /// The file's own copy goes now, before the caller crops anything: it is a whole page per layer,
+    /// and holding it through the rewrite is exactly the memory a crop on the tablet ran out of.
+    /// Nothing here references it any more -- the layers above are clones in the image this hands
+    /// back, which belongs to \a document.
+    releaseDocument(loader);
+
+    if (!page) {
+        return KisImageSP();
+    }
+    document->setCurrentImage(page, false);
+    return page;
+}
+
 QSize PdfInkLoader::artifactSize(const QString &kraPath, QString *why)
 {
     if (!QFileInfo::exists(kraPath)) {
@@ -245,33 +482,57 @@ QSize PdfInkLoader::artifactSize(const QString &kraPath, QString *why)
         return QSize();
     }
 
-    KraConverter *converter = new KraConverter(document);
-    QFile file(kraPath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        fail(why, QStringLiteral("cannot read %1").arg(kraPath));
-        delete converter;
-        converter = nullptr;
-        KisPart::instance()->removeDocument(document, true);
+    /// Through the one read of an artifact there is: the size is a property of the image the file
+    /// holds, so asking for it any other way is a second decode of the same page. The image is
+    /// released inside the block -- an image that outlives its document has no update scheduler and
+    /// waits for jobs that will never run (see PdfPageRotator).
+    QSize size;
+    {
+        const KisImageSP image = loadArtifactInto(document, kraPath, why);
+        if (image) {
+            size = image->bounds().size();
+        }
+    }
+    releaseDocument(document);
+    return size;
+}
+
+QSize PdfInkLoader::artifactSizeFromArchive(const QString &kraPath)
+{
+    if (!QFileInfo::exists(kraPath)) {
         return QSize();
     }
 
-    const KisImportExportErrorCode code = converter->buildImage(&file);
-    file.close();
-
-    QSize size;
-    if (code.isOk()) {
-        const KisImageSP loaded = converter->image();
-        if (loaded) {
-            size = loaded->bounds().size();
-        }
-    } else {
-        fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
+    KZip zip(kraPath);
+    if (!zip.open(QIODevice::ReadOnly)) {
+        return QSize();
+    }
+    const KArchiveDirectory *root = zip.directory();
+    if (!root) {
+        return QSize();
     }
 
-    delete converter;
-    converter = nullptr;
-    KisPart::instance()->removeDocument(document, true);
-    return size;
+    QList<const KArchiveFile *> candidates;
+    collectMergedImageFiles(root, QString(), &candidates);
+    const KArchiveFile *best = nullptr;
+    for (const KArchiveFile *candidate : candidates) {
+        if (!best || candidate->size() > best->size()) {
+            best = candidate;
+        }
+    }
+    if (!best) {
+        /// No merged image: an artifact that carries layers only. Nothing to read a size out of, and
+        /// the caller asks the full read instead.
+        return QSize();
+    }
+
+    /// Through a device, and only the header: data() would inflate the whole PNG -- a page, several
+    /// megabytes of it -- to answer what the first 24 bytes say.
+    QScopedPointer<QIODevice> device(best->createDevice());
+    if (!device || !device->open(QIODevice::ReadOnly)) {
+        return QSize();
+    }
+    return pngHeaderSize(device->read(24));
 }
 
 QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath, QString *why)
@@ -294,7 +555,7 @@ QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath
         fail(why, QStringLiteral("cannot read %1").arg(kraPath));
         delete converter;
         converter = nullptr;
-        KisPart::instance()->removeDocument(document, true);
+        releaseDocument(document);
         return layers;
     }
 
@@ -304,7 +565,7 @@ QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath
         fail(why, QStringLiteral("%1 is not a readable document").arg(kraPath));
         delete converter;
         converter = nullptr;
-        KisPart::instance()->removeDocument(document, true);
+        releaseDocument(document);
         return layers;
     }
 
@@ -325,7 +586,7 @@ QList<QPair<QString, QImage>> PdfInkLoader::loadInkLayers(const QString &kraPath
 
     delete converter;
     converter = nullptr;
-    KisPart::instance()->removeDocument(document, true);
+    releaseDocument(document);
     return layers;
 }
 

@@ -29,6 +29,58 @@ def stream_object(dictionary, data):
             + b"stream" + NL + data + NL + b"endstream")
 
 
+def lzw_encode(data, early_change=1):
+    """Encode bytes exactly as PDF's LZWDecode reads them: MSB-first codes, 256 as the clear code,
+    257 as end-of-data, a string table that starts at 258 and grows to 4096, and 9-to-12-bit codes.
+
+    early_change mirrors the stream's /EarlyChange parameter. The encoder's table is one entry ahead
+    of the decoder's, so the width check below carries the -1: with the PDF default of 1 the code
+    widens as soon as the encoder has generated entry 511, which is the entry the decoder widens on.
+    The output begins with a clear code and ends with EOD, so it is a complete LZWDecode stream.
+    """
+    bits = bytearray()
+    buffer = 0
+    buffered = 0
+
+    def emit(code, width):
+        nonlocal buffer, buffered
+        buffer = (buffer << width) | code
+        buffered += width
+        while buffered >= 8:
+            buffered -= 8
+            bits.append((buffer >> buffered) & 0xFF)
+        buffer &= (1 << buffered) - 1
+
+    table = {bytes([value]): value for value in range(256)}
+    next_code = 258
+    width = 9
+    emit(256, width)  # clear, so a reader starts from a known table
+    if data:
+        current = bytes(data[:1])
+        for value in data[1:]:
+            candidate = current + bytes([value])
+            if candidate in table:
+                current = candidate
+                continue
+            emit(table[current], width)
+            if next_code < 4096:
+                table[candidate] = next_code
+                next_code += 1
+                if next_code + early_change - 1 == (1 << width) and width < 12:
+                    width += 1
+            else:
+                emit(256, width)
+                table = {bytes([v]): v for v in range(256)}
+                next_code = 258
+                width = 9
+            current = bytes([value])
+        emit(table[current], width)
+    emit(257, width)  # end-of-data
+    if buffered:
+        bits.append((buffer << (8 - buffered)) & 0xFF)
+    return bytes(bits)
+
+
 def text_stream(box, heading, body):
     """Text placed inside the page's own box: the offset MediaBox page and the short landscape
     pages would otherwise carry text nothing can render."""
@@ -108,13 +160,15 @@ def manypage_pdf(count):
     return classic_pdf(pages)
 
 
-def objstm_predictor_pdf(filter_name=b"FlateDecode"):
+def objstm_predictor_pdf(filter_name=b"FlateDecode", early_change=1):
     """Hand-built PDF 1.5: catalog, page tree and both pages inside one object stream, located
     through a cross reference stream compressed with the PNG Up predictor.
 
     Ghostscript on this machine happens to emit no predictor, and browsers do, so this fixture is
-    what keeps the predictor path honest. With filter_name=b"LZWDecode" the same file declares a
-    filter no reader has to support, which is the refusal fixture.
+    what keeps the predictor path honest. filter_name picks how the predictor output is wrapped:
+    FlateDecode compresses it with zlib, LZWDecode encodes it with the LZW encoder above and names
+    the /EarlyChange it used, and any other name keeps the zlib payload but declares a filter no
+    reader has to support, which is the refusal fixture.
     """
     catalog = b"<< /Type /Catalog /Pages 2 0 R >>"
     page_tree = b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"
@@ -176,12 +230,20 @@ def objstm_predictor_pdf(filter_name=b"FlateDecode"):
         row = raw[i:i + 5]
         encoded += bytes([2]) + bytes(((row[j] - previous[j]) & 0xFF) for j in range(5))
         previous = row
-    compressed = zlib.compress(encoded, 9)
+
+    # The filter sees the predictor output, so the LZW fixture proves both halves: a real LZWDecode
+    # stream that still has to be unpredicted afterwards.
+    if filter_name == b"LZWDecode":
+        payload = lzw_encode(encoded, early_change)
+        parms = b" /DecodeParms << /Predictor 12 /Columns 5 /EarlyChange %d >>" % early_change
+    else:
+        payload = zlib.compress(encoded, 9)
+        parms = b" /DecodeParms << /Predictor 12 /Columns 5 >>"
 
     add(9, stream_object(
         b"/Type /XRef /Size 10 /Root 1 0 R /W [1 2 2] /Index [0 10]"
-        b" /Filter /" + filter_name + b" /DecodeParms << /Predictor 12 /Columns 5 >>",
-        compressed))
+        b" /Filter /" + filter_name + parms,
+        payload))
 
     out.append(b"startxref")
     out.append(b"%d" % xref_at)
@@ -355,7 +417,8 @@ def main():
     write("ex-rotations.pdf", classic_pdf(ROTATIONS))
     write("ex-manypage-50.pdf", manypage_pdf(50))
     write("ex-objstm-predictor.pdf", objstm_predictor_pdf())
-    write("ex-objstm-badfilter.pdf", objstm_predictor_pdf(b"LZWDecode"))
+    write("ex-objstm-badfilter.pdf", objstm_predictor_pdf(b"DCTDecode"))
+    write("ex-objstm-lzw.pdf", objstm_predictor_pdf(b"LZWDecode"))
     write("ex-indirect-contents.pdf", indirect_contents_pdf())
     write("ex-mediabox-cases.pdf", mediabox_cases_pdf())
 

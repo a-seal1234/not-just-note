@@ -91,12 +91,6 @@ bool PdfNotebookQuicks::available(Action action, int pageCount, int currentPage,
         }
         return true;
     case Action::Delete:
-        /// A notebook keeps at least one page -- a notebook with no pages is not a notebook, and
-        /// the manifest refuses it -- so the last one cannot be deleted.
-        if (pageCount <= 1) {
-            return no(QStringLiteral("A notebook keeps at least one page, so the last one cannot be "
-                                     "deleted."));
-        }
         return true;
     case Action::Duplicate:
     case Action::TurnLeft:

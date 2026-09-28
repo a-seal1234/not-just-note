@@ -78,6 +78,26 @@ public:
      */
     static QImage turnedForDisplay(const QImage &rendered, int extraRotation);
 
+    /**
+     * \a rendered reduced to \a boxPt, the page's own rectangle in source points, at \a sourceDpi.
+     *
+     * Public for the same reason turnedForDisplay() is: the single-page path renders its own raster
+     * and has to put the box on it too, or a cropped page opens as the whole sheet -- bigger than
+     * the size its own record declares, with the ink the crop already cut missing from the paper
+     * under it. The order is always crop first, turn second, which is the order the strip uses.
+     */
+    static QImage croppedToBox(const QImage &rendered, const QRectF &boxPt, qreal sourceDpi);
+
+    /**
+     * The paper of a page that has NO source: white paper of the page's own sheet, at \a dpi.
+     *
+     * The same arithmetic as renderPage() and in the same order -- the scale, the box, then the turn
+     * -- so a blank page measures exactly what a rendered one would and every size comparison
+     * downstream (the layout, the strip's slot, the budget, the exporter) holds without a special
+     * case. The paper is OPAQUE white: a blank page is a sheet of paper, not a hole in the notebook.
+     */
+    static QImage blankPage(const PdfPageRecord &record, qreal dpi);
+
     /// Closes and forgets every renderer. For a notebook change.
     void clear();
 
@@ -85,7 +105,7 @@ public:
     int openSourceCount() const;
 
 private:
-    PdfRenderBackend *backendForFile(const QString &sourceFile, const QString &projectDir,
+    PdfRenderBackend *backendForFile(const PdfSourceRecord &source, const QString &projectDir,
                                      QString *why);
 
     Factory m_factory;

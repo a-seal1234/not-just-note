@@ -5,11 +5,18 @@
  */
 
 #include "PdfExporter.h"
+#include "PdfLzwDecoder.h"
+
+#include "session/PdfAssembler.h"
+#include "session/PdfSession.h"
 
 #include <QDebug>
 
 #include <QFile>
+#include <QFileInfo>
 #include <QHash>
+#include <QSaveFile>
+#include <QTemporaryDir>
 #include <QPointF>
 #include <QRectF>
 #include <QSet>
@@ -558,8 +565,10 @@ bool decodeStream(const QByteArray &bytes, int dictStart, int dictEnd, const QBy
     QByteArray data = raw;
     for (int fi = 0; fi < filters.size(); ++fi) {
         const QByteArray filter = filters.at(fi);
-        if (filter != "FlateDecode" && filter != "Fl") {
-            fail(why, QStringLiteral("the PDF uses the unsupported stream filter /%1")
+        const bool flate = filter == "FlateDecode" || filter == "Fl";
+        const bool lzw = filter == "LZWDecode" || filter == "LZW";
+        if (!flate && !lzw) {
+            fail(why, QStringLiteral("the PDF uses the unsupported stream filter /%1 in a structural stream")
                           .arg(QString::fromLatin1(filter)));
             return false;
         }
@@ -567,18 +576,37 @@ bool decodeStream(const QByteArray &bytes, int dictStart, int dictEnd, const QBy
             *out = QByteArray();
             return true;
         }
-        /// qUncompress wants the four byte length header qCompress writes. Qt inflates into a
-        /// correctly sized buffer regardless of the number in the header, so a zero header is a
-        /// safe placeholder -- verified against the Qt this plugin builds with.
-        const QByteArray inflated = qUncompress(QByteArray(4, '\0') + data);
-        if (inflated.isNull()) {
-            fail(why, QStringLiteral("a FlateDecode stream in the PDF could not be inflated"));
-            return false;
-        }
-        data = inflated;
 
         DictSlice parms;
-        if (dictDictValue(bytes, dictStart, dictEnd, "DecodeParms", fi, &parms)) {
+        const bool haveParms = dictDictValue(bytes, dictStart, dictEnd, "DecodeParms", fi, &parms);
+        if (flate) {
+            /// qUncompress wants the four byte length header qCompress writes. Qt inflates into a
+            /// correctly sized buffer regardless of the number in the header, so a zero header is a
+            /// safe placeholder -- verified against the Qt this plugin builds with.
+            const QByteArray inflated = qUncompress(QByteArray(4, '\0') + data);
+            if (inflated.isNull()) {
+                fail(why, QStringLiteral("a FlateDecode stream in the PDF could not be inflated"));
+                return false;
+            }
+            data = inflated;
+        } else {
+            qint64 earlyChange = 1;
+            if (haveParms) {
+                dictIntValue(bytes, parms.start, parms.end, "EarlyChange", &earlyChange);
+            }
+            if (earlyChange != 0 && earlyChange != 1) {
+                fail(why, QStringLiteral("an LZWDecode stream has unsupported /EarlyChange %1")
+                              .arg(earlyChange));
+                return false;
+            }
+            QByteArray decoded;
+            if (!PdfLzwDecoder::decode(data, int(earlyChange), &decoded, why)) {
+                return false;
+            }
+            data = decoded;
+        }
+
+        if (haveParms) {
             qint64 predictor = 1;
             qint64 colors = 1;
             qint64 bits = 8;
@@ -2897,5 +2925,146 @@ bool PdfExporter::exportWithInk(const QString &sourcePdf,
         return false;
     }
     target.write(out);
+    return true;
+}
+
+bool PdfExporter::exportProjectWithInk(const QString &projectDir,
+                                       const PdfSessionManifest &manifest,
+                                       const QHash<int, QImage> &ink,
+                                       const QString &outPath,
+                                       QString *why)
+{
+    if (!manifest.isValid(why)) {
+        return false;
+    }
+
+    /// A page the writer cannot COPY is a page the assembler has to WRITE: a BLANK page has no page
+    /// in any PDF, and a page drawn from a PICTURE is not a PDF page at all. A notebook that has one
+    /// is therefore assembled even when it names a single PDF -- that is the path which writes such a
+    /// page object, and every turn, crop, scale and ink stamp then goes through it unchanged.
+    bool needsAssembly = false;
+    for (const PdfPageRecord &page : manifest.pages) {
+        if (page.isBlank() || manifest.sourceAt(page.source).isImage()) {
+            needsAssembly = true;
+            break;
+        }
+    }
+
+    /// Keep the well-tested single-source export exactly where it is for a notebook that is only PDF
+    /// pages. Resolving through PdfSession means the live caller and every source in a project use the
+    /// same project-relative naming rule.
+    if (manifest.sourceCount() == 1 && !needsAssembly) {
+        const QString sourcePdf = PdfSession::sourcePath(projectDir, manifest.sourceAt(0).file);
+        return exportWithInk(sourcePdf, manifest, ink, outPath, why);
+    }
+
+    /// An assembler must not export a stale or replaced background as if it were the source the
+    /// notebook was opened from. openProject() performs this identity check on entry; repeat it at
+    /// this API boundary as the manifest and project directory are also public inputs.
+    for (int i = 0; i < manifest.sourceCount(); ++i) {
+        const PdfSourceRecord record = manifest.sourceAt(i);
+        if (!PdfSession::isPathInsideProject(projectDir, record.file, why)) {
+            return false;
+        }
+        const QString sourcePath = PdfSession::sourcePath(projectDir, record.file);
+        const QFileInfo sourceInfo(sourcePath);
+        if (!sourceInfo.exists() || !sourceInfo.isFile()) {
+            fail(why, QStringLiteral("the source file %1 is missing").arg(record.file));
+            return false;
+        }
+        if (sourceInfo.size() != record.byteSize
+            || PdfSessionManifest::sha256OfFile(sourcePath) != record.sha256) {
+            fail(why, QStringLiteral("the source file %1 changed since the project was created")
+                              .arg(record.file));
+            return false;
+        }
+    }
+
+    QTemporaryDir temporary;
+    if (!temporary.isValid()) {
+        fail(why, QStringLiteral("cannot create a temporary directory to assemble the notebook"));
+        return false;
+    }
+    const QString assembledPath = temporary.filePath(QStringLiteral("assembled.pdf"));
+    if (!PdfAssembler::assemble(projectDir, manifest, assembledPath, nullptr, why)) {
+        return false;
+    }
+
+    /// PdfAssembler writes one page per manifest record, in notebook order. Only the source and
+    /// source-page address change in this copy: sizePt is already the recorded DISPLAYED size, and
+    /// all turns, scale, crop, rotation, ink-file names and other page metadata must remain intact.
+    PdfSessionManifest assembledManifest = manifest;
+    assembledManifest.sources.clear();
+    PdfSourceRecord assembledSource;
+    assembledSource.file = QStringLiteral("assembled.pdf");
+    assembledSource.sha256 = PdfSessionManifest::sha256OfFile(assembledPath);
+    assembledSource.byteSize = QFileInfo(assembledPath).size();
+    if (assembledSource.sha256.isEmpty() || assembledSource.byteSize <= 0) {
+        fail(why, QStringLiteral("the assembled PDF could not be read back"));
+        return false;
+    }
+    assembledManifest.sourceFile = assembledSource.file;
+    assembledManifest.sourceSha256 = assembledSource.sha256;
+    assembledManifest.sourceByteSize = assembledSource.byteSize;
+    assembledManifest.sources.append(assembledSource);
+    for (int i = 0; i < assembledManifest.pages.size(); ++i) {
+        assembledManifest.pages[i].source = 0;
+        assembledManifest.pages[i].index = i;
+    }
+    if (!assembledManifest.isValid(why)) {
+        return false;
+    }
+
+    /// The legacy writer writes to a QFile directly. Give it a private staging path, then atomically
+    /// commit its complete bytes so an export refusal or write error cannot leave a partial target.
+    const QString stagedPath = temporary.filePath(QStringLiteral("exported.pdf"));
+    if (!exportWithInk(assembledPath, assembledManifest, ink, stagedPath, why)) {
+        return false;
+    }
+
+    QFile staged(stagedPath);
+    if (!staged.open(QIODevice::ReadOnly)) {
+        fail(why, QStringLiteral("cannot read staged export %1: %2")
+                          .arg(stagedPath, staged.errorString()));
+        return false;
+    }
+    const QByteArray stagedPdf = staged.readAll();
+    if (staged.error() != QFile::NoError) {
+        fail(why, QStringLiteral("cannot read staged export %1: %2")
+                          .arg(stagedPath, staged.errorString()));
+        return false;
+    }
+    QString validationWhy;
+    const QList<int> stagedPages = pageObjectNumbers(stagedPdf, &validationWhy);
+    if (stagedPages.size() != manifest.pages.size()) {
+        fail(why, validationWhy.isEmpty()
+                      ? QStringLiteral("the staged export has %1 page(s), expected %2")
+                            .arg(stagedPages.size()).arg(manifest.pages.size())
+                      : QStringLiteral("the staged export is not a valid PDF: %1")
+                            .arg(validationWhy));
+        return false;
+    }
+    staged.close();
+
+    QSaveFile target(outPath);
+    if (!target.open(QIODevice::WriteOnly)) {
+        fail(why, QStringLiteral("cannot write %1: %2").arg(outPath, target.errorString()));
+        return false;
+    }
+    qint64 offset = 0;
+    while (offset < stagedPdf.size()) {
+        const qint64 written = target.write(stagedPdf.constData() + offset,
+                                            stagedPdf.size() - offset);
+        if (written <= 0) {
+            target.cancelWriting();
+            fail(why, QStringLiteral("cannot write %1: %2").arg(outPath, target.errorString()));
+            return false;
+        }
+        offset += written;
+    }
+    if (!target.commit()) {
+        fail(why, QStringLiteral("cannot commit %1: %2").arg(outPath, target.errorString()));
+        return false;
+    }
     return true;
 }

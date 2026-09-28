@@ -146,6 +146,9 @@ private Q_SLOTS:
     void testLegacyManifestWithoutSourcesIsUpgradedOnRead();
     void testSourcesRoundTripAndTheFirstMirrorsTheLegacyFields();
     void testAPageCannotNameASourceTheManifestDoesNotHave();
+
+    /// A BLANK page: no source, no page inside one, and the manifest accepts exactly one shape of it.
+    void testABlankPageIsAPageWithNoSource();
     void testThePageNumberAllocatorNeverReusesANumber();
     void testDisplaySizeFollowsTheNotebooksOwnRotation();
     void testOpenProjectVerifiesEverySource();
@@ -154,10 +157,10 @@ private Q_SLOTS:
     /// keep, what they refuse, and that a change which cannot be committed leaves nothing behind.
     void testMovingAPageChangesOnlyTheManifest();
     void testDeletingAPageJournalsItsFiles();
-    void testDeletingTheLastPageIsRefused();
+    void testDeletingEveryPageLeavesAnEmptyNotebook();
     void testDuplicatingAPageCopiesItsArtifacts();
     void testAnOperationThatCannotCommitChangesNothing();
-    void testUndoUndoesTheLastChangeOnly();
+    void testUndoWalksHistoryAcrossMultipleChanges();
 
     /// The one-click operations the submenu and the notebook panel share: one rule that both ask
     /// before they offer an operation, and one call that both make when one is chosen.
@@ -865,28 +868,50 @@ void PdfSessionTest::testDeletingAPageJournalsItsFiles()
     QVERIFY(!QFileInfo::exists(journal));
 }
 
-void PdfSessionTest::testDeletingTheLastPageIsRefused()
+void PdfSessionTest::testDeletingEveryPageLeavesAnEmptyNotebook()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
     const QString project = dir.filePath(QStringLiteral("project"));
 
     PopplerRenderBackend backend;
-    const PdfSessionManifest before =
-        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    const QString source = fixturePath(QStringLiteral("text-fixture.pdf"));
+    const PdfSessionManifest before = PdfSession::createProject(project, source, backend);
     QVERIFY(before.isValid());
-    const QByteArray manifestBefore = readBytes(PdfSession::manifestPath(project));
+    QCOMPARE(before.pages.size(), 3);
 
-    /// Every page: a notebook with none is not a notebook, and the manifest refuses it.
-    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::deletePages(project, 0, 3, 0);
-    QVERIFY(!outcome.ok);
-    QVERIFY2(outcome.why.contains(QStringLiteral("last page")), qPrintable(outcome.why));
+    /// Removing every page is a committed operation, not a notebook deletion. Its PDF source remains
+    /// available so the empty project can be repopulated from the operations screen.
+    PdfNotebookOps::PageEdits edits;
+    edits.sources = before.sources;
+    for (const PdfPageRecord &page : before.pages) {
+        edits.removeAfter << page.kraFile << page.kraFile + QStringLiteral(".layers")
+                          << page.kraFile + QStringLiteral(".layers.txt");
+        if (!page.thumbFile.isEmpty()) {
+            edits.removeAfter << page.thumbFile;
+        }
+    }
+    const PdfNotebookOps::Outcome outcome = PdfNotebookOps::applyPageEdits(project, edits, {});
+    QVERIFY2(outcome.ok, qPrintable(outcome.why));
+    QCOMPARE(outcome.anchorPage, -1);
 
-    QCOMPARE(readBytes(PdfSession::manifestPath(project)), manifestBefore);
-    QVERIFY(!PdfNotebookOps::canUndo(project));
+    QString why;
+    const PdfSessionManifest empty = PdfSession::openProject(project, &why);
+    QVERIFY2(empty.isValid(&why), qPrintable(why));
+    QVERIFY(empty.pages.isEmpty());
+    QVERIFY(!empty.sources.isEmpty());
+    QVERIFY(QFileInfo::exists(QDir(project).filePath(empty.sourceFile)));
+    QVERIFY(PdfNotebookOps::canUndo(project));
 
-    /// One page short of that is allowed, so the refusal is the last page and not "delete".
-    QVERIFY2(PdfNotebookOps::deletePages(project, 0, 2, 0).ok, "two of three pages must be deletable");
+    /// Insert is the recovery path for a deliberately empty notebook.
+    const PdfNotebookOps::Outcome inserted =
+        PdfNotebookOps::insertPages(project, 0, source, backend, 0, 1, -1);
+    QVERIFY2(inserted.ok, qPrintable(inserted.why));
+    QCOMPARE(inserted.anchorPage, 0);
+    const PdfSessionManifest repopulated = PdfSession::openProject(project, &why);
+    QVERIFY2(repopulated.isValid(&why), qPrintable(why));
+    QCOMPARE(repopulated.pages.size(), 1);
+    QCOMPARE(repopulated.pages.first().index, 0);
 }
 
 /**
@@ -990,10 +1015,9 @@ void PdfSessionTest::testAnOperationThatCannotCommitChangesNothing()
 }
 
 /**
- * Undo is one change deep, and it is the LAST change: a second operation replaces what the first
- * one left to undo.
+ * Each operation is one undo step, and older steps remain available after the latest one is undone.
  */
-void PdfSessionTest::testUndoUndoesTheLastChangeOnly()
+void PdfSessionTest::testUndoWalksHistoryAcrossMultipleChanges()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
@@ -1013,13 +1037,19 @@ void PdfSessionTest::testUndoUndoesTheLastChangeOnly()
     const PdfSessionManifest afterDuplicate = PdfSession::openProject(project, &why);
     QCOMPARE(afterDuplicate.pages.size(), 4);
 
-    const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
-    QVERIFY2(undo.ok, qPrintable(undo.why));
+    const PdfNotebookOps::Outcome undoDuplicate = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undoDuplicate.ok, qPrintable(undoDuplicate.why));
 
-    /// Back to the state after the move -- not to the notebook before it.
+    /// First undo returns to the state after the move, and promotes that earlier move into the active
+    /// undo slot instead of throwing it away.
     QCOMPARE(PdfSession::openProject(project, &why).toJson(), afterMove.toJson());
-    QVERIFY(!PdfNotebookOps::canUndo(project));
+    QVERIFY(PdfNotebookOps::canUndo(project));
     QCOMPARE(PdfSession::openProject(project, &why).pages.size(), 3);
+
+    const PdfNotebookOps::Outcome undoMove = PdfNotebookOps::undoLast(project);
+    QVERIFY2(undoMove.ok, qPrintable(undoMove.why));
+    QCOMPARE(PdfSession::openProject(project, &why).toJson(), start.toJson());
+    QVERIFY(!PdfNotebookOps::canUndo(project));
 }
 
 /**
@@ -1094,8 +1124,9 @@ void PdfSessionTest::testInsertingPagesFromAnotherPdf()
     QCOMPARE(twice.pages.at(5).source, 1);
     QCOMPARE(twice.pages.at(5).index, 0);
 
-    /// Undo is one change deep, so this undoes the SECOND insert and leaves the first: five pages
-    /// again, and the copied PDF still there, because the pages that came with it still draw on it.
+    /// One click undoes exactly the SECOND insert and leaves the first: five pages again, and the
+    /// copied PDF still there because the remaining pages still draw on it. The earlier insert is
+    /// still available as the next undo step.
     const PdfNotebookOps::Outcome undo = PdfNotebookOps::undoLast(project);
     QVERIFY2(undo.ok, qPrintable(undo.why));
     const PdfSessionManifest back = PdfSession::openProject(project, &why);
@@ -2509,10 +2540,9 @@ void PdfSessionTest::testQuickPageOperations()
     QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::MoveDown, pages, 2, &why));
     QVERIFY2(why.contains(QStringLiteral("last page")), qPrintable(why));
 
-    /// A notebook keeps at least one page -- the engine's own rule, said here once so that the entry
-    /// cannot be offered where the engine would refuse it.
-    QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Delete, 1, 0, &why));
-    QVERIFY2(why.contains(QStringLiteral("at least one page")), qPrintable(why));
+    /// A one-page notebook can now be emptied; its PDF source remains for the insert/merge recovery path.
+    QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Delete, 1, 0, &why));
+    QVERIFY2(why.isEmpty(), qPrintable(why));
     QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Delete, 2, 0, &why));
     QVERIFY(PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Duplicate, 1, 0, &why));
     QVERIFY(!PdfNotebookQuicks::available(PdfNotebookQuicks::Action::Duplicate, 1, 1, &why));
@@ -2739,18 +2769,102 @@ void PdfSessionTest::testPageSizeIsBoxThenTurnThenScale()
     QCOMPARE(upgraded.pages.at(0).boxPt, QRectF());
     QCOMPARE(upgraded.pages.at(0).displaySizePt(), QSizeF(842, 595));
 
-    /// And the other direction, which the schema number exists for: a manifest this build is too old
-    /// to understand is REFUSED with the number in the reason, not opened with the size dropped.
-    const QByteArray four = R"({
-    "schema": 4,
+    /// A schema 3 notebook -- the shape the build before this one wrote -- opens unchanged as well:
+    /// the same source, and no page of it blank.
+    const QByteArray three = R"({
+    "schema": 3,
+    "source": { "file": "source.pdf", "sha256": "deadbeef", "bytes": 4 },
+    "sources": [ { "file": "source.pdf", "sha256": "deadbeef", "bytes": 4 } ],
+    "nextPageNumber": 2,
+    "pages": [
+        { "index": 0, "sizePt": [595, 842], "rotation": 0, "kra": "pages/p0001.kra",
+          "thumb": "thumbs/p0001.png", "generation": 1, "source": 0, "extraRotation": 0,
+          "extraScale": 1.0 }
+    ]
+})";
+    writeBytes(path, three);
+    const PdfSessionManifest fromThree = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(fromThree.isValid(&why), qPrintable(why));
+    QCOMPARE(fromThree.schema, PdfSessionManifest::CurrentSchema);
+    QVERIFY(!fromThree.pages.at(0).isBlank());
+
+    /// And the other direction, which the schema number exists for: a manifest from a build NEWER
+    /// than this one is REFUSED with the number in the reason, not opened with what it cannot read
+    /// dropped. The number is derived rather than spelled, so this stays a test of "the future" and
+    /// not of whichever number happened to be current when it was written.
+    const int future = PdfSessionManifest::CurrentSchema + 1;
+    const QByteArray fromTheFuture = QStringLiteral(R"({
+    "schema": %1,
     "source": { "file": "source.pdf", "sha256": "deadbeef", "bytes": 4 },
     "pages": [ { "index": 0, "sizePt": [595, 842], "kra": "pages/p0001.kra" } ]
-})";
-    writeBytes(path, four);
+})").arg(future).toUtf8();
+    writeBytes(path, fromTheFuture);
     why.clear();
     const PdfSessionManifest refused = PdfSessionManifest::readFrom(path, &why);
     QVERIFY(!refused.isValid());
-    QVERIFY2(why.contains(QStringLiteral("unsupported manifest schema 4")), qPrintable(why));
+    QVERIFY2(why.contains(QStringLiteral("unsupported manifest schema %1").arg(future)), qPrintable(why));
+}
+
+/**
+ * A BLANK page is a page with no source at all, and the manifest accepts exactly one shape of it.
+ *
+ * The shape matters more than it looks: `source == -1` with a real `index` is a record two readers
+ * can read two ways, and one of those ways is the user's PDF appearing where the blank page is. So
+ * "no source" and "no page inside one" travel together or the record is refused.
+ */
+void PdfSessionTest::testABlankPageIsAPageWithNoSource()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString project = dir.filePath(QStringLiteral("project"));
+
+    PopplerRenderBackend backend;
+    const PdfSessionManifest before =
+        PdfSession::createProject(project, fixturePath(QStringLiteral("text-fixture.pdf")), backend);
+    QVERIFY(before.isValid());
+
+    QString why;
+    PdfPageRecord blank;
+    blank.source = -1;
+    blank.index = -1;
+    blank.sizePt = QSizeF(420, 595);
+    blank.kraFile = PdfSession::pageFileNameForNumber(before.effectiveNextPageNumber());
+
+    PdfSessionManifest withBlank = before;
+    withBlank.pages.insert(1, blank);
+    QVERIFY2(withBlank.isValid(&why), qPrintable(why));
+    QVERIFY(withBlank.pages.at(1).isBlank());
+    /// Nothing to render it from, which is what makes its paper the renderer's own business.
+    QCOMPARE(withBlank.sourceForPage(withBlank.pages.at(1)).file, QString());
+
+    /// And it survives being written and read back: the record is what says "blank" tomorrow.
+    const QString path = dir.filePath(QStringLiteral("manifest.json"));
+    QVERIFY2(withBlank.writeTo(path, &why), qPrintable(why));
+    const PdfSessionManifest readBack = PdfSessionManifest::readFrom(path, &why);
+    QVERIFY2(readBack.isValid(&why), qPrintable(why));
+    QCOMPARE(readBack.pages.size(), before.pages.size() + 1);
+    QVERIFY(readBack.pages.at(1).isBlank());
+    QCOMPARE(readBack.pages.at(1).sizePt, QSizeF(420, 595));
+
+    /// Half a blank page is not a blank page: a record that says "no source" while naming a page of
+    /// one is refused rather than read either way.
+    withBlank.pages[1].index = 0;
+    QVERIFY(!withBlank.isValid(&why));
+    QVERIFY2(why.contains(QStringLiteral("has no source but names page")), qPrintable(why));
+    withBlank.pages[1] = blank;
+
+    /// A page that names a source the notebook does not have is still refused, blank or not.
+    PdfPageRecord stray = blank;
+    stray.source = before.sourceCount();
+    stray.index = 0;
+    withBlank.pages[1] = stray;
+    QVERIFY(!withBlank.isValid(&why));
+    QVERIFY2(why.contains(QStringLiteral("which the manifest does not have")), qPrintable(why));
+    withBlank.pages[1] = blank;
+
+    /// A blank page with no size is refused too: its size is the only thing that describes its paper.
+    withBlank.pages[1].sizePt = QSizeF();
+    QVERIFY(!withBlank.isValid(&why));
 }
 
 /**

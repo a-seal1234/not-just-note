@@ -137,6 +137,95 @@ qint64 javaHeapBytes()
 }
 #endif
 
+/// The resolution a page may really be built at, after the device's own page budget.
+///
+/// One place for both kinds of page: a blank page costs exactly as much memory as a rendered one of
+/// the same size, so it answers to the same cap, and the log line names which page was clamped.
+/// \a displaySizePt is the size the reader sees, turn and scale included -- charging the budget for
+/// the unturned rectangle would let an angled page past the cap by the whole area the angle adds.
+qreal clampedDpiForPage(const PdfPageRecord &page, qreal dpi, const QSizeF &displaySizePt)
+{
+    const qint64 maxPixels = PdfProjectBuilder::maxPagePixels();
+    const qreal wantedPixels = (displaySizePt.width() * dpi / 72.0) * (displaySizePt.height() * dpi / 72.0);
+    if (wantedPixels <= maxPixels) {
+        return dpi;
+    }
+
+    /// Said out loud. A page rendered below the resolution that was asked for is a page whose notes
+    /// are drawn on a coarser grid than the user expects, and they should be able to find out why
+    /// rather than wonder whether the notebook is blurry.
+    const qreal requested = dpi;
+    const qreal clamped = dpi * std::sqrt(qreal(maxPixels) / wantedPixels);
+    qWarning() << "[pdfio] page" << (page.isBlank() ? QStringLiteral("(blank)") : QString::number(page.index + 1))
+               << "wants" << qint64(wantedPixels) << "pixels but this device allows" << maxPixels
+               << "; rendering at" << clamped << "dpi instead of" << requested;
+    return clamped;
+}
+
+/// The layer stack every page is, once its raster exists: the paper locked underneath, the Ink group
+/// above it with the paint layer the user draws into.
+///
+/// \a raster is the page as the reader sees it -- scale, box and turn already applied -- and \a dpi
+/// is the resolution it was built at, which is what the image records and what the size check below
+/// measures against. The check is deliberately shared: a render and a blank sheet reach it the same
+/// way, so "this page measures what its record says" is asserted for both kinds of page.
+KisImageSP pageImageFromRaster(const PdfPageRecord &page, const QImage &raster, qreal dpi,
+                               const QSizeF &displaySizePt, QString *why)
+{
+    if (raster.isNull()) {
+        fail(why, QStringLiteral("the page produced no raster"));
+        return KisImageSP();
+    }
+
+    /// The image is the box the budget above was measured on, so the two are compared rather than
+    /// assumed equal. A renderer's own transform rounds its result outwards, so a pixel or two more
+    /// than displaySizePt() is the rounding, not a disagreement; a page that came back any further
+    /// off would mean the turned sheet and the box it is measured against had drifted apart, which
+    /// is worth saying out loud.
+    const QSize boxPixels(qRound(displaySizePt.width() * dpi / 72.0),
+                          qRound(displaySizePt.height() * dpi / 72.0));
+    if (qAbs(raster.width() - boxPixels.width()) > 2 || qAbs(raster.height() - boxPixels.height()) > 2) {
+        qWarning() << "[pdfio] page"
+                   << (page.isBlank() ? QStringLiteral("(blank)") : QString::number(page.index + 1))
+                   << "turned by" << page.extraRotation << "degrees measures" << raster.size()
+                   << "where displaySizePt() puts it at" << boxPixels;
+    }
+
+    const KoColorSpace *colorSpace = KoColorSpaceRegistry::instance()->rgb8();
+    if (!colorSpace) {
+        fail(why, QStringLiteral("no RGB color space is available"));
+        return KisImageSP();
+    }
+
+    /// The image is measured in pixels of the raster, so nothing downstream has to redo the
+    /// point-to-pixel conversion that the raster already made.
+    KisImageSP image = new KisImage(0, raster.width(), raster.height(), colorSpace,
+                                    QStringLiteral("PDF page %1").arg(page.index + 1));
+    image->setResolution(dpi, dpi);
+
+    KisPaintLayerSP background = new KisPaintLayer(image, PdfProjectBuilder::backgroundLayerName(),
+                                                   OPACITY_OPAQUE_U8);
+    background->paintDevice()->convertFromQImage(raster, 0, 0, 0);
+
+    /// The page artwork is not ours to edit; only the Ink group is written by the session.
+    background->setUserLocked(true);
+
+    KisGroupLayerSP ink = new KisGroupLayer(image, PdfProjectBuilder::inkLayerName(), OPACITY_OPAQUE_U8,
+                                            colorSpace);
+
+    /// Added in order: the background first, so the Ink group ends up above it.
+    image->addNode(background, image->root());
+    image->addNode(ink, image->root());
+
+    /// The Ink group needs a paint layer of its own. A group is not paintable, so without this
+    /// the user selects Ink, draws, and nothing happens at all.
+    KisPaintLayerSP stroke = new KisPaintLayer(image, PdfProjectBuilder::inkStrokeLayerName(),
+                                               OPACITY_OPAQUE_U8);
+    image->addNode(stroke, ink);
+
+    return image;
+}
+
 } // namespace
 
 qint64 PdfProjectBuilder::maxPagePixels()
@@ -172,81 +261,55 @@ KisImageSP PdfProjectBuilder::buildPageImage(const PdfPageRecord &page,
         return KisImageSP();
     }
 
-    /// The box the page occupies once the notebook's own turn is on it, which is what the image
-    /// below will actually measure. A page set down at an angle is BIGGER than its sizePt: charging
-    /// the budget for the unturned rectangle would let an angled page past the cap by the whole
-    /// area the angle adds, and the page the user sees would be the one rendered coarser than the
-    /// device allows.
-    const QSizeF boxPt = page.displaySizePt();
+    const QSizeF displaySizePt = page.displaySizePt();
+    dpi = clampedDpiForPage(page, dpi, displaySizePt);
 
-    const qint64 maxPixels = maxPagePixels();
-    const qreal wantedPixels =
-        (boxPt.width() * dpi / 72.0) * (boxPt.height() * dpi / 72.0);
-    if (wantedPixels > maxPixels) {
-        const qreal requestedDpi = dpi;
-        dpi *= std::sqrt(qreal(maxPixels) / wantedPixels);
-
-        /// Said out loud. A page rendered below the resolution that was asked for is a page whose
-        /// notes are drawn on a coarser grid than the user expects, and they should be able to
-        /// find out why rather than wonder whether the notebook is blurry.
-        qWarning() << "[pdfio] page" << (page.index + 1) << "wants" << qint64(wantedPixels)
-                   << "pixels but this device allows" << maxPixels
-                   << "; rendering at" << dpi << "dpi instead of" << requestedDpi;
-    }
-
-    const QImage rendered = backend.renderPage(page.index, dpi);
+    /// displaySizePt() includes extraScale, so the source PDF must be rendered at the corresponding
+    /// higher source DPI. Using the effective canvas DPI directly here leaves an opened scaled page
+    /// at its old pixel dimensions, with gray canvas showing where the enlarged page should be.
+    const qreal extraScale = page.extraScale > 0.0 ? page.extraScale : 1.0;
+    const qreal sourceDpi = dpi * extraScale;
+    const QImage rendered = backend.renderPage(page.index, sourceDpi);
     if (rendered.isNull()) {
         fail(why, QStringLiteral("the renderer produced nothing for page %1").arg(page.index + 1));
         return KisImageSP();
     }
 
+    /// And the page's own BOX, before the turn, exactly as the strip applies it: what the box does
+    /// not cover is dropped and a margin comes back as paper white. Without this a cropped page
+    /// opened as the whole sheet -- the image bigger than the size its record declares, and the
+    /// paper under the ink the crop had already cut away. Found by
+    /// PdfNavigatorIntegrationTest::testTheRealClipperCropsThePageAndKeepsItsInk.
+    const QImage boxed = page.boxPt.isValid()
+        ? PdfSourceRenderers::croppedToBox(rendered, page.boxPt, sourceDpi)
+        : rendered;
+
     /// And turned by the notebook's own turn, if it has one: the renderer hands back the source's
     /// orientation, and a page the user has turned -- by a right angle or by any other -- comes back
     /// turned. The ink is turned with it -- the artifact was rotated when the page was -- so a
     /// stroke stays on its line.
-    const QImage oriented = PdfSourceRenderers::turnedForDisplay(rendered, page.extraRotation);
+    return pageImageFromRaster(page, PdfSourceRenderers::turnedForDisplay(boxed, page.extraRotation),
+                               dpi, displaySizePt, why);
+}
 
-    /// The image the turn produced is the box the budget above was measured on, so the two are
-    /// compared rather than assumed equal. The renderer's own transform rounds its result outwards,
-    /// so a pixel or two more than displaySizePt() is the rounding, not a disagreement; a page that
-    /// came back any further off would mean the turned sheet and the box it is measured against had
-    /// drifted apart, which is worth saying out loud.
-    const QSize boxPixels(qRound(boxPt.width() * dpi / 72.0), qRound(boxPt.height() * dpi / 72.0));
-    if (qAbs(oriented.width() - boxPixels.width()) > 2
-        || qAbs(oriented.height() - boxPixels.height()) > 2) {
-        qWarning() << "[pdfio] page" << (page.index + 1) << "turned by" << page.extraRotation
-                   << "degrees measures" << oriented.size() << "where displaySizePt() puts it at"
-                   << boxPixels;
+KisImageSP PdfProjectBuilder::buildBlankPageImage(const PdfPageRecord &page, qreal dpi, QString *why)
+{
+    if (!page.sizePt.isValid()) {
+        fail(why, QStringLiteral("the blank page has no usable geometry"));
+        return KisImageSP();
     }
-
-    const KoColorSpace *colorSpace = KoColorSpaceRegistry::instance()->rgb8();
-    if (!colorSpace) {
-        fail(why, QStringLiteral("no RGB color space is available"));
+    if (!page.isBlank()) {
+        /// Said rather than done: a caller that asks for a blank page and hands over a page with a
+        /// source has the two halves of the notebook disagreeing, and rendering a white sheet over a
+        /// PDF page would hide the paper the user expects under a blank one.
+        fail(why, QStringLiteral("page %1 has a source, so it is not a blank page").arg(page.index + 1));
         return KisImageSP();
     }
 
-    /// The image is measured in pixels of the render, so nothing downstream has to redo the
-    /// point-to-pixel conversion that the renderer already made.
-    KisImageSP image = new KisImage(0, oriented.width(), oriented.height(), colorSpace,
-                                    QStringLiteral("PDF page %1").arg(page.index + 1));
-    image->setResolution(dpi, dpi);
+    const QSizeF displaySizePt = page.displaySizePt();
+    dpi = clampedDpiForPage(page, dpi, displaySizePt);
 
-    KisPaintLayerSP background = new KisPaintLayer(image, backgroundLayerName(), OPACITY_OPAQUE_U8);
-    background->paintDevice()->convertFromQImage(oriented, 0, 0, 0);
-
-    /// The page artwork is not ours to edit; only the Ink group is written by the session.
-    background->setUserLocked(true);
-
-    KisGroupLayerSP ink = new KisGroupLayer(image, inkLayerName(), OPACITY_OPAQUE_U8, colorSpace);
-
-    /// Added in order: the background first, so the Ink group ends up above it.
-    image->addNode(background, image->root());
-    image->addNode(ink, image->root());
-
-    /// The Ink group needs a paint layer of its own. A group is not paintable, so without this
-    /// the user selects Ink, draws, and nothing happens at all.
-    KisPaintLayerSP stroke = new KisPaintLayer(image, inkStrokeLayerName(), OPACITY_OPAQUE_U8);
-    image->addNode(stroke, ink);
-
-    return image;
+    /// White paper of the page's own sheet: the same call the strip, the thumbnail and the exporter
+    /// make for a page with no source, so the page opens at exactly the size the others measure.
+    return pageImageFromRaster(page, PdfSourceRenderers::blankPage(page, dpi), dpi, displaySizePt, why);
 }

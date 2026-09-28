@@ -3,10 +3,13 @@ set(kritapdfio_SOURCES
     PdfIoPlugin.cpp
     PdfIoProbe.cpp
     PdfNotebookOpsDialog.cpp
+    PdfNotebookResizeDialog.cpp
     PdfPageNavigator.cpp
     PdfPageStripDecoration.cpp
     PdfRendererSpike.cpp
     backend/PdfRenderBackendCreate.cpp
+    backends/image/ImageRenderBackend.cpp
+    session/PdfAssembler.cpp
     session/PdfExporter.cpp
     session/PdfInkLoader.cpp
     session/PdfNotebookBundle.cpp

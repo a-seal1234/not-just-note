@@ -262,8 +262,8 @@ void PdfSessionManifest::setFailBeforeCommitForTests(bool fail)
     failBeforeCommitForTests() = fail;
 }
 
-/// How many times writeTo() has committed, for the seam above. A file-scope counter rather than a
-/// static member so the header does not have to name a storage. 
+/// How many times writeTo() has committed the notebook's live manifest, for the test seam. Journal
+/// after-images are not notebook commits; a file-scope counter keeps storage out of the header.
 static int &committedManifests()
 {
     static int count = 0;
@@ -294,10 +294,8 @@ bool PdfSessionManifest::isValid(QString *why) const
         fail(why, QStringLiteral("no source checksum recorded"));
         return false;
     }
-    if (pages.isEmpty()) {
-        fail(why, QStringLiteral("no pages recorded"));
-        return false;
-    }
+    /// A notebook may legitimately be empty after its final page is deleted. The retained source
+    /// record makes the project readable, and the operations screen can insert pages again.
     /// Every field that names a file is checked here, once, where the manifest enters the session.
     /// readFrom(), fromJson() and PdfSession::openProject() all come through isValid(), and every
     /// consumer joins these names onto the project directory afterwards -- so this is the one place
@@ -322,6 +320,13 @@ bool PdfSessionManifest::isValid(QString *why) const
                           .arg(i + 1).arg(source.file, reason));
             return false;
         }
+        /// The kinds this build knows, or nothing. An unknown one is refused BY NAME rather than
+        /// opened as a PDF: whichever reader a build has is not necessarily the one the file needs.
+        if (!source.kind.isEmpty() && source.kind != QStringLiteral("pdf") && !source.isImage()) {
+            fail(why, QStringLiteral("source %1 is a \"%2\" file, which this build cannot read")
+                          .arg(i + 1).arg(source.kind));
+            return false;
+        }
     }
     if (!sources.isEmpty()
         && (sources.first().file != sourceFile || sources.first().sha256 != sourceSha256
@@ -331,52 +336,69 @@ bool PdfSessionManifest::isValid(QString *why) const
         return false;
     }
 
-    for (const PdfPageRecord &page : pages) {
-        if (page.index < 0 || !page.sizePt.isValid()) {
-            fail(why, QStringLiteral("page %1 is incomplete").arg(page.index));
+    for (int i = 0; i < pages.size(); ++i) {
+        const PdfPageRecord &page = pages.at(i);
+        /// The page's POSITION in the list names it, not its index inside a source: a blank page has
+        /// no source page to be numbered by, and "page 0" in a refusal reads like a real page.
+        const QString which = QStringLiteral("page %1").arg(i + 1);
+        if (!page.sizePt.isValid()) {
+            fail(why, QStringLiteral("%1 has no size").arg(which));
             return false;
         }
-        if (page.source < 0 || page.source >= sourceCount()) {
-            fail(why, QStringLiteral("page %1 names source %2, which the manifest does not have")
-                          .arg(page.index + 1).arg(page.source));
+        if (!page.isBlank()) {
+            if (page.index < 0) {
+                fail(why, QStringLiteral("%1 is incomplete: no page inside its source").arg(which));
+                return false;
+            }
+            if (page.source >= sourceCount()) {
+                fail(why, QStringLiteral("%1 names source %2, which the manifest does not have")
+                              .arg(which).arg(page.source));
+                return false;
+            }
+        } else if (page.index != -1) {
+            /// Both fields say "no source" or neither does. A blank record that still names a page
+            /// of a PDF is the one combination that could be read two ways, and one of those ways is
+            /// the user's manual appearing where a blank page should be.
+            fail(why, QStringLiteral("%1 has no source but names page %2 of one")
+                          .arg(which).arg(page.index + 1));
             return false;
         }
         if (!isTurn(page.extraRotation)) {
-            fail(why, QStringLiteral("page %1 has an extra rotation of %2 degrees, which is not an angle "
+            fail(why, QStringLiteral("%1 has an extra rotation of %2 degrees, which is not an angle "
                                      "between 0 and 359")
-                          .arg(page.index + 1).arg(page.extraRotation));
+                          .arg(which).arg(page.extraRotation));
             return false;
         }
         /// A scale of zero or less, or one that is not a number, is a page with no size: refused
         /// here rather than divided by later. A factor of exactly 1.0 is "as the source declares".
         if (!qIsFinite(page.extraScale) || page.extraScale <= 0.0) {
-            fail(why, QStringLiteral("page %1 has a scale of %2, which is not a positive factor")
-                          .arg(page.index + 1).arg(page.extraScale));
+            fail(why, QStringLiteral("%1 has a scale of %2, which is not a positive factor")
+                          .arg(which).arg(page.extraScale));
             return false;
         }
         /// An absent box is legal and means the whole sheet. A rectangle that is there but has no
         /// area -- a half-written or hand-edited box -- would make a page of nothing, so it is
         /// refused. A box outside the sheet is legal: that is a margin.
         if (!page.boxPt.isNull() && !page.boxPt.isValid()) {
-            fail(why, QStringLiteral("page %1 has a box of %2x%3 points, which is not a rectangle")
-                          .arg(page.index + 1).arg(page.boxPt.width()).arg(page.boxPt.height()));
+            fail(why, QStringLiteral("%1 has a box of %2x%3 points, which is not a rectangle")
+                          .arg(which).arg(page.boxPt.width()).arg(page.boxPt.height()));
             return false;
         }
         if (page.kraFile.isEmpty()) {
-            fail(why, QStringLiteral("the manifest's page %1 ink file is not recorded").arg(page.index + 1));
+            fail(why, QStringLiteral("the manifest's %1 ink file is not recorded").arg(which));
             return false;
         }
         if (!isSafeRelativePath(page.kraFile, &reason)) {
-            fail(why, QStringLiteral("the manifest's page %1 ink file \"%2\" is not a file inside the project: %3")
-                          .arg(page.index + 1).arg(page.kraFile, reason));
+            fail(why, QStringLiteral("the manifest's %1 ink file \"%2\" is not a file inside the project: %3")
+                          .arg(which).arg(page.kraFile, reason));
             return false;
         }
 
         /// An empty thumbnail stays legal -- see PdfPageRecord::thumbFile. A name that is there is
         /// checked like any other, because the docker and the strip decoration join it.
         if (!page.thumbFile.isEmpty() && !isSafeRelativePath(page.thumbFile, &reason)) {
-            fail(why, QStringLiteral("the manifest's page %1 thumbnail \"%2\" is not a file inside the project: %3")
-                          .arg(page.index + 1).arg(page.thumbFile, reason));
+            fail(why, QStringLiteral("the manifest's %1 thumbnail \"%2\" is not a file inside the project: %3")
+                          .arg(which).arg(page.thumbFile, reason));
             return false;
         }
     }
@@ -423,6 +445,11 @@ QJsonObject PdfSessionManifest::toJson() const
             entry.insert(QStringLiteral("file"), record.file);
             entry.insert(QStringLiteral("sha256"), QString::fromLatin1(record.sha256));
             entry.insert(QStringLiteral("bytes"), double(record.byteSize));
+            /// Written only when the source is not a plain PDF, which keeps every manifest this
+            /// build writes for an ordinary notebook byte-for-byte what it was.
+            if (!record.kind.isEmpty()) {
+                entry.insert(QStringLiteral("kind"), record.kind);
+            }
             sourceArray.append(entry);
         }
     }
@@ -454,7 +481,7 @@ PdfSessionManifest PdfSessionManifest::fromJson(const QJsonObject &object, QStri
     /// A schema 1 manifest is this shape plus nothing: one source in the legacy object, no
     /// sources[] list, no per-page source and no page-number counter. It is upgraded here, in
     /// memory, which is what keeps every notebook made until now opening.
-    if (manifest.schema == 1 || manifest.schema == 2) {
+    if (manifest.schema == 1 || manifest.schema == 2 || manifest.schema == 3) {
         manifest.schema = CurrentSchema;
     }
 
@@ -474,6 +501,8 @@ PdfSessionManifest PdfSessionManifest::fromJson(const QJsonObject &object, QStri
         record.file = entry.value(QStringLiteral("file")).toString();
         record.sha256 = entry.value(QStringLiteral("sha256")).toString().toLatin1();
         record.byteSize = qint64(entry.value(QStringLiteral("bytes")).toDouble());
+        /// Absent in every manifest written before image pages existed, and absent means a PDF.
+        record.kind = entry.value(QStringLiteral("kind")).toString();
         manifest.sources.append(record);
     }
 
@@ -561,7 +590,11 @@ bool PdfSessionManifest::writeTo(const QString &path, QString *why) const
         return false;
     }
 
-    ++committedManifests();
+    /// Journal after-images are serialized with this class too, but operation tests care about
+    /// commits to the notebook's active manifest, not the recovery snapshot beside it.
+    if (QFileInfo(path).fileName() == QStringLiteral("manifest.json")) {
+        ++committedManifests();
+    }
     return true;
 }
 

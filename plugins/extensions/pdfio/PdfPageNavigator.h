@@ -848,6 +848,13 @@ private:
     /// turn, and the previous one's signal must not go on marking pages of the new one.
     QMetaObject::Connection m_inkChangeConnection;
 
+    /// Tracks BEGIN/END from the active canvas tool so idle saves and automatic page changes do
+    /// not snapshot or evict a page while the user still holds the pen or another tool action.
+    QMetaObject::Connection m_toolActionConnection;
+    bool m_toolActionActive = false;
+
+    friend class PdfNavigatorIntegrationTest;
+
     /// True while a page turn is being made. A second turn arriving from inside an event loop
     /// this one is waiting in -- a click while a write is landing -- must be refused, not
     /// interleaved: two turns deciding at once where the ink belongs is how it ends up neither

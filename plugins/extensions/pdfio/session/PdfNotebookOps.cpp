@@ -17,15 +17,21 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <QTemporaryDir>
+#include <QtMath>
+#include <algorithm>
+#include <limits>
 
 namespace {
 
 const char *const OpsDirName = ".ops";
 const char *const LastDirName = "last";
+const char *const HistoryDirName = "history";
 const char *const BeforeName = "before.json";
+const char *const AfterName = "after.json";
 const char *const OpName = "op.json";
 const char *const RemovedDirName = "removed";
 const char *const AddedName = "added.txt";
+const int MaxUndoDepth = 20;
 
 void fail(QString *why, const QString &message)
 {
@@ -184,6 +190,177 @@ void undoCreatedFiles(const QString &projectDir, const Plan &plan)
     }
 }
 
+QString undoHistoryDir(const QString &projectDir)
+{
+    /// History is a sibling of the active `last` journal under .ops, not a child of `last` itself:
+    /// archiving the active directory into one of its descendants cannot work and silently made the
+    /// second notebook operation fail.
+    return QDir(projectDir).filePath(QLatin1String(OpsDirName) + QLatin1Char('/')
+                                      + QLatin1String(HistoryDirName));
+}
+
+QStringList undoHistoryNames(const QString &projectDir)
+{
+    const QDir history(undoHistoryDir(projectDir));
+    QStringList names;
+    for (const QString &name : history.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks,
+                                                 QDir::Name)) {
+        bool ok = false;
+        name.toULongLong(&ok);
+        if (ok) {
+            names.append(name);
+        }
+    }
+    return names;
+}
+
+QByteArray readFileBytes(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
+bool journalHasRecoveryFiles(const QString &projectDir, const QString &journal)
+{
+    const QDir project(projectDir);
+    for (const QString &relative : readLines(QDir(journal).filePath(QLatin1String(AddedName)))) {
+        if (QFileInfo::exists(project.filePath(relative))) {
+            return true;
+        }
+    }
+
+    const QString removed = QDir(journal).filePath(QLatin1String(RemovedDirName));
+    if (QFileInfo::exists(removed)) {
+        QDirIterator iterator(removed, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden,
+                              QDirIterator::Subdirectories);
+        if (iterator.hasNext()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A journal is usable when its before-image is valid and the operation metadata exists. New journals
+/// also carry after.json, which distinguishes a committed transaction from one that crashed before the
+/// manifest swap. A staged added/removed file still makes an uncommitted journal useful for recovery.
+bool journalCanBeUndone(const QString &projectDir, const QString &journal)
+{
+    QString why;
+    const QString beforePath = QDir(journal).filePath(QLatin1String(BeforeName));
+    if (!PdfSessionManifest::readFrom(beforePath, &why).isValid(&why)
+        || !QFileInfo::exists(QDir(journal).filePath(QLatin1String(OpName)))
+        || !QFileInfo::exists(QDir(journal).filePath(QLatin1String(AddedName)))) {
+        return false;
+    }
+
+    const QString afterPath = QDir(journal).filePath(QLatin1String(AfterName));
+    if (!QFileInfo::exists(afterPath)) {
+        /// A journal from the one-deep format remains undoable.
+        return true;
+    }
+    const PdfSessionManifest after = PdfSessionManifest::readFrom(afterPath, &why);
+    if (!after.isValid(&why)) {
+        return false;
+    }
+    return readFileBytes(PdfSession::manifestPath(projectDir)) != readFileBytes(beforePath)
+        || journalHasRecoveryFiles(projectDir, journal);
+}
+
+QStringList newestUndoHistoryFirst(const QString &projectDir)
+{
+    QStringList names = undoHistoryNames(projectDir);
+    names.sort(Qt::CaseSensitive);
+    std::reverse(names.begin(), names.end());
+    return names;
+}
+
+/// Ensure the active slot is usable, promoting older entries as needed. Invalid or incomplete entries
+/// are discarded without touching the manifest; the next older operation remains available.
+bool ensureUndoJournal(const QString &projectDir)
+{
+    const QString journal = PdfNotebookOps::journalDir(projectDir);
+    if (QFileInfo::exists(journal)) {
+        if (journalCanBeUndone(projectDir, journal)) {
+            return true;
+        }
+        removePath(journal);
+    }
+
+    for (const QString &name : newestUndoHistoryFirst(projectDir)) {
+        const QString source = QDir(undoHistoryDir(projectDir)).filePath(name);
+        if (!QDir().rename(source, journal)) {
+            return false;
+        }
+        if (journalCanBeUndone(projectDir, journal)) {
+            return true;
+        }
+        removePath(journal);
+    }
+    return false;
+}
+
+bool archiveCurrentUndo(const QString &projectDir, QString *archived, QString *why)
+{
+    archived->clear();
+    const QString journal = PdfNotebookOps::journalDir(projectDir);
+    if (!QFileInfo::exists(journal)) {
+        return true;
+    }
+
+    const QString history = undoHistoryDir(projectDir);
+    if (!QDir().mkpath(history)) {
+        fail(why, QStringLiteral("cannot make the notebook's undo history under %1").arg(projectDir));
+        return false;
+    }
+    quint64 highest = 0;
+    for (const QString &name : undoHistoryNames(projectDir)) {
+        bool ok = false;
+        const quint64 value = name.toULongLong(&ok);
+        if (ok) {
+            highest = qMax(highest, value);
+        }
+    }
+    if (highest == std::numeric_limits<quint64>::max()) {
+        fail(why, QStringLiteral("the notebook's undo history has exhausted its sequence numbers"));
+        return false;
+    }
+    const QString name = QString::number(highest + 1).rightJustified(20, QLatin1Char('0'));
+    const QString destination = QDir(history).filePath(name);
+    if (!QDir().rename(journal, destination)) {
+        fail(why, QStringLiteral("cannot preserve the previous notebook undo under %1").arg(destination));
+        return false;
+    }
+    *archived = destination;
+    return true;
+}
+
+void trimUndoHistory(const QString &projectDir)
+{
+    QStringList names = undoHistoryNames(projectDir);
+    names.sort(Qt::CaseSensitive);
+    while (names.size() > MaxUndoDepth - 1) {
+        const QString oldest = QDir(undoHistoryDir(projectDir)).filePath(names.takeFirst());
+        QDir(oldest).removeRecursively();
+    }
+}
+
+struct JournalRotationGuard {
+    QString journal;
+    QString archived;
+    bool keepNewJournal = false;
+
+    ~JournalRotationGuard()
+    {
+        if (keepNewJournal) {
+            return;
+        }
+        removePath(journal);
+        if (!archived.isEmpty() && QFileInfo::exists(archived) && !QFileInfo::exists(journal)) {
+            QDir().rename(archived, journal);
+        }
+    }
+};
+
 /// The journal's before.json is a copy of the manifest file itself, so this does not need the
 /// already-parsed manifest: an undo restores the bytes that were there, including anything a hand
 /// edit put in them that this code does not understand.
@@ -193,10 +370,17 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
     const QDir project(projectDir);
     const QString journal = PdfNotebookOps::journalDir(projectDir);
 
-    /// A new journal replaces the last one. Undo is one change deep by design -- the state a second
-    /// undo would need is exactly what this operation is about to destroy -- and the journal is
-    /// what makes the change atomic and inspectable.
-    QDir(journal).removeRecursively();
+    /// Recover an older entry if a previous undo was interrupted, then rotate the active undo into
+    /// bounded history. The current entry is restored if anything fails before the manifest commit.
+    ensureUndoJournal(projectDir);
+    QString archivedJournal;
+    if (!archiveCurrentUndo(projectDir, &archivedJournal, why)) {
+        return false;
+    }
+    JournalRotationGuard rotation;
+    rotation.journal = journal;
+    rotation.archived = archivedJournal;
+
     if (!QDir().mkpath(journal)) {
         fail(why, QStringLiteral("cannot write the journal under %1").arg(projectDir));
         return false;
@@ -407,10 +591,18 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
         }
     }
 
-    /// Four: the manifest, atomically. This is the commit -- before it the notebook is exactly what
-    /// it was, and after it the change has happened.
+    /// Record the planned after-image before the atomic manifest swap. It lets startup distinguish a
+    /// transaction that reached commit from a crash while files were still being staged.
     PdfSessionManifest after = plan.after;
     after.refreshNextPageNumber();
+    if (!after.writeTo(QDir(journal).filePath(QLatin1String(AfterName)), why)) {
+        putTurnsBack();
+        undoCreatedFiles(projectDir, plan);
+        return false;
+    }
+
+    /// Four: the manifest, atomically. This is the commit -- before it the notebook is exactly what
+    /// it was, and after it the change has happened.
     if (!after.writeTo(PdfSession::manifestPath(projectDir), why)) {
         /// The turned pages go back first: the manifest was not committed, so the notebook has to
         /// be the one it was, artifacts included.
@@ -419,6 +611,8 @@ bool applyPlan(const QString &projectDir, const Plan &plan,
         QDir(journal).removeRecursively();
         return false;
     }
+    rotation.keepNewJournal = true;
+    trimUndoHistory(projectDir);
 
     /// Five, and last: the files the change displaced. They are unreferenced now, so a failure
     /// here costs space and an undo that is only partly reversible -- not a broken notebook.
@@ -478,12 +672,30 @@ QString safeSourceBase(const QString &pdfPath)
 
 /// sources/<sha8>-<name>.pdf, with an ordinal when that name is already taken by other content.
 /// The checksum prefix is what makes two different PDFs with the same file name two files.
-QString sourceRelativeName(const QByteArray &sha256, const QString &base, int ordinal)
+/// The extension a file's own name offers, when it is one a name may carry: letters and digits, up
+/// to five of them. Anything else is nothing, and the caller's own default stands -- a name built
+/// out of whatever a file happened to be called is not a name this project takes.
+QString safeSuffix(const QString &path)
+{
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    if (suffix.isEmpty() || suffix.size() > 5) {
+        return QString();
+    }
+    for (const QChar character : suffix) {
+        if (!character.isLetterOrNumber()) {
+            return QString();
+        }
+    }
+    return suffix;
+}
+
+QString sourceRelativeName(const QByteArray &sha256, const QString &base, const QString &extension,
+                           int ordinal)
 {
     const QString key = QString::fromLatin1(sha256.left(8));
     const QString stem = ordinal <= 1 ? QStringLiteral("%1-%2").arg(key, base)
                                       : QStringLiteral("%1-%2-%3").arg(key, base).arg(ordinal);
-    return QStringLiteral("sources/%1.pdf").arg(stem);
+    return QStringLiteral("sources/%1.%2").arg(stem, extension);
 }
 
 /// A name inside the target for a file arriving from another notebook: the name it already had,
@@ -722,7 +934,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::insertPages(const QString &projectDir, i
         }
 
         const QString base = safeSourceBase(pdfPath);
-        QString relative = sourceRelativeName(sha, base, 1);
+        QString relative = sourceRelativeName(sha, base, QStringLiteral("pdf"), 1);
         /// A name already taken inside the project by different content -- another file whose first
         /// eight hex digits agree, or a file put there by hand. The content is what the manifest
         /// records, so the name gives way, not the source.
@@ -730,7 +942,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::insertPages(const QString &projectDir, i
         int ordinal = 1;
         while (QFileInfo::exists(project.filePath(relative))
                && PdfSessionManifest::sha256OfFile(project.filePath(relative)) != sha) {
-            relative = sourceRelativeName(sha, base, ++ordinal);
+            relative = sourceRelativeName(sha, base, QStringLiteral("pdf"), ++ordinal);
         }
 
         PdfSourceRecord source;
@@ -966,7 +1178,8 @@ PdfNotebookOps::Outcome PdfNotebookOps::extractRange(const QString &projectDir, 
 
 QString PdfNotebookOps::sourceFileNameFor(const QString &pdfPath)
 {
-    return sourceRelativeName(PdfSessionManifest::sha256OfFile(pdfPath), safeSourceBase(pdfPath), 1);
+    return sourceRelativeName(PdfSessionManifest::sha256OfFile(pdfPath), safeSourceBase(pdfPath),
+                              QStringLiteral("pdf"), 1);
 }
 
 PdfNotebookOps::Outcome PdfNotebookOps::rotatePages(const QString &projectDir, int first, int count,
@@ -1184,12 +1397,6 @@ PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, i
         return refused(QStringLiteral("pages %1..%2 are not part of the notebook: it has %3 page(s)")
                            .arg(first + 1).arg(first + count).arg(pages));
     }
-    if (pages - count < 1) {
-        /// A notebook with no pages is not a notebook: the manifest refuses it, and there would be
-        /// nothing to open. Deleting the last one is refused rather than left half done.
-        return refused(QStringLiteral("the notebook's last page cannot be deleted; a notebook needs "
-                                      "at least one page"));
-    }
     if (currentPage < 0 || currentPage >= pages) {
         currentPage = first;
     }
@@ -1223,9 +1430,11 @@ PdfNotebookOps::Outcome PdfNotebookOps::deletePages(const QString &projectDir, i
     const int remaining = pages - count;
     const int remapped = remapAfterDelete(currentPage, first, count);
     outcome.ok = true;
-    /// The page that took the deleted one's place, or the last one when the end was deleted: the
-    /// reader lands on a page that exists, next to where they were.
-    outcome.anchorPage = qBound(0, remapped >= 0 ? remapped : qMin(first, remaining - 1), remaining - 1);
+    /// An empty notebook has no page to anchor to. Otherwise the reader lands on the page that took
+    /// the deleted one's place, or the last one when the end was deleted.
+    outcome.anchorPage = remaining == 0
+        ? -1
+        : qBound(0, remapped >= 0 ? remapped : qMin(first, remaining - 1), remaining - 1);
     outcome.summary = plan.summary;
     return outcome;
 }
@@ -1240,6 +1449,151 @@ int PdfNotebookOps::nextFreePageNumber(const QString &projectDir)
     return manifest.effectiveNextPageNumber();
 }
 
+QSize PdfNotebookOps::pixelSizeAtDpi(const PdfPageRecord &page, int dpi)
+{
+    if (dpi <= 0) {
+        return QSize();
+    }
+
+    const QSizeF display = page.displaySizePt();
+    const qreal width = display.width() * dpi / 72.0;
+    const qreal height = display.height() * dpi / 72.0;
+    if (!qIsFinite(width) || !qIsFinite(height) || width < 1.0 || height < 1.0
+        || width > std::numeric_limits<int>::max() || height > std::numeric_limits<int>::max()) {
+        return QSize();
+    }
+
+    return QSize(qRound(width), qRound(height));
+}
+
+bool PdfNotebookOps::scaleForPixelBounds(const PdfPageRecord &page, const QSize &boundsPx, int dpi,
+                                         qreal *extraScale, QSize *fittedSizePx, QString *why)
+{
+    const auto fail = [why](const QString &message) {
+        if (why) {
+            *why = message;
+        }
+        return false;
+    };
+
+    if (!extraScale || boundsPx.width() < 1 || boundsPx.height() < 1 || dpi < 36 || dpi > 2400) {
+        return fail(QStringLiteral("a pixel resize needs positive width and height, and a DPI "
+                                  "between 36 and 2400"));
+    }
+
+    const QSizeF display = page.displaySizePt();
+    if (!qIsFinite(display.width()) || !qIsFinite(display.height())
+        || display.width() <= 0.0 || display.height() <= 0.0
+        || !qIsFinite(page.extraScale) || page.extraScale <= 0.0) {
+        return fail(QStringLiteral("the page has no usable size to resize"));
+    }
+
+    /// Use the integer pixel size shown in the dialog for the fit ratio. Otherwise a page whose
+    /// default bounds are its rounded current size (e.g. 2479x3508 at 300 DPI) would be changed by a
+    /// fractional point-rounding sliver immediately after opening the resize menu.
+    const QSize currentPixels = pixelSizeAtDpi(page, dpi);
+    if (!currentPixels.isValid()) {
+        return fail(QStringLiteral("the page's pixel size cannot be represented"));
+    }
+
+    const qreal relativeScale = qMin(qreal(boundsPx.width()) / currentPixels.width(),
+                                     qreal(boundsPx.height()) / currentPixels.height());
+    const qreal proposedScale = page.extraScale * relativeScale;
+    constexpr qreal MinUiScale = 0.1;
+    constexpr qreal MaxUiScale = 8.0;
+    const bool unchanged = qFuzzyCompare(proposedScale, page.extraScale);
+    if (!qIsFinite(proposedScale)
+        || (!unchanged && (proposedScale < MinUiScale - 1e-9
+                           || proposedScale > MaxUiScale + 1e-9))) {
+        return fail(QStringLiteral("this pixel size needs a scale of %1%, outside the supported "
+                                   "10%-800% range")
+                        .arg(proposedScale * 100.0, 0, 'f', 1));
+    }
+
+    /// An imported notebook may already carry a scale outside the UI's edit range. A request that
+    /// leaves that existing scale alone is still a valid no-op; only new scale values are bounded.
+    *extraScale = unchanged ? page.extraScale : qBound(MinUiScale, proposedScale, MaxUiScale);
+    if (fittedSizePx) {
+        const qreal width = display.width() * relativeScale * dpi / 72.0;
+        const qreal height = display.height() * relativeScale * dpi / 72.0;
+        if (!qIsFinite(width) || !qIsFinite(height)
+            || width > std::numeric_limits<int>::max() || height > std::numeric_limits<int>::max()) {
+            return fail(QStringLiteral("the fitted pixel size is too large"));
+        }
+        *fittedSizePx = QSize(qBound(1, qRound(width), boundsPx.width()),
+                              qBound(1, qRound(height), boundsPx.height()));
+    }
+    if (why) {
+        why->clear();
+    }
+    return true;
+}
+
+PdfNotebookOps::Outcome PdfNotebookOps::resizePagesToPixelBounds(
+    const QString &projectDir, const QList<int> &pageIndices, const QSize &boundsPx, int dpi,
+    int currentPage, const ArtifactRotator &rotator)
+{
+    PdfSessionManifest before;
+    QString why;
+    if (!loadManifest(projectDir, &before, &why)) {
+        return refused(why);
+    }
+    if (pageIndices.isEmpty()) {
+        return refused(QStringLiteral("choose at least one page to resize"));
+    }
+
+    PageEdits edits;
+    edits.pages = before.pages;
+    edits.sources = before.sources;
+    edits.summary = QStringLiteral("pages were resized to fit within %1x%2 pixels at %3 dpi")
+                        .arg(boundsPx.width()).arg(boundsPx.height()).arg(dpi);
+
+    QList<int> handled;
+    int changed = 0;
+    for (const int index : pageIndices) {
+        if (index < 0 || index >= before.pages.size()) {
+            return refused(QStringLiteral("page %1 is not in the notebook")
+                               .arg(index + 1));
+        }
+        if (handled.contains(index)) {
+            continue;
+        }
+        handled.append(index);
+
+        const PdfPageRecord &beforePage = before.pages.at(index);
+        qreal scale = beforePage.extraScale;
+        QSize fittedSize;
+        if (!scaleForPixelBounds(beforePage, boundsPx, dpi, &scale, &fittedSize, &why)) {
+            return refused(QStringLiteral("page %1: %2").arg(index + 1).arg(why));
+        }
+        if (qFuzzyCompare(scale, beforePage.extraScale)) {
+            continue;
+        }
+
+        edits.pages[index].extraScale = scale;
+        if (!beforePage.thumbFile.isEmpty() && !edits.removeAfter.contains(beforePage.thumbFile)) {
+            edits.removeAfter.append(beforePage.thumbFile);
+        }
+        ++changed;
+    }
+
+    const int anchor = before.pages.isEmpty() ? 0 : qBound(0, currentPage, before.pages.size() - 1);
+    if (changed == 0) {
+        Outcome outcome;
+        outcome.ok = true;
+        outcome.anchorPage = anchor;
+        outcome.summary = QStringLiteral("the selected pages already fit the requested pixel size");
+        return outcome;
+    }
+
+    Outcome outcome = applyPageEdits(projectDir, edits, rotator);
+    if (outcome.ok) {
+        /// Scaling cannot reorder pages, so the reader remains on the same index it was on before.
+        outcome.anchorPage = anchor;
+    }
+    return outcome;
+}
+
 PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir,
                                                        const PageEdits &edits,
                                                        const ArtifactRotator &rotator)
@@ -1250,10 +1604,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
         return refused(why);
     }
 
-    /// The same rules a notebook always has: at least one page, and a PDF to draw them from.
-    if (edits.pages.isEmpty()) {
-        return refused(QStringLiteral("a notebook keeps at least one page"));
-    }
+    /// An empty page list is valid; keep at least one PDF source so the notebook can be repopulated.
     if (edits.sources.isEmpty()) {
         return refused(QStringLiteral("the page list has no PDF to be drawn from"));
     }
@@ -1358,19 +1709,27 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
             continue;
         }
 
+        /// What the file IS, which decides both the reader that will open it and the name it lands
+        /// under: a picture keeps its own extension, so a person looking into the project can tell
+        /// what this notebook draws that page from.
+        const QString kind = k < edits.additionKinds.size() ? edits.additionKinds.at(k) : QString();
+        const QString asked = kind == QStringLiteral("image") ? safeSuffix(pdfPath) : QString();
+        const QString suffix = asked.isEmpty() ? QStringLiteral("pdf") : asked;
+
         const QString base = safeSourceBase(pdfPath);
-        QString relative = sourceRelativeName(sha, base, 1);
+        QString relative = sourceRelativeName(sha, base, suffix, 1);
         const QDir project(projectDir);
         int ordinal = 1;
         while (QFileInfo::exists(project.filePath(relative))
                && PdfSessionManifest::sha256OfFile(project.filePath(relative)) != sha) {
-            relative = sourceRelativeName(sha, base, ++ordinal);
+            relative = sourceRelativeName(sha, base, suffix, ++ordinal);
         }
 
         PdfSourceRecord source;
         source.file = relative;
         source.sha256 = sha;
         source.byteSize = QFileInfo(pdfPath).size();
+        source.kind = kind;
         additionLandedAt.insert(k, plan.after.sources.size());
         plan.after.sources.append(source);
 
@@ -1511,7 +1870,7 @@ PdfNotebookOps::Outcome PdfNotebookOps::applyPageEdits(const QString &projectDir
     }
 
     outcome.ok = true;
-    outcome.anchorPage = 0;
+    outcome.anchorPage = plan.after.pages.isEmpty() ? -1 : 0;
     outcome.summary = edits.summary.isEmpty() ? QStringLiteral("the notebook's pages were changed")
                                               : edits.summary;
     return outcome;
@@ -1522,13 +1881,14 @@ bool PdfNotebookOps::canUndo(const QString &projectDir)
     if (projectDir.isEmpty()) {
         return false;
     }
-    QString why;
-    return PdfSessionManifest::readFrom(
-               QDir(journalDir(projectDir)).filePath(QLatin1String(BeforeName)), &why).isValid(&why);
+    return ensureUndoJournal(projectDir);
 }
 
 PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
 {
+    if (!canUndo(projectDir)) {
+        return refused(QStringLiteral("there is no notebook change to undo"));
+    }
     const QDir project(projectDir);
     const QString journal = journalDir(projectDir);
 
@@ -1560,6 +1920,14 @@ PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
 
     /// Two: the files the change moved aside go back. Before the manifest, always: a crash between
     /// the two leaves files nothing references rather than a manifest naming files in the journal.
+    const auto isSavedPreview = [&before](const QString &relative) {
+        for (const PdfPageRecord &page : before.pages) {
+            if (page.thumbFile == relative) {
+                return true;
+            }
+        }
+        return false;
+    };
     const QString removedRoot = QDir(journal).filePath(QLatin1String(RemovedDirName));
     const QDir removed(removedRoot);
     if (removed.exists()) {
@@ -1574,6 +1942,15 @@ PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
             if (!QDir().mkpath(QFileInfo(destination).absolutePath())) {
                 return refused(QStringLiteral("cannot put %1 back").arg(relative));
             }
+            /// A newly rendered preview may already occupy the stable thumbnail name. It is a
+            /// derived cache, so discard it before restoring the previous preview from the journal;
+            /// a collision for any non-preview file still fails closed below.
+            if (isSavedPreview(relative) && QFileInfo::exists(destination)) {
+                removePath(destination);
+                if (QFileInfo::exists(destination)) {
+                    return refused(QStringLiteral("cannot replace regenerated preview %1").arg(relative));
+                }
+            }
             if (!QDir().rename(file.absoluteFilePath(), destination)) {
                 return refused(QStringLiteral("cannot put %1 back").arg(relative));
             }
@@ -1586,10 +1963,11 @@ PdfNotebookOps::Outcome PdfNotebookOps::undoLast(const QString &projectDir)
     }
 
     QDir(journal).removeRecursively();
+    ensureUndoJournal(projectDir);
 
     Outcome outcome;
     outcome.ok = true;
-    outcome.anchorPage = qBound(0, anchor, before.pages.size() - 1);
+    outcome.anchorPage = before.pages.isEmpty() ? -1 : qBound(0, anchor, before.pages.size() - 1);
     outcome.summary = QStringLiteral("the last notebook change was undone");
     return outcome;
 }
