@@ -17,8 +17,6 @@ jobs:
       KDECI_GITLAB_SERVER: https://invent.kde.org/
       KDECI_PACKAGE_PROJECT: teams/ci-artifacts/krita-windows
       KDECI_REPO_METADATA_PATH: ${{ github.workspace }}\krita-deps-management\repo-metadata
-      KDECI_CACHE_PATH: ${{ runner.temp }}\krita-deps-cache
-      KDECI_CC_CACHE: ${{ runner.temp }}\krita-ccache
       KDECI_COMPRESS_PACKAGES_ON_DOWNLOAD: 'False'
       KDECI_BUILD_TYPE: Release
       KDECI_EXTRA_CMAKE_ARGS: '-DHIDE_SAFE_ASSERTS=OFF -DBUILD_TESTING=OFF -DBRANDING=NotJustNote'
@@ -69,6 +67,9 @@ jobs:
             -s branch-corrected-deps.yml -o .kde-ci.yml
 
       - name: Build Not Just Note with KDE's public Windows dependencies
+        env:
+          KDECI_CACHE_PATH: ${{ runner.temp }}\krita-deps-cache
+          KDECI_CC_CACHE: ${{ runner.temp }}\krita-ccache
         shell: pwsh
         run: |
           python -u krita-deps-management/ci-utilities/run-ci-build.py `
