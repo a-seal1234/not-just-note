@@ -1,0 +1,7 @@
+<!DOCTYPE RCC>
+<!-- SPDX-License-Identifier: CC0-1.0 -->
+<RCC version="1.0">
+    <qresource>
+        <file alias="krita-branding.svgz">sc-apps-not-just-note.svgz</file>
+    </qresource>
+</RCC>

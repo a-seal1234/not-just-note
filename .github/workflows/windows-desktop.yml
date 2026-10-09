@@ -1,0 +1,83 @@
+name: Windows desktop package
+
+"on":
+  workflow_dispatch:
+  push:
+    tags:
+      - '0.*-rc*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    # Krita's Windows dependency set and build need a provisioned runner with
+    # ample disk space; GitHub-hosted standard runners do not provide KDE's
+    # Windows toolchain. Configure a private self-hosted runner with this label.
+    runs-on: [self-hosted, Windows, X64, njn-krita-build]
+    timeout-minutes: 360
+    env:
+      KDECI_GITLAB_SERVER: https://invent.kde.org/
+      KDECI_PACKAGE_PROJECT: teams/ci-artifacts/krita-windows
+      KDECI_REPO_METADATA_PATH: ${{ github.workspace }}\krita-deps-management\repo-metadata
+      KDECI_CACHE_PATH: ${{ runner.temp }}\krita-deps-cache
+      KDECI_CC_CACHE: ${{ runner.temp }}\krita-ccache
+      KDECI_COMPRESS_PACKAGES_ON_DOWNLOAD: 'False'
+      KDECI_BUILD_TYPE: Release
+      KDECI_EXTRA_CMAKE_ARGS: '-DHIDE_SAFE_ASSERTS=OFF -DBUILD_TESTING=OFF -DBRANDING=NotJustNote'
+      KRITACI_SKIP_DEBUG_PACKAGE: 'True'
+      KRITACI_BUILD_INSTALLERS: 'False'
+      KRITACI_RELEASE_PACKAGE_NAMING: 'True'
+      KRITACI_SKIP_UPLOAD_NIGHTLY_PACKAGE: 'True'
+      PYTHONUTF8: '1'
+      CI_PROJECT_NAME: krita
+      CI_COMMIT_REF_NAME: ${{ github.ref_name }}
+      CI_COMMIT_SHORT_SHA: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Fetch public KDE build helpers
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch master https://invent.kde.org/packaging/krita-deps-management.git
+          git clone --depth 1 https://invent.kde.org/packaging/krita-ci-utilities.git krita-deps-management/ci-utilities
+          python -m pip install --upgrade pip
+          python -m pip install -r krita-deps-management/requirements.txt
+          python -m pip install -r krita-deps-management/ci-utilities/requirements-windows.txt
+
+      - name: Prepare KDE dependency manifest
+        shell: pwsh
+        run: |
+          python krita-deps-management/tools/replace-branch-in-seed-file.py `
+            krita-deps-management/latest/krita-deps.yml -p `
+            -o branch-corrected-deps.yml -d master
+          python krita-deps-management/tools/generate-deps-file.py `
+            -s branch-corrected-deps.yml -o .kde-ci.yml
+
+      - name: Build Not Just Note with KDE's public Windows dependencies
+        shell: pwsh
+        run: |
+          python -u krita-deps-management/ci-utilities/run-ci-build.py `
+            --project krita --branch $env:GITHUB_REF_NAME `
+            --platform Windows/Qt5/Shared --skip-publishing
+
+      - name: Package Windows build
+        shell: pwsh
+        run: |
+          python -u build-tools/ci-scripts/build-windows-package.py `
+            --skip-debug-package --release-package-naming
+          $package = Get-ChildItem -File 'krita-x64-*.zip' | Select-Object -First 1
+          if (-not $package) { throw 'The Windows packaging step did not produce a ZIP.' }
+          Move-Item $package.FullName 'not-just-note-windows-x64-0.1.7-rc1.zip'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: not-just-note-windows-0.1.7-rc1
+          path: not-just-note-windows-x64-0.1.7-rc1.zip
+          if-no-files-found: error
+          retention-days: 30

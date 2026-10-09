@@ -240,7 +240,7 @@ android {
      * branch
      */
     // Increment this with the patch number in versionName for each revision; keep rc1 fixed.
-    def versionRelease  = 7
+    def versionRelease  = 8
 
     defaultConfig {
         applicationId "com.njn"
@@ -256,7 +256,7 @@ android {
         targetSdkVersion 36
         minSdkVersion 24
         versionCode project.ext.constant * 1000000 + versionMajor * 10000 + versionMinor * 100 + versionRelease
-        versionName "0.1.6-rc1"
+        versionName "0.1.7-rc1"
         def unstableSuffix = System.getenv('KRITA_UNSTABLE_PACKAGE_SUFFIX') ?: ''
         archivesBaseName = System.getenv('KRITA_BUILD_APPBUNDLE') ? "not-just-note-$versionName$unstableSuffix" : "not-just-note-$abi-$versionName$unstableSuffix"
     }

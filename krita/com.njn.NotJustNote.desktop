@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Not Just Note
+GenericName=Notes and PDF Annotation
+Comment=Write, draw, annotate and focus
+Exec=krita %F
+Icon=not-just-note
+Type=Application
+Terminal=false
+Categories=Qt;KDE;Graphics;2DGraphics;RasterGraphics;
+MimeType=application/x-krita;image/openraster;application/x-krita-paintoppreset;
+StartupWMClass=krita
+X-KDE-NativeMimeType=application/x-krita

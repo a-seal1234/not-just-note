@@ -19,6 +19,7 @@
 #include <QByteArray>
 #include <QDate>
 #include <QDir>
+#include <QIcon>
 #include <QLibraryInfo>
 #include <QLocale>
 #include <QMessageBox>
@@ -727,16 +728,20 @@ if (!qEnvironmentVariableIsEmpty("KRITA_OPENGL_DEBUG")) {
     /// Initialize application info, it will be used by both, Qt and
     /// DrKonqi of the host system
     KAboutData aboutData("krita",
-                            i18n("Krita"),
+                            i18n("Not Just Note"),
                             KritaVersionWrapper::versionString(true),
-                            i18n("Krita is the full-featured digital art studio"),
+                            i18n("Write, draw, annotate and focus"),
                             KAboutLicense::GPL,
-                            i18nc("@info:credit", "© 1999–2026 The Krita Developers"));
-    aboutData.setHomepage(QStringLiteral("https://krita.org"));
+                            i18nc("@info:credit", "Based on work by the Krita Developers; maintained by Not Just Note contributors"));
+    aboutData.setHomepage(QStringLiteral("https://github.com/a-seal1234/not-just-note"));
     aboutData.setOrganizationDomain("krita.org");
+    const QIcon productIcon = QIcon::fromTheme("not-just-note", QIcon(":/krita-branding.svgz"));
+    aboutData.setProgramLogo(productIcon);
 
     // this call sets corresponding fields of QApplication as well
     KAboutData::setApplicationData(aboutData);
+    app.setApplicationDisplayName(aboutData.displayName());
+    app.setWindowIcon(productIcon);
 
     // Note: Qt docs suggest we set organization name, but if we do, we get resource
     // paths of the form of krita/krita, which is weird.

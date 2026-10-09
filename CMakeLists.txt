@@ -131,18 +131,24 @@ endif()
 #######################
 ######################
 if (BUILD_WITH_QT6)
-set(KRITA_VERSION_STRING "0.1.0-rc1")
+set(KRITA_VERSION_STRING "0.1.7-rc1")
 set(KRITA_STABLE_VERSION_MAJOR 6)
 set(KRITA_STABLE_VERSION_MINOR 1)
 else()
 # define common versions of Krita applications, used to generate kritaversion.h
 # update these version for every release:
-set(KRITA_VERSION_STRING "0.1.0-rc1")
+set(KRITA_VERSION_STRING "0.1.7-rc1")
 # Major version: 3 for 3.x, 4 for 4.x, etc.
 set(KRITA_STABLE_VERSION_MAJOR 5)
 # Minor version: 0 for 4.0, 1 for 4.1, etc.
 set(KRITA_STABLE_VERSION_MINOR 4)
 endif()
+
+# Keep product version numbers separate from Krita's library ABI version.
+set(NOTJUSTNOTE_VERSION_MAJOR 0)
+set(NOTJUSTNOTE_VERSION_MINOR 1)
+set(NOTJUSTNOTE_VERSION_PATCH 7)
+set(NOTJUSTNOTE_VERSION_RC 1)
 
 # Bugfix release version, or 0 for before the first stable release
 set(KRITA_VERSION_RELEASE 0)
@@ -163,9 +169,9 @@ math(EXPR KRITA_MSI_VERSION_RELEASE_TRANSITIONAL "10000 + 100 * ${KRITA_VERSION_
 # Uncomment the following if this is currently in the "stable" branch.
 # Do not uncomment for master branch.
 #set(KRITA_STABLE_BRANCH 1)
-set(KRITA_ALPHA 1) # uncomment only for Alpha
+# This fork is producing a release candidate, not an Alpha build.
+set(KRITA_RC 1)
 #set(KRITA_BETA 1) # uncomment only for Beta
-#set(KRITA_RC 1) # uncomment only for RC
 
 if(NOT DEFINED KRITA_ALPHA AND NOT DEFINED KRITA_BETA AND NOT DEFINED KRITA_RC)
     set(KRITA_STABLE 1) # do not edit
@@ -380,19 +386,14 @@ if(BUILD_WITH_QT6 AND NOT "QT6" IN_LIST ALLOW_UNSTABLE)
     )
 endif()
 
-# Branding. Available options: default, Beta, Plus, Next. Can be set from command line
+# Branding. Upstream channels remain available as explicit overrides, but this fork
+# uses its own product identity by default.
 if ("${BRANDING}" STREQUAL "")
-    if (DEFINED KRITA_STABLE)
+    if (APPLE)
         set(BRANDING "default")
-    elseif (DEFINED KRITA_BETA OR DEFINED KRITA_RC)
-        set(BRANDING "Beta")
-    elseif (DEFINED KRITA_STABLE_BRANCH)
-        # Alpha/pre-alpha in stable branch
-        set(BRANDING "Plus")
-    else ()
-        # Alpha/pre-alpha in master branch or other experiments
-        set(BRANDING "Next")
-    endif ()
+    else()
+        set(BRANDING "NotJustNote")
+    endif()
 endif()
 
 # Qt6 isn't stable, don't make it look like it is.

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.njn.NotJustNote</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Not Just Note</name>
+  <summary>Write, draw, annotate and focus</summary>
+  <developer_name>Not Just Note contributors</developer_name>
+  <description>
+    <p>Not Just Note is an independently maintained Krita-based workspace for handwritten notes, drawing and PDF annotation.</p>
+    <p>The current release candidate targets Android tablets. Linux and Windows remain source build targets; desktop packages are experimental and have not received the same device and packaging validation.</p>
+  </description>
+  <launchable type="desktop-id">com.njn.NotJustNote.desktop</launchable>
+  <provides>
+    <binary>krita</binary>
+  </provides>
+  <url type="homepage">https://github.com/a-seal1234/not-just-note</url>
+  <url type="bugtracker">https://github.com/a-seal1234/not-just-note/issues</url>
+  <releases>
+    <release version="0.1.7-rc1" date="2026-10-09" type="development" />
+  </releases>
+</component>

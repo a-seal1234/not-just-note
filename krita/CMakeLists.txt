@@ -4,6 +4,12 @@ add_subdirectory( integration )
 # Install the application icons following the freedesktop icon theme spec
 add_subdirectory( "pics/branding/${BRANDING}" )
 
+if (BRANDING STREQUAL "NotJustNote")
+    set(BRANDING_ICON_NAME "not-just-note")
+else()
+    set(BRANDING_ICON_NAME "krita")
+endif()
+
 if (ANDROID)
     if (QT_MAJOR_VERSION STREQUAL "5")
         set (QtAndroidExtras_INCLUDE_DIRS ${Qt5AndroidExtras_INCLUDE_DIRS})
@@ -15,7 +21,7 @@ set(krita_SRCS main.cc)
 
 # Set the application icon on the application
 if (NOT APPLE)
-	file(GLOB ICON_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/*-apps-krita.png")
+	file(GLOB ICON_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/*-apps-${BRANDING_ICON_NAME}.png")
 else()
     # XCode below 26 cannot work with .icon format
     if(${XCODE_VERSION} VERSION_GREATER_EQUAL "26.0")
@@ -39,13 +45,13 @@ else()
         )
     else()
         set(ICON_SRCS
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/16-apps-krita.png"
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/32-apps-krita.png"
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/48-apps-krita.png"
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/128-apps-krita.png"
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/256-apps-krita.png"
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/512-apps-krita.png"
-             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/1024-apps-krita.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/16-apps-${BRANDING_ICON_NAME}.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/32-apps-${BRANDING_ICON_NAME}.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/48-apps-${BRANDING_ICON_NAME}.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/128-apps-${BRANDING_ICON_NAME}.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/256-apps-${BRANDING_ICON_NAME}.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/512-apps-${BRANDING_ICON_NAME}.png"
+             "${CMAKE_CURRENT_SOURCE_DIR}/pics/branding/${BRANDING}/1024-apps-${BRANDING_ICON_NAME}.png"
         )
     endif() # XCode version
 endif()
@@ -279,7 +285,11 @@ if(APPLE)
 else()
     install(TARGETS krita ${INSTALL_TARGETS_DEFAULT_ARGS})
 endif()
-install(FILES org.kde.krita.desktop DESTINATION ${KDE_INSTALL_APPDIR})
+if (BRANDING STREQUAL "NotJustNote" AND NOT ANDROID)
+    install(FILES com.njn.NotJustNote.desktop DESTINATION ${KDE_INSTALL_APPDIR})
+else()
+    install(FILES org.kde.krita.desktop DESTINATION ${KDE_INSTALL_APPDIR})
+endif()
 
 set(actions_files krita.action kritamenu.action)
 if (ANDROID)
@@ -290,7 +300,11 @@ if (ANDROID)
 endif()
 install(FILES ${actions_files} DESTINATION ${KDE_INSTALL_DATADIR}/krita/actions)
 
-install(FILES  org.kde.krita.appdata.xml DESTINATION ${KDE_INSTALL_METAINFODIR} )
+if (BRANDING STREQUAL "NotJustNote" AND NOT ANDROID)
+    install(FILES com.njn.NotJustNote.metainfo.xml DESTINATION ${KDE_INSTALL_METAINFODIR})
+else()
+    install(FILES org.kde.krita.appdata.xml DESTINATION ${KDE_INSTALL_METAINFODIR})
+endif()
 
 install(DIRECTORY DESTINATION ${KDE_INSTALL_DATADIR}/krita/shortcuts)
 
