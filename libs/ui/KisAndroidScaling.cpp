@@ -3,7 +3,6 @@
  */
 #include "KisAndroidScaling.h"
 
-#include <KisAndroidDonations.h>
 #include <KisAndroidUtils.h>
 #include <KisApplication.h>
 #include <kis_config.h>
@@ -60,15 +59,6 @@ KisAndroidScaling::KisAndroidScaling(KisConfig &cfg, KisApplication *app)
             &KisAndroidScaling::slotJniScalingDialogActive,
             Qt::QueuedConnection);
 
-    KisAndroidDonations *androidDonations = app->androidDonations();
-    KIS_SAFE_ASSERT_RECOVER_NOOP(androidDonations);
-    if (androidDonations) {
-        connect(androidDonations,
-                &KisAndroidDonations::sigSplashDialogDismissed,
-                this,
-                &KisAndroidScaling::slotSplashDialogDismissed,
-                Qt::QueuedConnection);
-    }
 }
 
 KisAndroidScaling *KisAndroidScaling::instance()
@@ -79,11 +69,6 @@ KisAndroidScaling *KisAndroidScaling::instance()
     } else {
         return nullptr;
     }
-}
-
-void KisAndroidScaling::slotSplashDialogDismissed()
-{
-    maybeShowDialog(true);
 }
 
 void KisAndroidScaling::slotJniSetPrimaryScreenScale(qreal scale)

@@ -13,7 +13,9 @@
 #include "ui_wdgsplash.h"
 
 class QPixmap;
+#ifndef Q_OS_ANDROID
 class QSvgWidget;
+#endif
 
 #include "kritaui_export.h"
 
@@ -56,10 +58,14 @@ private:
     QTimer m_timer;
     bool m_themed;
     bool m_displayLinks { false };
+#ifndef Q_OS_ANDROID
     QSvgWidget *m_brandingSvg;
     QSvgWidget *m_bannerSvg;
+#endif
     QLabel *m_loadingTextLabel;
+#ifndef Q_OS_ANDROID
     QLabel *m_artCreditsLabel;
+#endif
     QString m_versionHtml;
 };
 

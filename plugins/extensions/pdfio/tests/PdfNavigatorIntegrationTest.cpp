@@ -547,34 +547,24 @@ void PdfNavigatorIntegrationTest::cleanupTestCase()
     /// PARKED: the main window and its views are deliberately NOT torn down here, and main() exits
     /// the process without letting their destructors run at all.
     ///
-    /// The chain of Krita teardown defects this suite kept finding, in the order it was found:
-    ///   1. KoCanvasResourceProvider::hasDerivedResourceConverter(this=0) under
-    ///      KoToolManager::Private::disconnectActiveTool -- guarded in KoToolManager.cpp.
-    ///   2. KisViewManager::canvasResourceProvider(this=0) under KisToolPaint::tryRestoreOpacitySnapshot
-    ///      -- guarded in kis_tool_paint.cc, and reachable from the product, not only from a test.
-    ///   3. A use-after-free in KisMainWindow::dockWidgets() from a canvas controller unset after the
-    ///      window was half destroyed: fixed here by unsetting the controllers while the window was
-    ///      still alive (that abort is gone).
-    ///   4. Two more null converter paths behind it (canvasState, syncOnImageSizeChange) -- the
-    ///      second reachable from the product: KisView.cpp calls it whenever the image's size changes.
-    ///   5. What is left is a USE-AFTER-FREE, not a null: KoToolProxy::requestStrokeEnd at
-    ///      KoToolProxy.cpp:569, reached from a Qt signal/slot during teardown, faulting on a
-    ///      non-zero address. A dangling tool proxy on the way out; the tool proxy is Krita's, the
-    ///      suite never touches it, and a test harness cannot order a fix for it.
+    /// Earlier teardown investigation fixed several null/use-after-free paths. The active-tool
+    /// reference in KoToolProxy is now QPointer-backed and the manager unregisters destroyed proxies.
+    /// The current opt-in normal-teardown run still SIGSEGVs after the suite: gdb points to
+    /// KisDocument::~KisDocument -> KisImage::waitForDone -> KisBusyWaitBroker::notifyWaitOnImageStarted
+    /// (QObject::thread on the image). This is the active task-24 failure; keep the default _exit
+    /// below while the reproducer and fix are developed.
     ///
     /// Both obvious ways out were tried and both bite: deleting the window walks the chain above,
     /// and leaving the window and the views to static destruction is the segfault on the way out of
     /// the process this comment used to record. So the third way is taken -- the process ends BEFORE
     /// that teardown runs, in main(), after QTest has printed its summary and with an exit status
-    /// derived from its result. Recorded as its own defect task: four core guards landed, this fifth
-    /// is Krita's, and the teardown chain is Krita's to fix.
+    /// derived from its result. The default path keeps this broad plugin suite stable; the opt-in
+    /// PDFIO_TEST_NORMAL_TEARDOWN mode exercises application shutdown and currently reproduces the
+    /// task-24 SIGSEGV in KisBusyWaitBroker during KisDocument/KisImage destruction.
     ///
-    /// WHAT THIS LEAVES UNCOVERED, named rather than hidden: nothing about the plugin is untested --
-    /// every notebook, document, page turn, roll, budget, naming and preview assertion still runs.
-    /// What is no longer exercised is the APPLICATION's teardown: KisMainWindow destruction with a
-    /// notebook open, the view's own close path inside that destruction, and Krita's document/view
-    /// cleanup on exit. Those are Krita's code, they are covered by Krita's own ui tests, and they
-    /// are exactly where the five defects above live.
+    /// WHAT THE DEFAULT MODE LEAVES UNCOVERED: application teardown (KisMainWindow destruction with
+    /// a notebook open, view close, and Krita document/view cleanup). The normal-teardown mode now
+    /// reaches that path for diagnosis, but is expected to fail until task-24 is fixed.
     if (m_dialogWatchdog) {
         m_dialogWatchdog->stop();
     }
@@ -6248,16 +6238,18 @@ int main(int argc, char *argv[])
     PdfNavigatorIntegrationTest test;
     const int failed = QTest::qExec(&test, argc, argv);
 
-    /// And OUT of the process from here, deliberately, without returning through the static
-    /// destructors: the application's teardown is Krita's and it is unsound (see the park in
-    /// cleanupTestCase() for the five defects, the last of them a use-after-free in KoToolProxy), so
-    /// the window and the views this suite built are left standing and the process ends now.
+    /// Preserve the safe default: exit without Krita static destructors. Set
+    /// PDFIO_TEST_NORMAL_TEARDOWN=1 to exercise normal teardown; that mode currently reproduces
+    /// a SIGSEGV and is reserved for task-24 diagnosis.
     ///
     /// QTest has already printed its summary and failed holds how many tests failed, so the exit
     /// status still means what it always meant -- a red suite stays red. The buffers are flushed by
     /// hand because _exit() does not do it, and ctest reads the summary from those streams.
-    std::fflush(nullptr);
-    ::_exit(failed == 0 ? 0 : 1);
+    if (!qEnvironmentVariableIsSet("PDFIO_TEST_NORMAL_TEARDOWN")) {
+        std::fflush(nullptr);
+        ::_exit(failed == 0 ? 0 : 1);
+    }
+    return failed;
 }
 
 

@@ -108,6 +108,9 @@ public:
      */
     bool prepareForNotebookChange(QString *why = nullptr);
 
+    /// Records a committed manifest/operation change so the next complete save can snapshot it.
+    void noteNotebookChangedOnDisk();
+
     /**
      * Re-reads the notebook from disk -- after something changed its manifest -- and opens
      * \a anchorPage (clamped to the pages that exist) in a fresh document and view.
@@ -589,6 +592,7 @@ private:
     /// what a stroke means. All of a strip's pages rather than the active one: which page a
     /// stroke belongs to is decided at save time by the rectangle, not at stroke time.
     void markOpenPagesDirty();
+    void maybeCreateDailyBackup(const QString &projectDir);
 
     /// The idle half of the pipeline: once the ink has been quiet for a beat, writes whatever is
     /// marked unsaved, so a page turn is never the first thing to find out what was never saved.
@@ -728,6 +732,8 @@ private:
     /// event loop, and the follow timer keeps firing inside it: without this a page turn could run
     /// in the middle of the save that is cropping the very layer it would move.
     bool m_savingPages = false;
+    /// Set by ink or manifest changes and cleared only after a daily snapshot exists.
+    QString m_backupPendingProjectDir;
 
     /// The document the fit zoom has already been applied to. Fitting again on every page turn is
     /// what made the page under the centre jump around: the zoom changed, the centre moved with it,

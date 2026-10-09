@@ -46,6 +46,16 @@ KoToolProxyPrivate::KoToolProxyPrivate(KoToolProxy *p)
     scrollTimer.setInterval(100);
 }
 
+void KoToolProxyPrivate::setActiveTool(KoToolBase *tool)
+{
+    if (activeTool) {
+        QObject::disconnect(activeTool, SIGNAL(selectionChanged(bool)), parent, SLOT(selectionChanged(bool)));
+        toolPriorityShortcuts.clear();
+    }
+
+    activeTool = tool;
+}
+
 void KoToolProxyPrivate::timeout() // Auto scroll the canvas
 {
     Q_ASSERT(controller);
@@ -127,6 +137,9 @@ KoToolProxy::KoToolProxy(KoCanvasBase *canvas, QObject *parent)
 
 KoToolProxy::~KoToolProxy()
 {
+    d->scrollTimer.stop();
+    d->setActiveTool(nullptr);
+    KoToolManager::instance()->priv()->unregisterToolProxy(this);
     delete d;
 }
 
@@ -383,12 +396,7 @@ KisPopupWidgetInterface* KoToolProxy::popupWidget()
 
 void KoToolProxy::setActiveTool(KoToolBase *tool)
 {
-    if (d->activeTool) {
-        disconnect(d->activeTool, SIGNAL(selectionChanged(bool)), this, SLOT(selectionChanged(bool)));
-        d->toolPriorityShortcuts.clear();
-    }
-
-    d->activeTool = tool;
+    d->setActiveTool(tool);
 
     if (tool) {
         KisKActionCollection *collection = d->controller->actionCollection();
@@ -565,6 +573,7 @@ void KoToolProxy::requestStrokeCancellation()
 
 void KoToolProxy::requestStrokeEnd()
 {
+    // Tool destruction clears the QPointer, so a late stroke-end request is ignored safely.
     if (d->activeTool) {
         d->activeTool->requestStrokeEnd();
     }

@@ -240,6 +240,8 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfNotebookResizeDialog.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfPageNavigator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../PdfPageStripDecoration.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookBackup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookBundle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfInkLoader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageRotator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfPageSaver.cpp
@@ -330,6 +332,35 @@ if (Poppler_Qt${QT_MAJOR_VERSION}_FOUND)
 
     add_test(NAME pdfio-PdfNotebookBundleTest COMMAND PdfNotebookBundleTest)
     set_tests_properties(pdfio-PdfNotebookBundleTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Backups share the bundle format but add daily retention, separate restore, and a conservative
+    # artifact collector. Keep those filesystem decisions in a small, headless test target.
+    add_executable(PdfNotebookBackupTest
+        PdfNotebookBackupTest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../backends/poppler/PopplerRenderBackend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookBackup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfNotebookBundle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSession.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../session/PdfSessionManifest.cpp
+        )
+
+    target_include_directories(PdfNotebookBackupTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+    target_link_libraries(PdfNotebookBackupTest PRIVATE
+        Qt${QT_MAJOR_VERSION}::Core
+        Qt${QT_MAJOR_VERSION}::Gui
+        Qt${QT_MAJOR_VERSION}::Test
+        Poppler::Qt${QT_MAJOR_VERSION}
+        KF${KF_MAJOR}::Archive)
+
+    target_compile_definitions(PdfNotebookBackupTest PRIVATE PDFIO_HAVE_POPPLER)
+
+    set_target_properties(PdfNotebookBackupTest PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+    add_test(NAME pdfio-PdfNotebookBackupTest COMMAND PdfNotebookBackupTest)
+    set_tests_properties(pdfio-PdfNotebookBackupTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # The scroll-follow bug, as a state machine over real strip geometry. checkScrollFollow() is a

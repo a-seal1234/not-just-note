@@ -32,6 +32,14 @@ public:
         maybeShowDialog(false);
     }
 
+    void showOnStartup()
+    {
+        if (!m_startupDialogConsidered) {
+            m_startupDialogConsidered = true;
+            maybeShowDialog(true);
+        }
+    }
+
 Q_SIGNALS:
     void sigInterfaceScaleChanged();
     void sigJniSetPrimaryScreenScale(qreal scale);
@@ -39,7 +47,6 @@ Q_SIGNALS:
     void sigJniScalingDialogActive(bool active);
 
 private Q_SLOTS:
-    void slotSplashDialogDismissed();
     void slotJniSetPrimaryScreenScale(qreal scale);
     void slotJniSaveInterfaceScale(bool askOnStartup);
     void slotJniScalingDialogActive(bool active);
@@ -56,6 +63,7 @@ private:
     QPointer<QScreen> m_initialPrimaryScreen;
     qreal m_initialPrimaryScreenDevicePixelRatio = 0.0;
     bool m_scalingDialogActive = false;
+    bool m_startupDialogConsidered = false;
 };
 
 namespace KisAndroidScalingDialog

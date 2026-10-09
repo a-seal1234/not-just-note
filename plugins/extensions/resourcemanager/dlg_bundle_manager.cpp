@@ -37,10 +37,6 @@
 #include <KisMainWindow.h>
 #include <KisPart.h>
 
-#ifdef Q_OS_ANDROID
-#include <KisSupporterBundlesDialog.h>
-#endif
-
 DlgBundleManager::ItemDelegate::ItemDelegate(QObject *parent, KisStorageFilterProxyModel* proxy)
     : QStyledItemDelegate(parent)
     , m_bundleManagerProxyModel(proxy)
@@ -155,12 +151,6 @@ DlgBundleManager::DlgBundleManager(QWidget *parent)
     m_ui->bnEdit->setIcon(KisIconUtils::loadIcon("document-new"));
     m_ui->bnEdit->setText(i18nc("In bundle manager; press button to edit existing bundle", "Edit Bundle"));
     connect(m_ui->bnEdit, SIGNAL(clicked(bool)), SLOT(editBundle()));
-
-#ifdef Q_OS_ANDROID
-    connect(m_ui->bnSupport, &QPushButton::clicked, this, &DlgBundleManager::slotShowSupporterBundlesDialog);
-#else
-    m_ui->bnSupport->hide();
-#endif
 
     setButtons(Close);
 
@@ -328,14 +318,6 @@ void DlgBundleManager::editBundle()
     }
 }
 
-#ifdef Q_OS_ANDROID
-void DlgBundleManager::slotShowSupporterBundlesDialog()
-{
-    QScopedPointer<KisSupporterBundlesDialog> dlg(new KisSupporterBundlesDialog(this));
-    dlg->exec();
-}
-#endif
-
 void DlgBundleManager::toggleBundle()
 {
     QModelIndex idx = m_ui->listView->currentIndex();
@@ -469,5 +451,4 @@ void DlgBundleManager::updateBundleInformation(QModelIndex idx)
     m_ui->lblPreview->setPixmap(QPixmap::fromImage(thumbnail));
     m_ui->lblType->setText(KisResourceStorage::storageTypeToString(storage->type()));
 }
-
 

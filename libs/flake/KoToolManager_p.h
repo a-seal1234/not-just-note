@@ -70,6 +70,7 @@ public:
      *        the proxy gets an update.
      */
     void registerToolProxy(KoToolProxy *proxy, KoCanvasBase *canvas);
+    void unregisterToolProxy(KoToolProxy *proxy);
 
     KoToolManager *q;
 

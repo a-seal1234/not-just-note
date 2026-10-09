@@ -912,5 +912,16 @@ void KoToolManager::Private::registerToolProxy(KoToolProxy *proxy, KoCanvasBase 
     }
 }
 
+void KoToolManager::Private::unregisterToolProxy(KoToolProxy *proxy)
+{
+    for (auto it = proxies.begin(); it != proxies.end(); ) {
+        if (it.value() == proxy) {
+            it = proxies.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 //have to include this because of Q_PRIVATE_SLOT
 #include "moc_KoToolManager.cpp"

@@ -19,10 +19,6 @@
 #include "KisMacosEntitlements.h"
 #endif
 
-#ifdef Q_OS_ANDROID
-#include "KisAndroidDonations.h"
-#endif
-
 #include <QStandardPaths>
 #include <QScreen>
 #include <QDir>
@@ -195,7 +191,6 @@ public:
     QVector<QString> earlyFileOpenEvents;
     QScopedPointer<KisExtendedModifiersMapperPluginInterface> extendedModifiersPluginInterface;
 #ifdef Q_OS_ANDROID
-    KisAndroidDonations *androidDonations {nullptr};
 #if KRITA_QT_HAS_ANDROID_QPLATFORMSCREEN_DENSITY_ADJUSTMENT
     KisAndroidScaling *androidScaling {nullptr};
 #endif
@@ -486,10 +481,6 @@ void KisApplication::loadPlugins()
 bool KisApplication::start(const KisApplicationArguments &args)
 {
     KisScopedPerformanceLogger perfLog(QStringLiteral("KisApplication::start"));
-#ifdef Q_OS_ANDROID
-    KisAndroidDonations::showDonationDialog(true);
-#endif
-
     KisConfig cfg(false);
 
     auto iconsInMenuMode = cfg.iconsInMenu();
@@ -553,7 +544,7 @@ bool KisApplication::start(const KisApplicationArguments &args)
     KConfigGroup group(KSharedConfig::openConfig(), "theme");
 #ifndef Q_OS_HAIKU
     Digikam::ThemeManager themeManager;
-    themeManager.setCurrentTheme(group.readEntry("Theme", "Krita dark"));
+    themeManager.setCurrentTheme(group.readEntry("Theme", "System"));
 #endif
 
     ResetStarting resetStarting(d->splashScreen, args.filenames().count()); // remove the splash when done
@@ -642,9 +633,6 @@ bool KisApplication::start(const KisApplicationArguments &args)
     }
 
     setSplashScreenLoadingText(QString()); // done loading, so clear out label
-#ifdef Q_OS_ANDROID
-    KisAndroidDonations::setLoaded(true);
-#endif
     processEvents();
 
     //configure the unit manager
@@ -889,16 +877,10 @@ void KisApplication::setSplashScreenLoadingText(const QString &textToLoad)
         d->splashScreen->setLoadingText(textToLoad);
         d->splashScreen->repaint();
     }
-#ifdef Q_OS_ANDROID
-    KisAndroidDonations::setLoadingText(textToLoad);
-#endif
 }
 
 void KisApplication::hideSplashScreen()
 {
-#ifdef Q_OS_ANDROID
-    KisAndroidDonations::setLoaded(true);
-#endif
     if (d->splashScreen) {
         // hide the splashscreen to see the dialog
         d->splashScreen->hide();
@@ -1345,15 +1327,6 @@ KisExtendedModifiersMapperPluginInterface* KisApplication::extendedModifiersPlug
 }
 
 #ifdef Q_OS_ANDROID
-KisAndroidDonations *KisApplication::androidDonations()
-{
-    if (!d->androidDonations) {
-        d->androidDonations = new KisAndroidDonations(this);
-        d->androidDonations->syncState();
-    }
-    return d->androidDonations;
-}
-
 KisAndroidScaling *KisApplication::androidScaling()
 {
 #if KRITA_QT_HAS_ANDROID_QPLATFORMSCREEN_DENSITY_ADJUSTMENT

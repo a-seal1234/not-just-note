@@ -19,6 +19,7 @@
 #include <QStandardPaths>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QMessageBox>
 #include <QRegularExpression>
 #include <QSet>
 #include <kis_image_config.h>
@@ -33,6 +34,7 @@
 #include "PdfPageStripDecoration.h"
 #include "session/PdfStripBuilder.h"
 #include "session/PdfInkLoader.h"
+#include "session/PdfNotebookBackup.h"
 #include "session/PdfPageSaver.h"
 #include "session/PdfProjectBuilder.h"
 #include "session/PdfSession.h"
@@ -58,6 +60,7 @@
 #include <KisViewManager.h>
 #include <KisPart.h>
 #include <KisView.h>
+#include <klocalizedstring.h>
 
 namespace {
 
@@ -3515,6 +3518,7 @@ bool PdfPageNavigator::saveStripPages(QString *why)
 
     if (ok) {
         say(QStringLiteral("saved %1 pages").arg(pages.size()));
+        maybeCreateDailyBackup(m_projectDir);
     }
     return ok;
 }
@@ -3837,6 +3841,7 @@ bool PdfPageNavigator::saveThroughQueue(int index, QString *why)
     m_savingPages = wasSaving;
 
     if (ok) {
+        maybeCreateDailyBackup(m_projectDir);
         return true;
     }
 
@@ -3872,6 +3877,10 @@ void PdfPageNavigator::markOpenPagesDirty()
         return;
     }
 
+    if (!m_projectDir.isEmpty()) {
+        m_backupPendingProjectDir = m_projectDir;
+    }
+
     if (m_stripPages.isEmpty()) {
         m_window.setDirty(m_index, true);
         return;
@@ -3885,6 +3894,42 @@ void PdfPageNavigator::markOpenPagesDirty()
         if (page >= 0) {
             m_window.setDirty(page, true);
         }
+    }
+}
+
+void PdfPageNavigator::noteNotebookChangedOnDisk()
+{
+    if (!hasNotebook()) {
+        return;
+    }
+    m_backupPendingProjectDir = m_projectDir;
+    maybeCreateDailyBackup(m_projectDir);
+}
+
+void PdfPageNavigator::maybeCreateDailyBackup(const QString &projectDir)
+{
+    if (projectDir.isEmpty() || m_backupPendingProjectDir != projectDir || !m_saves.isIdle()) {
+        return;
+    }
+    /// Another dirty page in the open window has not reached disk yet. Its successful write calls
+    /// this method again; a notebook switched away has already passed prepareForNotebookChange().
+    if (projectDir == m_projectDir && !m_window.dirtyPages().isEmpty()) {
+        return;
+    }
+
+    QString backupPath;
+    QString why;
+    bool created = false;
+    if (!PdfNotebookBackup::createDailyBackup(projectDir, &backupPath, &created, &why)) {
+        say(QStringLiteral("WARNING: the notebook was saved, but its daily backup failed: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Notebook backup"),
+                             i18n("The notebook was saved, but its backup could not be completed: %1", why));
+        return;
+    }
+
+    m_backupPendingProjectDir.clear();
+    if (created) {
+        say(QStringLiteral("daily notebook backup saved at %1").arg(backupPath));
     }
 }
 

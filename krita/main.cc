@@ -204,6 +204,17 @@ Java_org_krita_android_JNIWrappers_openFileFromIntent(JNIEnv* /*env*/,
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_org_krita_android_JNIWrappers_systemThemeChanged(JNIEnv* /*env*/, jobject /*obj*/)
+{
+    if (!KisPart::exists()) return;
+
+    KisMainWindow *mainWindow = KisPart::instance()->currentMainwindow();
+    if (mainWindow) {
+        QMetaObject::invokeMethod(mainWindow, "slotSystemThemeChanged", Qt::QueuedConnection);
+    }
+}
+
 #define MAIN_EXPORT __attribute__ ((visibility ("default")))
 #define MAIN_FN main
 #elif defined Q_OS_WIN

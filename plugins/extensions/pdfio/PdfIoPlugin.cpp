@@ -23,6 +23,8 @@
 #include <unistd.h>
 
 #include <QActionGroup>
+#include <QAbstractButton>
+#include <QAbstractItemView>
 #include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -43,6 +45,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollBar>
 #include <QStandardPaths>
 #include <QTimer>
@@ -53,6 +56,7 @@
 #include "backend/PdfRenderBackend.h"
 #include "session/PdfExporter.h"
 #include "session/PdfInkLoader.h"
+#include "session/PdfNotebookBackup.h"
 #include "session/PdfNotebookBundle.h"
 #include "session/PdfNotebookOps.h"
 #include "session/PdfPageRotator.h"
@@ -794,6 +798,8 @@ bool applyNotebookName(const QString &entered)
         say(QStringLiteral("cannot write the notebook's name: %1").arg(why));
         return false;
     }
+
+    navigator->noteNotebookChangedOnDisk();
 
     say(QStringLiteral("the notebook is now named \"%1\"").arg(clean));
     reloadDockerNames();
@@ -1749,23 +1755,25 @@ bool pickNotebookForScreen(PdfNotebookOpsDialog::NotebookToMerge *notebook, QStr
 /// rule every operation follows -- and then it works on a copy. On Apply the engine commits the
 /// whole change once (one journal entry, one manifest write) and the notebook is reloaded once, so
 /// the reader ends up on the page they were on rather than wherever the last edit happened to land.
-/// Shows the Notebook ops screen as a PAGE of the window rather than as a dialog on top of it.
+/// Shows the Notebook ops screen as a floating dialog above the canvas.
 ///
-/// It is given the rectangle the canvas had -- the main window's central area -- and a frame with no
-/// title bar, so opening it reads as the window turning to another page and Apply or Cancel reads as
-/// turning back. The menu, the toolbars, the status bar and the panels stay exactly where they were,
-/// and the notebook panel beside it keeps showing the notebook the list is describing.
+/// It floats above the canvas, parented to Krita's main window. The dialog is sized to the available
+/// central area, leaving the existing dockers visible around it. It remains modal so the canvas
+/// underneath cannot be changed while the page list is being edited.
 ///
 /// It is still exec(): the page is a decision about the notebook's page list, and the canvas
 /// underneath must not be poked while that decision is being made.
 void showNotebookOpsPage(PdfNotebookOpsDialog &dialog)
 {
-    dialog.setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    dialog.setWindowFlags(Qt::Dialog | Qt::WindowTitleHint | Qt::WindowCloseButtonHint);
+    dialog.setWindowModality(Qt::WindowModal);
 
     KisMainWindow *window = KisPart::instance()->currentMainwindow();
-    if (QWidget *central = window ? window->centralWidget() : nullptr) {
-        dialog.move(central->mapToGlobal(QPoint(0, 0)));
-        dialog.resize(central->size());
+    if (window) {
+        const QRect available = window->screen()->availableGeometry();
+        dialog.resize(qRound(available.width() * 0.88), qRound(available.height() * 0.92));
+
+        dialog.move(available.center() - QPoint(dialog.width() / 2, dialog.height() / 2));
     }
 
     dialog.exec();
@@ -1795,7 +1803,8 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
         return;
     }
 
-    PdfNotebookOpsDialog dialog(navigator->projectDir(), manifest, navigator->currentIndex());
+    KisMainWindow *window = KisPart::instance()->currentMainwindow();
+    PdfNotebookOpsDialog dialog(navigator->projectDir(), manifest, navigator->currentIndex(), window);
 
     /// Insert and merge are edits the screen builds itself: it is handed only the picking and the
     /// reading, so a PDF added here and a notebook merged in join the same Apply as everything else.
@@ -1888,6 +1897,7 @@ void openNotebookOpsScreen(PdfIoPlugin *plugin)
         QDir(unpackedNotebook).removeRecursively();
     }
 
+    navigator->noteNotebookChangedOnDisk();
     say(outcome.summary);
     if (!navigator->reloadNotebook(dialog.anchorPage(), &why)) {
         say(QStringLiteral("the page list changed, but the notebook could not be reopened: %1")
@@ -1929,6 +1939,7 @@ bool applyNotebookOperation(const QString &title,
         return false;
     }
 
+    navigator->noteNotebookChangedOnDisk();
     say(outcome.summary);
     if (!navigator->reloadNotebook(outcome.anchorPage, &why)) {
         say(QStringLiteral("notebook operation applied, but the notebook could not be reopened: %1").arg(why));
@@ -2031,8 +2042,179 @@ void updateNotebookOpsActions(QMenu *ops)
     set("pdfio_ops_merge", true);
     set("pdfio_ops_merge_folder", true);
     set("pdfio_ops_undo", PdfNotebookOps::canUndo(navigator->projectDir()));
+    set("pdfio_ops_backup_now", true);
+    set("pdfio_ops_restore_backup", true);
+    set("pdfio_ops_collect_artifacts", true);
     /// Deleting the notebook is possible exactly when there is one open, which is what a open is.
     set("pdfio_ops_delete_notebook", true);
+}
+
+void createNotebookBackupNow()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return;
+    }
+
+    QString why;
+    if (!navigator->prepareForNotebookChange(&why)) {
+        QMessageBox::warning(nullptr, i18n("Create notebook backup"),
+                             i18n("The notebook could not be saved first: %1", why));
+        return;
+    }
+
+    QString backupPath;
+    if (!PdfNotebookBackup::createSafetyBackup(navigator->projectDir(), &backupPath, &why)) {
+        say(QStringLiteral("manual notebook backup failed: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Create notebook backup"),
+                             i18n("The notebook was saved, but its backup could not be completed: %1", why));
+        return;
+    }
+    say(QStringLiteral("manual notebook backup saved at %1").arg(backupPath));
+    QMessageBox::information(nullptr, i18n("Create notebook backup"),
+                             i18n("A verified backup was saved."));
+}
+
+void restoreNotebookBackup()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return;
+    }
+
+    QString why;
+    if (!navigator->prepareForNotebookChange(&why)) {
+        QMessageBox::warning(nullptr, i18n("Restore notebook backup"),
+                             i18n("The open notebook could not be saved first: %1", why));
+        return;
+    }
+
+    const QList<PdfNotebookBackup::Snapshot> snapshots =
+        PdfNotebookBackup::availableBackups(navigator->projectDir());
+    if (snapshots.isEmpty()) {
+        QMessageBox::information(nullptr, i18n("Restore notebook backup"),
+                                 i18n("There are no verified backups for this notebook."));
+        return;
+    }
+
+    QStringList choices;
+    for (const PdfNotebookBackup::Snapshot &snapshot : snapshots) {
+        choices.append(QStringLiteral("%1  (%2 KB)")
+                           .arg(snapshot.displayName)
+                           .arg((snapshot.bytes + 1023) / 1024));
+    }
+    bool accepted = false;
+    const QString choice = QInputDialog::getItem(nullptr, i18n("Restore notebook backup"),
+                                                 i18n("Choose a backup. It will be restored as a new notebook:"),
+                                                 choices, 0, false, &accepted);
+    if (!accepted) {
+        return;
+    }
+    const int selected = choices.indexOf(choice);
+    if (selected < 0 || selected >= snapshots.size()) {
+        return;
+    }
+
+    QString restoredDir;
+    if (!PdfNotebookBackup::restoreAsNewNotebook(snapshots.at(selected).path, &restoredDir, &why)) {
+        say(QStringLiteral("notebook backup restore failed: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Restore notebook backup"), why);
+        return;
+    }
+    if (!navigator->openNotebookDir(restoredDir, &why)) {
+        say(QStringLiteral("backup was restored at %1 but could not be opened: %2").arg(restoredDir, why));
+        QMessageBox::warning(nullptr, i18n("Restore notebook backup"),
+                             i18n("The backup was restored as a new notebook at %1, but it could not be opened: %2",
+                                  restoredDir, why));
+        return;
+    }
+    say(QStringLiteral("restored a new notebook from %1 at %2")
+            .arg(snapshots.at(selected).path, restoredDir));
+}
+
+bool confirmArtifactCandidates(const QStringList &candidates)
+{
+    QDialog dialog;
+    dialog.setWindowTitle(i18n("Collect stale notebook artifacts"));
+
+    auto *description = new QLabel(
+        i18np("A fresh verified backup is ready. Review this file before it is removed:",
+              "A fresh verified backup is ready. Review these %1 files before they are removed:",
+              candidates.size()), &dialog);
+    description->setWordWrap(true);
+
+    auto *list = new QListWidget(&dialog);
+    list->setSelectionMode(QAbstractItemView::NoSelection);
+    list->addItems(candidates);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    if (QAbstractButton *remove = buttons->button(QDialogButtonBox::Ok)) {
+        remove->setText(i18n("Remove listed files"));
+    }
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->addWidget(description);
+    layout->addWidget(list);
+    layout->addWidget(buttons);
+    dialog.resize(560, 420);
+    return dialog.exec() == QDialog::Accepted;
+}
+
+void collectStaleNotebookArtifacts()
+{
+    PdfPageNavigator *navigator = PdfPageNavigator::instance();
+    if (!navigator->hasNotebook()) {
+        return;
+    }
+
+    QString why;
+    if (!navigator->prepareForNotebookChange(&why)) {
+        QMessageBox::warning(nullptr, i18n("Collect stale notebook artifacts"),
+                             i18n("The notebook could not be saved first: %1", why));
+        return;
+    }
+
+    QString safetyBackup;
+    if (!PdfNotebookBackup::ensureFreshSafetyBackup(navigator->projectDir(), &safetyBackup, &why)) {
+        say(QStringLiteral("artifact collection skipped because a fresh backup failed: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Collect stale notebook artifacts"),
+                             i18n("No files were removed because a fresh backup could not be completed: %1",
+                                  why));
+        return;
+    }
+
+    QStringList candidates;
+    if (!PdfNotebookBackup::findOrphanedArtifacts(navigator->projectDir(), &candidates, &why)) {
+        say(QStringLiteral("artifact collection could not establish reachability: %1").arg(why));
+        QMessageBox::warning(nullptr, i18n("Collect stale notebook artifacts"), why);
+        return;
+    }
+    if (candidates.isEmpty()) {
+        QMessageBox::information(nullptr, i18n("Collect stale notebook artifacts"),
+                                 i18n("No unreferenced generated files were found."));
+        return;
+    }
+    if (!confirmArtifactCandidates(candidates)) {
+        return;
+    }
+
+    QStringList removed;
+    if (!PdfNotebookBackup::removeOrphanedArtifacts(navigator->projectDir(), candidates,
+                                                     &removed, &why)) {
+        say(QStringLiteral("artifact collection stopped after %1 removal(s): %2")
+                .arg(removed.size()).arg(why));
+        QMessageBox::warning(nullptr, i18n("Collect stale notebook artifacts"),
+                             i18n("Collection stopped after removing %1 file(s): %2")
+                                 .arg(removed.size()).arg(why));
+        return;
+    }
+    say(QStringLiteral("collected %1 stale artifact(s); safety backup at %2")
+            .arg(removed.size()).arg(safetyBackup));
+    QMessageBox::information(nullptr, i18n("Collect stale notebook artifacts"),
+                             i18np("Removed one unreferenced generated file.",
+                                   "Removed %1 unreferenced generated files.", removed.size()));
 }
 
 /// The "Notebook ops" submenu: everything that changes the notebook itself rather than the page on
@@ -2197,6 +2379,21 @@ void addNotebookOpsMenu(QMenu *menu, PdfIoPlugin *plugin)
             return PdfNotebookOps::undoLast(dir);
         });
     });
+
+    ops->addSeparator();
+
+    QAction *backupNow = ops->addAction(i18n("Create backup now..."));
+    backupNow->setObjectName(QStringLiteral("pdfio_ops_backup_now"));
+    QObject::connect(backupNow, &QAction::triggered, ops, []() { createNotebookBackupNow(); });
+
+    QAction *restoreBackup = ops->addAction(i18n("Restore a backup as a new notebook..."));
+    restoreBackup->setObjectName(QStringLiteral("pdfio_ops_restore_backup"));
+    QObject::connect(restoreBackup, &QAction::triggered, ops, []() { restoreNotebookBackup(); });
+
+    QAction *collectArtifacts = ops->addAction(i18n("Collect stale artifacts..."));
+    collectArtifacts->setObjectName(QStringLiteral("pdfio_ops_collect_artifacts"));
+    QObject::connect(collectArtifacts, &QAction::triggered, ops,
+                     []() { collectStaleNotebookArtifacts(); });
 
     /// Last, below the separator, and the only entry here that takes something away for good: the
     /// notebook and its folder. It is the counterpart of "Import PDF as notebook", which is how one

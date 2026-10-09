@@ -1,18 +1,18 @@
 <?xml version='1.0' encoding='utf-8'?>
-<manifest package="org.krita" xmlns:android="http://schemas.android.com/apk/res/android" android:installLocation="auto">
+<manifest package="com.njn" xmlns:android="http://schemas.android.com/apk/res/android" android:installLocation="auto">
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application android:hardwareAccelerated="true"
                  android:name="org.qtproject.qt5.android.bindings.QtApplication"
-                 android:label="Krita"
+                 android:label="Not Just Note"
                  android:icon="@mipmap/ic_launcher"
                  android:roundIcon="@mipmap/ic_launcher_round"
                  android:hasFragileUserData="true" >
 
         <activity android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density"
                   android:name="org.krita.android.MainActivity"
-                  android:label="Krita"
+                  android:label="Not Just Note"
                   android:screenOrientation="unspecified"
                   android:resizeableActivity="true"
                   android:theme="@style/DefaultTheme"
@@ -161,6 +161,4 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="com.android.vending.BILLING" />
-
 </manifest>

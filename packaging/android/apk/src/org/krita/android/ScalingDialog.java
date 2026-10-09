@@ -11,7 +11,7 @@ import android.widget.CheckBox;
 import android.widget.SeekBar;
 import android.widget.TextView;
 
-import org.krita.R;
+import com.njn.R;
 
 public final class ScalingDialog {
 

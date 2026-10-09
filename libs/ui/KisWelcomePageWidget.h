@@ -114,10 +114,6 @@ private Q_SLOTS:
     void slotToggleUpdateChecks(bool state);
 #endif
 
-#ifdef Q_OS_ANDROID
-    void slotUpdateDonationState();
-#endif
-
     bool isDevelopmentBuild();
 
     QFont largerFont();
@@ -150,9 +146,6 @@ private:
     void updateVersionUpdaterFrame();
 #endif
 
-#ifdef Q_OS_ANDROID
-    void initDonations();
-#endif
 
     KisMainWindow *m_mainWindow {nullptr};
 

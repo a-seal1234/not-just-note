@@ -23,7 +23,7 @@ import android.util.Log;
 
 import androidx.annotation.RequiresApi;
 
-import org.krita.R;
+import com.njn.R;
 
 public class DocumentSaverService extends Service {
 

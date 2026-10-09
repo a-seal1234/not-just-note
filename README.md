@@ -17,6 +17,27 @@ release and is not endorsed by the Krita Foundation.
   duplicate, rotate, delete, resize, and merge pages or notebooks.
 - Use the app's tablet workspace and light or dark theme.
 
+## Xiaomi Focus Pen Pro
+
+On the Xiaomi Pad 8, Not Just Note connects to Xiaomi's built-in pen service and supports
+the Focus Pen Pro's squeeze, double-press, slide-up, slide-down, and barrel-rotation
+inputs. The four gesture actions can be changed under **Settings → Configure Krita → Pen**.
+
+Default gesture actions are:
+
+- **Squeeze:** open the popup palette
+- **Double press:** erase
+- **Slide up / down:** increase / decrease brush size
+- **Barrel rotation:** drive brush angle; the Pen settings can enable this for every
+  brush preset and reverse its direction
+
+Enable each gesture in the tablet's own pen settings first. Rotation can be enabled
+globally in the app's Pen settings, or per brush preset with Krita's Rotation sensor.
+The integration reads from the Xiaomi system service already on the device; no Xiaomi
+SDK is bundled in the APK. Hardware-specific behavior has been verified on Xiaomi Pad 8
+with Focus Pen Pro; other devices have not been verified. Xiaomi's haptic feedback and
+hover preview are system features and are not app features.
+
 ## Project status
 
 - **Current candidate:** `0.1.6-rc1`

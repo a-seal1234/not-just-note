@@ -259,7 +259,6 @@ public Q_SLOTS:
     void slotShowSessionManager();
 
 #ifdef Q_OS_ANDROID
-    void slotShowDonationManagementDialog();
     void slotFlashWindowHack();
 #endif
 
@@ -396,6 +395,7 @@ private Q_SLOTS:
      */
     void updateTheme();
     void slotThemeChanged();
+    void slotSystemThemeChanged();
 
     void undo();
     void redo();

@@ -518,8 +518,6 @@ if(WIN32)
         )
 elseif(ANDROID)
     list(APPEND kritaui_LIB_SRCS
-        dialogs/KisDonationManagementDialog.cpp
-        widgets/KisDonationManagementWidget.cpp
         input/KisAndroidPenBridge.cpp
     )
     if(KRITA_QT_HAS_ANDROID_QPLATFORMSCREEN_DENSITY_ADJUSTMENT)
@@ -578,7 +576,6 @@ endif()
 
 if(ANDROID)
     list(APPEND kritaui_LIB_SRCS
-        KisAndroidDonations.cpp
         animation/KisAndroidMediaEncoderRunnable.cpp
         animation/KisLibavMediaEncoderRunnable.cpp
         animation/KisMediaEncoderFormatPreferencesDialog.cpp
@@ -689,11 +686,6 @@ ki18n_wrap_ui(kritaui_LIB_SRCS
 if(WIN32)
     ki18n_wrap_ui(kritaui_LIB_SRCS
         dialogs/KisDlgCustomTabletResolution.ui
-    )
-elseif(ANDROID)
-    ki18n_wrap_ui(kritaui_LIB_SRCS
-        dialogs/KisDonationManagementDialog.ui
-        widgets/KisDonationManagementWidget.ui
     )
 endif()
 

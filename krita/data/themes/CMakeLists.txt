@@ -10,6 +10,8 @@ if (FOUNDATION_BUILD)
 endif()
 
 install(FILES
+NotJustNote.colors
+NotJustNoteLight.colors
 KritaNeutral.colors
 KritaBlender.colors
 KritaBright.colors

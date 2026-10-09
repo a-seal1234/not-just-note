@@ -34,6 +34,11 @@
 #include <QAction>
 #include <QMessageBox>
 
+#ifdef Q_OS_ANDROID
+#include <QtAndroid>
+#include <QAndroidJniObject>
+#endif
+
 // KDE includes
 
 #include <klocalizedstring.h>
@@ -109,7 +114,7 @@ QString ThemeManager::currentThemeName() const
     }
     if (themeName.isEmpty()) {
         //qDebug() << "\tfallback";
-        themeName = "Krita dark";
+        themeName = "System";
     }
     //qDebug() << "\tresult" << themeName;
     return themeName;
@@ -133,10 +138,24 @@ void ThemeManager::setCurrentTheme(const QString& name)
 
 void ThemeManager::slotChangePalette()
 {
-    if (currentThemeName() == "System") {
+    QString theme(currentThemeName());
+    if (theme == "System") {
+#ifdef Q_OS_ANDROID
+        const QAndroidJniObject resources = QtAndroid::androidActivity().callObjectMethod(
+            "getResources", "()Landroid/content/res/Resources;");
+        const QAndroidJniObject configuration = resources.callObjectMethod(
+            "getConfiguration", "()Landroid/content/res/Configuration;");
+        const jint uiMode = configuration.getField<jint>("uiMode");
+        const jint nightModeMask = 0x30;
+        const jint nightModeYes = 0x20;
+        theme = (uiMode & nightModeMask) == nightModeYes
+            ? QStringLiteral("Not Just Note Dark")
+            : QStringLiteral("Not Just Note Light");
+#else
         qApp->setPalette(QPalette());
         Q_EMIT signalThemeChanged();
         return;
+#endif
     }
 
     //qDebug() << "slotChangePalette" << sender();
@@ -146,7 +165,6 @@ void ThemeManager::slotChangePalette()
     // PaletteChange event if needed.
     KisIconUtils::clearIconCache();
 
-    QString theme(currentThemeName());
     QString filename        = d->themeMap.value(theme);
     KSharedConfigPtr config = KSharedConfig::openConfig(filename);
 
@@ -236,9 +254,9 @@ void ThemeManager::populateThemeMenu()
         actionMap.insert(name, action);
     }
 
-#ifdef Q_OS_MAC
-    // Add a "System" theme, which resets the palette to system colors
-    // It only seems to work as expected on macOS.
+#if defined(Q_OS_MAC) || defined(Q_OS_ANDROID)
+    // On Android this follows the system light/dark appearance using the
+    // matching Not Just Note color scheme.
     action = new QAction("System", d->themeMenuActionGroup);
     action->setCheckable(true);
     actionMap.insert("System", action);

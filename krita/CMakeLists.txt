@@ -127,8 +127,8 @@ endif()
 # you specify should always be one higher than any version number you see here,
 # no matter what you're doing. Do not re-use versions.
 if(ANDROID)
-    # Android had interface scaling and supporter benefit menu options added.
-    set(KRITA5_XMLGUI_VERSION 544)
+    # Android changed interface scaling and removed supporter benefit menu options.
+    set(KRITA5_XMLGUI_VERSION 545)
 else()
     # Other systems aren't affected, they keep using the previous version.
     set(KRITA5_XMLGUI_VERSION 543)
@@ -136,7 +136,7 @@ endif()
 
 # After updating the version number properly, put the new hash that the CMake
 # error lists as the "actual hash" here.
-set(krita5_xmlgui_hash_expected "b74fdc4f3bafac700be2db906a424542")
+set(krita5_xmlgui_hash_expected "58efddb0d96d583f72fce1712c27fa9a")
 
 # You can stop reading now, the stuff that follows doesn't need to be modified.
 # ==============================================================================

@@ -10,5 +10,6 @@ install( FILES
     VFX_Paint.kws
     Minimal.kws
     Notebook.kws
+    NotJustNote.kws
     DESTINATION ${KDE_INSTALL_DATADIR}/krita/workspaces)
 

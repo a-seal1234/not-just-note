@@ -168,7 +168,7 @@ void KisToolProxy::forwardToTool(ActionState state, KisTool::ToolAction action, 
 {
     bool eventValid = false;
     KoPointerEvent ev = convertEventToPointerEvent(event, docPoint, &eventValid);
-    KisTool *activeTool = dynamic_cast<KisTool*>(priv()->activeTool);
+    KisTool *activeTool = dynamic_cast<KisTool*>(priv()->activeTool.data());
 
     if (!eventValid || !activeTool) return;
 
@@ -209,13 +209,13 @@ void KisToolProxy::forwardToTool(ActionState state, KisTool::ToolAction action, 
 
 bool KisToolProxy::primaryActionSupportsHiResEvents() const
 {
-    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool);
+    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool.data());
     return activeTool && activeTool->primaryActionSupportsHiResEvents();
 }
 
 bool KisToolProxy::alternateActionSupportsHiResEvents(KisTool::AlternateAction action) const
 {
-    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool);
+    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool.data());
     return activeTool && activeTool->alternateActionSupportsHiResEvents(action);
 }
 
@@ -234,7 +234,7 @@ void KisToolProxy::setActiveTool(KoToolBase *tool)
 
 void KisToolProxy::activateToolAction(KisTool::ToolAction action)
 {
-    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool);
+    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool.data());
 
     if (activeTool) {
         if (action == KisTool::Primary) {
@@ -250,7 +250,7 @@ void KisToolProxy::activateToolAction(KisTool::ToolAction action)
 
 void KisToolProxy::deactivateToolAction(KisTool::ToolAction action)
 {
-    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool);
+    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool.data());
 
     if (activeTool) {
         if (action == KisTool::Primary) {
@@ -266,6 +266,6 @@ void KisToolProxy::deactivateToolAction(KisTool::ToolAction action)
 
 bool KisToolProxy::supportsPaintingAssistants() const
 {
-    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool);
+    KisTool *activeTool = dynamic_cast<KisTool*>(const_cast<KisToolProxy*>(this)->priv()->activeTool.data());
     return activeTool && activeTool->supportsPaintingAssistants();
 }

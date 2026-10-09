@@ -506,7 +506,12 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
 
     /// What the archive actually carries, hashed. The manifest is first so the list has one order.
     QList<PdfNotebookBundle::Entry> carried;
-    const auto carry = [&](const QString &path, const KArchiveFile *file) {
+    QSet<QString> carriedPaths;
+    const auto carry = [&carried, &carriedPaths, &verifiedSources, &why](
+                               const QString &path, const KArchiveFile *file) {
+        if (carriedPaths.contains(path)) {
+            return true;
+        }
         PdfNotebookBundle::Entry entry;
         entry.path = path;
         /// A source was hashed while it was verified above; every other file is hashed here.
@@ -518,6 +523,7 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
             return false;
         }
         carried.append(entry);
+        carriedPaths.insert(path);
         return true;
     };
 
@@ -530,6 +536,7 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
         }
     }
 
+    QSet<QString> sidecarDirectories;
     for (const PdfPageRecord &page : manifest.pages) {
         const QString references[] = { page.kraFile, page.thumbFile };
         for (const QString &reference : references) {
@@ -552,6 +559,34 @@ bool analyze(const KZip &zip, const QString &bundlePath, Analysis *analysis, QSt
             if (!carry(reference, file)) {
                 return false;
             }
+        }
+
+        /// A page's layer sidecar is a companion artifact just like its .kra file. It is not
+        /// manifest-named because its directory is derived from kraFile, but a bundle must keep it
+        /// intact or a restored notebook will rebuild/flatten the user's saved layer data later.
+        const QString sidecar = page.kraFile + QStringLiteral(".layers");
+        const QString sidecarIndex = sidecar + QStringLiteral(".txt");
+        if (const KArchiveFile *file = findEntry(analysis->files, sidecarIndex)) {
+            if (!carry(sidecarIndex, file)) {
+                return false;
+            }
+        }
+        sidecarDirectories.insert(sidecar);
+    }
+    for (const ArchiveEntry &entry : analysis->files) {
+        const int separator = entry.path.lastIndexOf(QLatin1Char('/'));
+        if (separator >= 0 && sidecarDirectories.contains(entry.path.left(separator))
+            && !carry(entry.path, entry.file)) {
+            return false;
+        }
+    }
+
+    /// Inserted pictures and other KRA-linked files live under assets/. They are not named by the
+    /// manifest, but their relative paths are stored by the page layers themselves and the bundle
+    /// writer deliberately carries them.
+    for (const ArchiveEntry &entry : analysis->files) {
+        if (entry.path.startsWith(QStringLiteral("assets/")) && !carry(entry.path, entry.file)) {
+            return false;
         }
     }
 
@@ -980,6 +1015,7 @@ bool PdfNotebookBundle::extract(const QString &bundlePath,
         stagedSources.append(stagedSource);
     }
 
+    QSet<QString> sidecarDirectories;
     for (const PdfPageRecord &page : manifest.pages) {
         const QString references[] = { page.kraFile, page.thumbFile };
         for (const QString &reference : references) {
@@ -995,6 +1031,28 @@ bool PdfNotebookBundle::extract(const QString &bundlePath,
             if (!copyEntryTo(file, stagedArtifact, why)) {
                 return false;
             }
+        }
+
+        const QString sidecar = page.kraFile + QStringLiteral(".layers");
+        const QString sidecarIndex = sidecar + QStringLiteral(".txt");
+        sidecarDirectories.insert(sidecar);
+        if (const KArchiveFile *file = findEntry(analysis.files, sidecarIndex)) {
+            QString stagedIndex;
+            if (!destinationInside(stagingPath, sidecarIndex, &stagedIndex, why)
+                || !copyEntryTo(file, stagedIndex, why)) {
+                return false;
+            }
+        }
+    }
+    for (const ArchiveEntry &entry : analysis.files) {
+        const int separator = entry.path.lastIndexOf(QLatin1Char('/'));
+        if (separator < 0 || !sidecarDirectories.contains(entry.path.left(separator))) {
+            continue;
+        }
+        QString stagedLayer;
+        if (!destinationInside(stagingPath, entry.path, &stagedLayer, why)
+            || !copyEntryTo(entry.file, stagedLayer, why)) {
+            return false;
         }
     }
 

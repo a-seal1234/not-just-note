@@ -10,6 +10,7 @@
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QPointF>
+#include <QPointer>
 #include <QEvent>
 #include <KoPointerEvent.h>
 #include <boost/optional.hpp>
@@ -34,8 +35,10 @@ public:
 
     /// the toolManager tells us which KoCanvasController this toolProxy is working for.
     void setCanvasController(KoCanvasController *controller);
+    void setActiveTool(KoToolBase *tool);
 
-    KoToolBase *activeTool {0};
+    // KoToolManager clears this on detach; QPointer also guards late callbacks during tool destruction.
+    QPointer<KoToolBase> activeTool;
     bool hasSelection {false};
     QTimer scrollTimer;
     QPointF widgetScrollPointDoc;

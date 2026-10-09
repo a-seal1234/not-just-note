@@ -99,8 +99,7 @@
 #include <KisPlaybackEngine.h>
 
 #ifdef Q_OS_ANDROID
-#include "KisAndroidDonations.h"
-#include "dialogs/KisDonationManagementDialog.h"
+#include "KisAndroidScaling.h"
 #include <QtAndroid>
 #include <KisAndroidUtils.h>
 #endif
@@ -267,8 +266,6 @@ public:
     KisAction *resetConfigurations {nullptr};
     KisAction *toggleDockerTitleBars {nullptr};
 #ifdef Q_OS_ANDROID
-    KisAction *showDonationManagementDialog {nullptr};
-    KisAction *manageSubscriptions {nullptr};
 #if KRITA_QT_HAS_ANDROID_QPLATFORMSCREEN_DENSITY_ADJUSTMENT
     KisAction *changeInterfaceScale {nullptr};
 #endif
@@ -377,7 +374,7 @@ KisMainWindow::KisMainWindow(QUuid uuid)
     d->viewManager = new KisViewManager(this, actionCollection());
     KConfigGroup group( KSharedConfig::openConfig(), "theme");
 #ifndef Q_OS_HAIKU
-    d->themeManager = new Digikam::ThemeManager(group.readEntry("Theme", "Krita dark"), this);
+    d->themeManager = new Digikam::ThemeManager(group.readEntry("Theme", "System"), this);
 #endif
     d->windowStateConfig = KSharedConfig::openConfig()->group("MainWindow");
 
@@ -993,6 +990,20 @@ void KisMainWindow::slotThemeChanged()
     applyActionIconOverridesFromLocalXML();
 
     Q_EMIT themeChanged();
+}
+
+void KisMainWindow::slotSystemThemeChanged()
+{
+#ifdef Q_OS_ANDROID
+    KConfigGroup group(KSharedConfig::openConfig(), "theme");
+    if (group.readEntry("Theme", "System") != "System") {
+        return;
+    }
+
+    d->themeManager->setCurrentTheme("System");
+    updateTheme();
+    Q_EMIT themeChanged();
+#endif
 }
 
 void KisMainWindow::customizeTabBar()
@@ -1683,13 +1694,12 @@ void KisMainWindow::showEvent(QShowEvent *event)
         setMainWindowLayoutForCurrentMainWidget(d->widgetStack->currentIndex(), false);
     }
 #ifdef Q_OS_ANDROID
-    // The user can conceivably purchase a product from the splash screen while
-    // Krita is still loading. In that case, the "pending" flag will be set. The
-    // dialog in question will clear the flag.
-    KisAndroidDonations *androidDonations = KisAndroidDonations::instance();
-    if (androidDonations && androidDonations->isShowDonationManagementDialogPending()) {
-        QTimer::singleShot(0, this, &KisMainWindow::slotShowDonationManagementDialog);
+#if KRITA_QT_HAS_ANDROID_QPLATFORMSCREEN_DENSITY_ADJUSTMENT
+    KisAndroidScaling *androidScaling = KisAndroidScaling::instance();
+    if (androidScaling) {
+        QTimer::singleShot(0, androidScaling, &KisAndroidScaling::showOnStartup);
     }
+#endif
 #endif
     return KXmlGuiWindow::showEvent(event);
 }
@@ -1916,37 +1926,6 @@ void KisMainWindow::slotShowSessionManager() {
 }
 
 #ifdef Q_OS_ANDROID
-void KisMainWindow::slotShowDonationManagementDialog()
-{
-    // Don't show the donation management dialog on top of another dialog
-    // that may have triggered a donation flow, such as the bundle manager.
-    QWidget *win = qApp->activeWindow();
-    if (win && !qobject_cast<KisMainWindow *>(win) && (win->isModal() || win->windowModality() != Qt::NonModal)) {
-        return;
-    }
-
-    // We don't use `exec` here because the purchase stuff runs in Android's
-    // event loop, so it's legitimately possible that we get hit by another
-    // request to show the donation management dialog while it's already up
-    // and it's more convenient for the dialog to handle the deduplication.
-    QString objectName = QStringLiteral("kisdonationmanagementdialog");
-    KisDonationManagementDialog *dlg = findChild<KisDonationManagementDialog *>(objectName, Qt::FindDirectChildrenOnly);
-    if (dlg) {
-        dlg->reshow();
-    } else {
-        dlg = new KisDonationManagementDialog(this);
-
-        QAction *action = actionCollection()->action("manage_supporter_bundles");
-        if (action) {
-            connect(dlg, &KisDonationManagementDialog::sigShowSupporterBundles, action, &QAction::trigger);
-        }
-
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setObjectName(objectName);
-        dlg->show();
-    }
-}
-
 void KisMainWindow::slotFlashWindowHack()
 {
     if (!d->flashWindowHackInProgress) {
@@ -2937,7 +2916,7 @@ void KisMainWindow::configChanged()
 
     KConfigGroup group( KSharedConfig::openConfig(), "theme");
 #ifndef Q_OS_HAIKU
-    d->themeManager->setCurrentTheme(group.readEntry("Theme", "Krita dark"));
+    d->themeManager->setCurrentTheme(group.readEntry("Theme", "System"));
 #endif
     d->actionManager()->updateGUI();
 
@@ -3175,25 +3154,6 @@ void KisMainWindow::createActions()
     connect(d->mdiPreviousWindow, SIGNAL(triggered()), d->mdiArea, SLOT(activatePreviousSubWindow()));
 
 #ifdef Q_OS_ANDROID
-    d->showDonationManagementDialog = actionManager->createAction("manage_donations");
-    connect(d->showDonationManagementDialog,
-            &QAction::triggered,
-            this,
-            &KisMainWindow::slotShowDonationManagementDialog);
-
-    KisAndroidDonations *androidDonations = KisAndroidDonations::instance();
-    if (androidDonations) {
-        d->manageSubscriptions = actionManager->createAction("manage_subscriptions");
-        connect(d->manageSubscriptions,
-                &QAction::triggered,
-                androidDonations,
-                &KisAndroidDonations::slotManageSubscriptions);
-        connect(androidDonations,
-                &KisAndroidDonations::sigShowDonationManagementDialogRequested,
-                this,
-                &KisMainWindow::slotShowDonationManagementDialog,
-                Qt::QueuedConnection);
-    }
 #if KRITA_QT_HAS_ANDROID_QPLATFORMSCREEN_DENSITY_ADJUSTMENT
     KisAndroidScaling *androidScaling = KisAndroidScaling::instance();
     if (androidScaling && androidScaling->isSupported()) {

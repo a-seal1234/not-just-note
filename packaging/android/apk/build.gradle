@@ -152,15 +152,37 @@ def isPackagingAPK() {
     return gradle.taskGraph.hasTask(assembleRelease) || gradle.taskGraph.hasTask(assembleDebug)
 }
 
+// Release credentials are supplied by the local build environment and must never be committed.
+def releaseSigningValues = [
+        storeFile: System.getenv('NJN_RELEASE_STORE_FILE'),
+        storePassword: System.getenv('NJN_RELEASE_STORE_PASSWORD'),
+        keyAlias: System.getenv('NJN_RELEASE_KEY_ALIAS'),
+        keyPassword: System.getenv('NJN_RELEASE_KEY_PASSWORD')
+]
+def hasReleaseSigning = releaseSigningValues.values().every { it }
+if (!hasReleaseSigning && releaseSigningValues.values().any { it }) {
+    throw new GradleException('Set all NJN_RELEASE_* environment variables to sign a release APK.')
+}
+
 android {
     /**
-     * We store the application ID in both, `namespace` tag and in the
-     * `package` attribute in the manifest, because androiddeployqt from Qt 5.15.x
-     * does not know how to fetch the package name from the Manifest
+     * Keep the resource namespace, application ID, and manifest package aligned.
+     * Qt 5.15.x androiddeployqt reads the package name from the manifest.
      */
-    namespace = "org.krita"
+    namespace = "com.njn"
 
     ndkPath ndkpath
+
+    if (hasReleaseSigning) {
+        signingConfigs {
+            release {
+                storeFile file(releaseSigningValues.storeFile)
+                storePassword releaseSigningValues.storePassword
+                keyAlias releaseSigningValues.keyAlias
+                keyPassword releaseSigningValues.keyPassword
+            }
+        }
+    }
 
     packagingOptions {
         jniLibs {
@@ -189,6 +211,9 @@ android {
 
     buildTypes {
         release {
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
                     'proguard-rules.pro'
@@ -198,8 +223,7 @@ android {
             applicationIdSuffix ".next"
         }
         debug {
-            // Comment this out when testing in-app purchases. The package name
-            // must not have a suffix for those to work properly.
+            // Keep debug installs side-by-side with release builds.
             applicationIdSuffix ".debug"
         }
     }
@@ -215,9 +239,11 @@ android {
      * (including alpha and beta) release of versionMajor.versionMinor
      * branch
      */
-    def versionRelease  = 0
+    // Increment this with the patch number in versionName for each revision; keep rc1 fixed.
+    def versionRelease  = 7
 
     defaultConfig {
+        applicationId "com.njn"
         compileSdk androidCompileSdkVersion.toInteger()
 
         // even though buildToolsVersion is deprecated,
@@ -230,9 +256,9 @@ android {
         targetSdkVersion 36
         minSdkVersion 24
         versionCode project.ext.constant * 1000000 + versionMajor * 10000 + versionMinor * 100 + versionRelease
-        versionName "5.4.0-prealpha"
-        def unstableSuffix = System.getenv('KRITA_UNSTABLE_PACKAGE_SUFFIX')
-        archivesBaseName = System.getenv('KRITA_BUILD_APPBUNDLE') ? "krita-$versionName$unstableSuffix" : "krita-$abi-$versionName$unstableSuffix"
+        versionName "0.1.6-rc1"
+        def unstableSuffix = System.getenv('KRITA_UNSTABLE_PACKAGE_SUFFIX') ?: ''
+        archivesBaseName = System.getenv('KRITA_BUILD_APPBUNDLE') ? "not-just-note-$versionName$unstableSuffix" : "not-just-note-$abi-$versionName$unstableSuffix"
     }
     buildFeatures {
         renderScript true
@@ -265,7 +291,6 @@ android {
 }
 
 dependencies {
-    implementation 'com.android.billingclient:billing:9.0.0'
     implementation 'androidx.annotation:annotation:1.10.0'
     implementation files("libs/SDL2Android.jar")
 }

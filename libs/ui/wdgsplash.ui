@@ -370,9 +370,6 @@
      <property name="textFormat">
       <enum>Qt::AutoText</enum>
      </property>
-     <property name="pixmap">
-      <pixmap>../../2.8/krita/data/splash/splash_screen.xpm</pixmap>
-     </property>
      <property name="scaledContents">
       <bool>false</bool>
      </property>

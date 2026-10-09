@@ -16,7 +16,9 @@
 #include <QFile>
 #include <QScreen>
 #include <QWindow>
+#ifndef Q_OS_ANDROID
 #include <QSvgWidget>
+#endif
 
 #include <KisPart.h>
 #include <KisApplication.h>
@@ -48,7 +50,7 @@ KisSplashScreen::KisSplashScreen(bool themed, QWidget *parent, Qt::WindowFlags f
 {
 
     setupUi(this);
-#ifndef Q_OS_MACOS
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_ANDROID)
     setWindowIcon(KisIconUtils::loadIcon("krita-branding"));
 #endif
 
@@ -58,6 +60,7 @@ KisSplashScreen::KisSplashScreen(bool themed, QWidget *parent, Qt::WindowFlags f
     m_loadingTextLabel->setAlignment(Qt::AlignRight | Qt::AlignTop);
     addDropShadow(m_loadingTextLabel);
 
+#ifndef Q_OS_ANDROID
     m_brandingSvg = new QSvgWidget(QStringLiteral(":/krita-branding.svgz"), lblSplash);
     m_bannerSvg = new QSvgWidget(QStringLiteral(":/splash/banner.svg"), lblSplash);
     addDropShadow(m_bannerSvg);
@@ -67,6 +70,7 @@ KisSplashScreen::KisSplashScreen(bool themed, QWidget *parent, Qt::WindowFlags f
     m_artCreditsLabel->setStyleSheet(QStringLiteral("QLabel { color: #fff; background-color: transparent; font: 10pt; }"));
     m_artCreditsLabel->setAlignment(Qt::AlignRight | Qt::AlignBottom);
     addDropShadow(m_artCreditsLabel);
+#endif
 
     updateSplashImage();
     setLoadingText(QString());
@@ -93,6 +97,23 @@ KisSplashScreen::KisSplashScreen(bool themed, QWidget *parent, Qt::WindowFlags f
 
 void KisSplashScreen::updateSplashImage()
 {
+#ifdef Q_OS_ANDROID
+    const int width = 480;
+    const int height = m_displayLinks ? 320 : 480;
+    if (m_displayLinks) {
+        setFixedSize(sizeHint());
+    } else {
+        setFixedSize(width, height);
+    }
+    lblSplash->setFixedSize(width, height);
+    lblSplash->setPixmap(QPixmap());
+    lblSplash->setAutoFillBackground(true);
+    lblSplash->setStyleSheet(QStringLiteral("QLabel { background-color: #262626; }"));
+    m_loadingTextLabel->setAlignment(Qt::AlignCenter);
+    m_loadingTextLabel->setFixedSize(width - 48, 64);
+    m_loadingTextLabel->move(24, height / 2 - 32);
+    return;
+#else
     constexpr int SPLASH_HEIGHT_LOADING = 480;
     constexpr int SPLASH_HEIGHT_ABOUT = 320;
 
@@ -149,6 +170,7 @@ void KisSplashScreen::updateSplashImage()
     if (m_displayLinks) {
         setFixedSize(sizeHint());
     }
+#endif
 }
 
 void KisSplashScreen::resizeEvent(QResizeEvent *event)
@@ -270,15 +292,15 @@ void KisSplashScreen::setLoadingText(QString text)
 
 KisSplashScreen::Source KisSplashScreen::getImageSource()
 {
+#ifdef Q_OS_ANDROID
+    return Source{QString(), QString()};
+#else
     QString artistCredit = i18nc("Normal splash artist name", "Tyson Tan");
     // Loading the ginormous 4K PNG splash image increases the startup time on
     // Android by several seconds and at the same time looks really bad when
     // scaled down to a dinky size. Instead of overengineering this into an
     // Enterprise Splash Screen Solution where we choose the image based on
     // screen size or something, we'll just use a HD JPEG instead. It's fine.
-#ifdef Q_OS_ANDROID
-    QString resourcePath = QStringLiteral(":/splash/hd.jpg");
-#else
     QString resourcePath = QStringLiteral(":/splash/0.png");
     // TODO: Re-add the holiday splash...
 #if 0
@@ -289,11 +311,11 @@ KisSplashScreen::Source KisSplashScreen::getImageSource()
         artistCredit = QStringLiteral("???")};
     }
 #endif
-#endif
     if (!artistCredit.isEmpty()) {
         artistCredit = i18nc("splash image credit", "Artwork by: %1", artistCredit);
     }
     return Source{resourcePath, artistCredit};
+#endif
 }
 
 

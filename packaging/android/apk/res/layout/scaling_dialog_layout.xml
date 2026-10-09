@@ -3,7 +3,7 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:background="#242424">
+    android:background="@color/njn_dark_surface">
 
     <TextView
         android:id="@+id/percentText"
@@ -14,7 +14,7 @@
         android:paddingTop="8dp"
         android:text="Interface scale: 100%"
         android:textAppearance="@android:style/TextAppearance.Material.Body1"
-        android:textColor="#ffffff" />
+        android:textColor="@color/njn_light_surface" />
 
     <SeekBar
         android:id="@+id/seekBar"
@@ -24,9 +24,9 @@
         android:layout_weight="2"
         android:max="60"
         android:progress="0"
-        android:thumbTint="#ffffff"
-        android:progressTint="#ffffff"
-        android:progressBackgroundTint="#53728e" />
+        android:thumbTint="@color/njn_light_surface"
+        android:progressTint="@color/njn_brand_blue"
+        android:progressBackgroundTint="@color/njn_mid_gray" />
 
     <CheckBox
         android:id="@+id/rememberCheckBox"
@@ -34,8 +34,8 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="@string/show_this_dialog_when_krita_starts"
-        android:textColor="#ffffff"
-        android:buttonTint="#ffffff" />
+        android:textColor="@color/njn_light_surface"
+        android:buttonTint="@color/njn_light_surface" />
 
     <Button
         android:id="@+id/okButton"
@@ -44,7 +44,7 @@
         android:gravity="center"
         android:text="@string/ok"
         android:layout_margin="4dp"
-        android:background="@drawable/krita_gray_button"
-        android:textColor="#ffffff"  />
+        android:background="@drawable/krita_blue_button"
+        android:textColor="@color/njn_light_surface"  />
 
 </LinearLayout>

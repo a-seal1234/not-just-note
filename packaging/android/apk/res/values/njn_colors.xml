@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="njn_deep_navy">#0F172A</color>
+    <color name="njn_brand_blue">#2563EB</color>
+    <color name="njn_bright_blue">#3B82F6</color>
+    <color name="njn_light_blue">#60A5FA</color>
+    <color name="njn_pale_blue">#DBEAFE</color>
+    <color name="njn_light_surface">#F8FAFC</color>
+    <color name="njn_dark_surface">#2B2B2B</color>
+    <color name="njn_mid_gray">#475569</color>
+</resources>

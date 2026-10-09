@@ -21,9 +21,7 @@ if(HAVE_SEEXPR)
 add_subdirectory( seexpr_scripts )
 endif()
 
-if (ANDROID)
-    add_subdirectory( donation )
-else()
+if (NOT ANDROID)
     # Both layouts are unsupported since they detach/create a new window
     add_subdirectory( windowlayouts )
 endif()
