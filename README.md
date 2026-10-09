@@ -26,8 +26,9 @@ The current `0.1.7-rc1` release candidate is an Android arm64 APK. The shared dr
 PDF notebook code is also part of the desktop builds, so Linux and Windows remain build
 targets for this source tree. The Linux desktop build and shared desktop code have been
 validated in development, including the Not Just Note desktop identity. A Windows Actions
-workflow is available for a configured self-hosted Krita build runner, but a Windows package
-has not yet been produced or validated. No packaged desktop release is currently provided.
+workflow is available for a self-hosted Windows runner with the LLVM/clang-cl 21 and Visual
+Studio build toolchain; no Windows package has yet been produced or validated. No packaged
+desktop release is currently provided.
 The Xiaomi Focus Pen Pro integration and tablet-specific shell are Android-only.
 
 ## Xiaomi Focus Pen Pro

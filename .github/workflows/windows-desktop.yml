@@ -8,9 +8,9 @@ permissions:
 
 jobs:
   build-windows:
-    # Krita's Windows dependency set and build need a provisioned runner with
-    # ample disk space; GitHub-hosted standard runners do not provide KDE's
-    # Windows toolchain. Configure a private self-hosted runner with this label.
+    # Provision the runner with LLVM/clang-cl 21, CMake, Ninja, Python, Git,
+    # Visual Studio C++ tools/Windows SDK, and ample disk space. KDE's Windows
+    # dependency set and full build will not fit a standard hosted runner.
     runs-on: [self-hosted, Windows, X64, njn-krita-build]
     timeout-minutes: 360
     env:
@@ -27,6 +27,8 @@ jobs:
       KRITACI_RELEASE_PACKAGE_NAMING: 'True'
       KRITACI_SKIP_UPLOAD_NIGHTLY_PACKAGE: 'True'
       PYTHONUTF8: '1'
+      CC: clang-cl
+      CXX: clang-cl
       CI_PROJECT_NAME: krita
       CI_COMMIT_REF_NAME: ${{ github.ref_name }}
       CI_COMMIT_SHORT_SHA: ${{ github.sha }}
@@ -37,6 +39,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: Check Windows compiler and build tools
+        shell: pwsh
+        run: |
+          foreach ($tool in @('clang-cl', 'cmake', 'ninja', 'git', 'python')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "The self-hosted runner is missing required tool: $tool"
+            }
+          }
+          clang-cl --version
 
       - name: Fetch public KDE build helpers
         shell: pwsh
