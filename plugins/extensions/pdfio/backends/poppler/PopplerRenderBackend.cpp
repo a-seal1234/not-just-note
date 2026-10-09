@@ -26,7 +26,11 @@ PopplerRenderBackend::~PopplerRenderBackend() = default;
 
 bool PopplerRenderBackend::open(const QString &path)
 {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     m_document = Poppler::Document::load(path);
+#else
+    m_document.reset(Poppler::Document::load(path));
+#endif
     if (!m_document || m_document->isLocked()) {
         m_document.reset();
         return false;
