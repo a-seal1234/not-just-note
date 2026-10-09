@@ -8,9 +8,9 @@ permissions:
 
 jobs:
   build-windows:
-    # Provision the runner with LLVM/clang-cl 21, CMake, Ninja, Python 3.12, Git,
-    # Visual Studio C++ tools/Windows SDK, and ample disk space. KDE's Windows
-    # dependency set and full build will not fit a standard hosted runner.
+    # Provision the runner with Clang 21 in GNU target mode and the LLVM-MinGW
+    # sysroot, CMake 3.31, Ninja, Python 3.13, ccache, Git, and ample disk space.
+    # KDE's Windows dependency set and full build will not fit a standard runner.
     runs-on: [self-hosted, Windows, X64, njn-krita-build]
     timeout-minutes: 360
     env:
@@ -19,14 +19,12 @@ jobs:
       KDECI_REPO_METADATA_PATH: ${{ github.workspace }}\krita-deps-management\repo-metadata
       KDECI_COMPRESS_PACKAGES_ON_DOWNLOAD: 'False'
       KDECI_BUILD_TYPE: Release
-      KDECI_EXTRA_CMAKE_ARGS: '-DHIDE_SAFE_ASSERTS=OFF -DBUILD_TESTING=OFF -DBRANDING=NotJustNote'
+      KDECI_EXTRA_CMAKE_ARGS: '-DHIDE_SAFE_ASSERTS=OFF -DBUILD_TESTING=OFF -DBRANDING=NotJustNote -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY'
       KRITACI_SKIP_DEBUG_PACKAGE: 'True'
       KRITACI_BUILD_INSTALLERS: 'False'
       KRITACI_RELEASE_PACKAGE_NAMING: 'True'
       KRITACI_SKIP_UPLOAD_NIGHTLY_PACKAGE: 'True'
       PYTHONUTF8: '1'
-      CC: clang-cl
-      CXX: clang-cl
       CI_PROJECT_NAME: krita
       CI_COMMIT_REF_NAME: ${{ github.ref_name }}
       CI_COMMIT_SHORT_SHA: ${{ github.sha }}
@@ -37,18 +35,36 @@ jobs:
       - name: Check Windows compiler and build tools
         shell: pwsh
         run: |
-          foreach ($tool in @('clang-cl', 'cmake', 'ninja', 'ccache', 'git', 'python')) {
+          foreach ($tool in @('clang', 'clang++', 'cmake', 'ninja', 'ccache', 'git', 'python')) {
             if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
               throw "The self-hosted runner is missing required tool: $tool"
             }
           }
           $pythonVersion = python --version
-          if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.12\.') {
-            throw "The self-hosted runner requires Python 3.12; found: $pythonVersion"
+          if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.13\.') {
+            throw "The self-hosted runner requires Python 3.13; found: $pythonVersion"
+          }
+          $llvmRoot = Join-Path $env:LOCALAPPDATA 'Programs\llvm-mingw-20251118-ucrt-x86_64\llvm-mingw-20251118-ucrt-x86_64'
+          $resourceDir = Join-Path $llvmRoot 'lib\clang\21'
+          $target = clang --target=x86_64-w64-windows-gnu -dumpmachine
+          if ($LASTEXITCODE -ne 0 -or $target -ne 'x86_64-w64-windows-gnu') {
+            throw "The Windows compiler must target GNU ABI; found: $target"
+          }
+          $sysrootArg = $llvmRoot.Replace('\', '/')
+          $resourceArg = $resourceDir.Replace('\', '/')
+          $clangPath = (Get-Command clang.exe).Source.Replace('\', '/')
+          $cc = "$clangPath --target=x86_64-w64-windows-gnu --sysroot=$sysrootArg -resource-dir=$resourceArg -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind"
+          $cxx = "$cc -stdlib=libc++"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CC=$cc`nCXX=$cxx`n", [System.Text.UTF8Encoding]::new($false))
+          $cmakeVersion = cmake --version
+          if ($LASTEXITCODE -ne 0 -or $cmakeVersion -notmatch '^cmake version 3\.31\.') {
+            throw "The self-hosted runner requires CMake 3.31; found: $cmakeVersion"
           }
           python -m pip --version
           ccache --version
-          clang-cl --version
+          clang --version
+          clang++ --version
+          cmake --version
 
       - name: Fetch public KDE build helpers
         shell: pwsh
