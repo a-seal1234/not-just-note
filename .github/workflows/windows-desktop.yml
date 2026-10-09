@@ -37,7 +37,7 @@ jobs:
       - name: Check Windows compiler and build tools
         shell: pwsh
         run: |
-          foreach ($tool in @('clang-cl', 'cmake', 'ninja', 'git', 'python')) {
+          foreach ($tool in @('clang-cl', 'cmake', 'ninja', 'ccache', 'git', 'python')) {
             if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
               throw "The self-hosted runner is missing required tool: $tool"
             }
@@ -47,6 +47,7 @@ jobs:
             throw "The self-hosted runner requires Python 3.12; found: $pythonVersion"
           }
           python -m pip --version
+          ccache --version
           clang-cl --version
 
       - name: Fetch public KDE build helpers
