@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build-windows:
-    # Provision the runner with LLVM/clang-cl 21, CMake, Ninja, Python, Git,
+    # Provision the runner with LLVM/clang-cl 21, CMake, Ninja, Python 3.12, Git,
     # Visual Studio C++ tools/Windows SDK, and ample disk space. KDE's Windows
     # dependency set and full build will not fit a standard hosted runner.
     runs-on: [self-hosted, Windows, X64, njn-krita-build]
@@ -34,10 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
       - name: Check Windows compiler and build tools
         shell: pwsh
         run: |
@@ -46,6 +42,11 @@ jobs:
               throw "The self-hosted runner is missing required tool: $tool"
             }
           }
+          $pythonVersion = python --version
+          if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.12\.') {
+            throw "The self-hosted runner requires Python 3.12; found: $pythonVersion"
+          }
+          python -m pip --version
           clang-cl --version
 
       - name: Fetch public KDE build helpers
