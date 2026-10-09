@@ -22,12 +22,13 @@ release and is not endorsed by the Krita Foundation.
 
 ## Platforms
 
-The current `0.1.6-rc1` release candidate is an Android arm64 APK. The shared drawing and
+The current `0.1.7-rc1` release candidate is an Android arm64 APK. The shared drawing and
 PDF notebook code is also part of the desktop builds, so Linux and Windows remain build
 targets for this source tree. The Linux desktop build and shared desktop code have been
-validated in development; a Not Just Note Windows build has not yet been separately
-validated. No packaged desktop release is currently provided. The Xiaomi Focus Pen Pro
-integration and tablet-specific shell are Android-only.
+validated in development, including the Not Just Note desktop identity. A Windows Actions
+workflow is available for a configured self-hosted Krita build runner, but a Windows package
+has not yet been produced or validated. No packaged desktop release is currently provided.
+The Xiaomi Focus Pen Pro integration and tablet-specific shell are Android-only.
 
 ## Xiaomi Focus Pen Pro
 
@@ -52,7 +53,7 @@ hover preview are system features and are not app features.
 
 ## Project status
 
-- **Current candidate:** `0.1.6-rc1`
+- **Current candidate:** `0.1.7-rc1`
 - **Device tested:** Xiaomi Pad 8 with Xiaomi Focus Pen Pro
 - **Test build:** Android arm64 debug APK (`com.njn.debug`). This is a development build,
   not the public release package.
