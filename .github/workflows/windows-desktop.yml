@@ -2,9 +2,6 @@ name: Windows desktop package
 
 "on":
   workflow_dispatch:
-  push:
-    tags:
-      - '0.*-rc*'
 
 permissions:
   contents: read
