@@ -19,7 +19,7 @@ jobs:
       KDECI_REPO_METADATA_PATH: ${{ github.workspace }}\krita-deps-management\repo-metadata
       KDECI_COMPRESS_PACKAGES_ON_DOWNLOAD: 'False'
       KDECI_BUILD_TYPE: Release
-      KDECI_EXTRA_CMAKE_ARGS: '-DHIDE_SAFE_ASSERTS=OFF -DBUILD_TESTING=OFF -DBRANDING=NotJustNote -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY'
+      KDECI_EXTRA_CMAKE_ARGS: '-DHIDE_SAFE_ASSERTS=OFF -DBUILD_TESTING=OFF -DBRANDING=NotJustNote -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DTIFF_CAN_WRITE_PSD_TAGS_EXITCODE=0'
       KRITACI_SKIP_DEBUG_PACKAGE: 'True'
       KRITACI_BUILD_INSTALLERS: 'False'
       KRITACI_RELEASE_PACKAGE_NAMING: 'True'
@@ -58,8 +58,13 @@ jobs:
           $resourceArg = $resourceDir.Replace('\', '/')
           $clangPath = (Get-Command clang.exe).Source.Replace('\', '/')
           $clangxxPath = (Get-Command clang++.exe).Source.Replace('\', '/')
-          $cc = "$clangPath --target=x86_64-w64-windows-gnu --sysroot=$sysrootArg -resource-dir=$resourceArg -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind"
-          $cxx = "$clangxxPath --target=x86_64-w64-windows-gnu --sysroot=$sysrootArg -resource-dir=$resourceArg -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -stdlib=libc++"
+          $common = "--target=x86_64-w64-windows-gnu --sysroot=$sysrootArg -resource-dir=$resourceArg -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind"
+          $clangCmd = Join-Path $llvmRoot 'bin\clang.cmd'
+          $clangxxCmd = Join-Path $llvmRoot 'bin\clang++.cmd'
+          Set-Content -LiteralPath $clangCmd -Value "@echo off`r`n`"$clangPath`" $common %*`r`nexit /b %errorlevel%`r`n" -Encoding Ascii
+          Set-Content -LiteralPath $clangxxCmd -Value "@echo off`r`n`"$clangxxPath`" $common -stdlib=libc++ %*`r`nexit /b %errorlevel%`r`n" -Encoding Ascii
+          $cc = $clangCmd.Replace('\', '/')
+          $cxx = $clangxxCmd.Replace('\', '/')
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CC=$cc`nCXX=$cxx`n", [System.Text.UTF8Encoding]::new($false))
           $cmakeVersion = cmake --version | Select-Object -First 1
           if ($LASTEXITCODE -ne 0 -or $cmakeVersion -notmatch '^cmake version 3\.31\.') {
