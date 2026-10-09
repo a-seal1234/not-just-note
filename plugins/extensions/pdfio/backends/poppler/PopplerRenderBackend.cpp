@@ -8,6 +8,19 @@
 
 #include <QLatin1String>
 
+namespace {
+
+std::unique_ptr<Poppler::Page> pageAt(Poppler::Document *document, int index)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return document->page(index);
+#else
+    return std::unique_ptr<Poppler::Page>(document->page(index));
+#endif
+}
+
+} // namespace
+
 PopplerRenderBackend::PopplerRenderBackend() = default;
 PopplerRenderBackend::~PopplerRenderBackend() = default;
 
@@ -40,7 +53,7 @@ PdfPageInfo PopplerRenderBackend::pageInfo(int index) const
         return info;
     }
 
-    std::unique_ptr<Poppler::Page> page = m_document->page(index);
+    std::unique_ptr<Poppler::Page> page = pageAt(m_document.get(), index);
     if (!page) {
         return info;
     }
@@ -64,7 +77,7 @@ QImage PopplerRenderBackend::renderPage(int index, qreal dpi) const
     if (!m_document) {
         return QImage();
     }
-    std::unique_ptr<Poppler::Page> page = m_document->page(index);
+    std::unique_ptr<Poppler::Page> page = pageAt(m_document.get(), index);
     if (!page) {
         return QImage();
     }
@@ -76,7 +89,7 @@ QString PopplerRenderBackend::pageText(int index) const
     if (!m_document) {
         return QString();
     }
-    std::unique_ptr<Poppler::Page> page = m_document->page(index);
+    std::unique_ptr<Poppler::Page> page = pageAt(m_document.get(), index);
     if (!page) {
         return QString();
     }
