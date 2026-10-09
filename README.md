@@ -6,8 +6,9 @@ Not Just Note is an Android note-taking and PDF annotation app for focused work 
 tablet. It combines Krita's drawing canvas with a workspace for handwritten notes and
 multi-page PDF notebooks.
 
-This is an independent, Android-focused Krita fork. It is not an official Krita or KDE
-release and is not endorsed by the Krita Foundation.
+This is an independently maintained Krita fork. The current release candidate targets
+Android tablets; the source also retains Krita's desktop builds for Linux and Windows.
+It is not an official Krita or KDE release and is not endorsed by the Krita Foundation.
 
 ## What you can do
 
@@ -16,6 +17,15 @@ release and is not endorsed by the Krita Foundation.
 - Manage notebook pages: insert pages from PDFs, add blank or image pages, reorder,
   duplicate, rotate, delete, resize, and merge pages or notebooks.
 - Use the app's tablet workspace and light or dark theme.
+
+## Platforms
+
+The current `0.1.6-rc1` release candidate is an Android arm64 APK. The shared drawing and
+PDF notebook code is also part of the desktop builds, so Linux and Windows remain build
+targets for this source tree. The Linux desktop build and shared desktop code have been
+validated in development; a Not Just Note Windows build has not yet been separately
+validated. No packaged desktop release is currently provided. The Xiaomi Focus Pen Pro
+integration and tablet-specific shell are Android-only.
 
 ## Xiaomi Focus Pen Pro
 
