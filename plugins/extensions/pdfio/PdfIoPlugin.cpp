@@ -123,7 +123,11 @@ qint64 residentKb()
     if (fields.size() < 2) {
         return -1;
     }
+#ifdef _SC_PAGESIZE
     return fields.at(1).toLongLong() * (sysconf(_SC_PAGESIZE) / 1024);
+#else
+    return -1;
+#endif
 }
 
 /// Puts the notebook list on the Start screen; defined with the open helpers far below, and
