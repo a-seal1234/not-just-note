@@ -100,12 +100,17 @@ constexpr qint64 MinMaxPagePixels = 1 * 1000 * 1000;
 
 qint64 availableMemoryBytes()
 {
+#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long pageSize = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || pageSize <= 0) {
         return 0;
     }
     return qint64(pages) * qint64(pageSize);
+#else
+    /// Use the existing conservative page-pixel cap on platforms without POSIX sysconf values.
+    return 0;
+#endif
 }
 
 #if defined(Q_OS_ANDROID)
