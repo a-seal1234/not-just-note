@@ -50,13 +50,18 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $target -ne 'x86_64-w64-windows-gnu') {
             throw "The Windows compiler must target GNU ABI; found: $target"
           }
+          $cxxTarget = clang++ --target=x86_64-w64-windows-gnu -dumpmachine
+          if ($LASTEXITCODE -ne 0 -or $cxxTarget -ne 'x86_64-w64-windows-gnu') {
+            throw "The Windows C++ compiler must target GNU ABI; found: $cxxTarget"
+          }
           $sysrootArg = $llvmRoot.Replace('\', '/')
           $resourceArg = $resourceDir.Replace('\', '/')
           $clangPath = (Get-Command clang.exe).Source.Replace('\', '/')
+          $clangxxPath = (Get-Command clang++.exe).Source.Replace('\', '/')
           $cc = "$clangPath --target=x86_64-w64-windows-gnu --sysroot=$sysrootArg -resource-dir=$resourceArg -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind"
-          $cxx = "$cc -stdlib=libc++"
+          $cxx = "$clangxxPath --target=x86_64-w64-windows-gnu --sysroot=$sysrootArg -resource-dir=$resourceArg -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -stdlib=libc++"
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CC=$cc`nCXX=$cxx`n", [System.Text.UTF8Encoding]::new($false))
-          $cmakeVersion = cmake --version
+          $cmakeVersion = cmake --version | Select-Object -First 1
           if ($LASTEXITCODE -ne 0 -or $cmakeVersion -notmatch '^cmake version 3\.31\.') {
             throw "The self-hosted runner requires CMake 3.31; found: $cmakeVersion"
           }
