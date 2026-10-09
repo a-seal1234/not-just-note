@@ -5,6 +5,10 @@ requests for fork-specific changes in this repository:
 
 <https://github.com/pongkhunwuttijarat-droid/not-just-note>
 
+This began as a personal-use project and is maintained as time allows. Updates and reviews
+may be infrequent, and there is no promised release schedule; please do not rely on a
+particular response or release date.
+
 When reporting a problem, include the app version, platform and OS version, device model
 where relevant, steps to reproduce, and any useful logs or screenshots. For pen issues,
 include the pen model and the related tablet gesture settings.

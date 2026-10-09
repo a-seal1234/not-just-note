@@ -8,7 +8,9 @@ multi-page PDF notebooks.
 
 This is an independently maintained Krita fork. The current release candidate targets
 Android tablets; the source also retains Krita's desktop builds for Linux and Windows.
-It is not an official Krita or KDE release and is not endorsed by the Krita Foundation.
+It began as a personal-use project and is maintained as time allows, so updates may be
+infrequent and there is no fixed release schedule. It is not an official Krita or KDE
+release and is not endorsed by the Krita Foundation.
 
 ## What you can do
 
