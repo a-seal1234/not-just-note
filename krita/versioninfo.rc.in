@@ -74,7 +74,7 @@ BEGIN
             VALUE "FileVersion", KRITA_FILE_VERSION_STR
             VALUE "InternalName", "krita"
             VALUE "LegalCopyright", KRITA_COPYRIGHT_STR
-            VALUE "OriginalFilename", "krita.exe"
+            VALUE "OriginalFilename", "@KRITA_WINDOWS_EXECUTABLE_NAME@.exe"
             VALUE "ProductName", "Not Just Note"
             VALUE "ProductVersion", KRITA_PRODUCT_VERSION_STR
         END
@@ -84,3 +84,4 @@ BEGIN
         VALUE "Translation", 0x0409, 1252
     END
 END
+

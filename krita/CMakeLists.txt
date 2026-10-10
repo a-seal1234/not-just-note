@@ -309,6 +309,12 @@ endif()
 install(DIRECTORY DESTINATION ${KDE_INSTALL_DATADIR}/krita/shortcuts)
 
 if (WIN32)
+    if (BRANDING STREQUAL "NotJustNote")
+        set(KRITA_WINDOWS_EXECUTABLE_NAME "NotJustNote")
+    else()
+        set(KRITA_WINDOWS_EXECUTABLE_NAME "krita")
+    endif()
+
     configure_file(versioninfo.rc.in ${CMAKE_CURRENT_BINARY_DIR}/versioninfo.rc)
     if (QT_MAJOR_VERSION STREQUAL "6")
         configure_file(krita6.exe.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/krita.exe.manifest)
@@ -337,7 +343,7 @@ if (WIN32)
     endif()
     set_target_properties(krita_windows_stub_exe
         PROPERTIES
-            OUTPUT_NAME "krita"
+            OUTPUT_NAME "${KRITA_WINDOWS_EXECUTABLE_NAME}"
     )
     if (MSVC)
         target_link_options(krita_windows_stub_exe PRIVATE "/DEBUG:NONE")
@@ -353,7 +359,7 @@ if (WIN32)
     set_target_properties(krita_windows_stub_com
         PROPERTIES
             WIN32_EXECUTABLE false
-            OUTPUT_NAME "krita"
+            OUTPUT_NAME "${KRITA_WINDOWS_EXECUTABLE_NAME}"
             SUFFIX ".com"
     )
     if (MSVC)
@@ -364,3 +370,4 @@ if (WIN32)
     endif()
     install(TARGETS krita_windows_stub_com ${INSTALL_TARGETS_DEFAULT_ARGS})
 endif (WIN32)
+
